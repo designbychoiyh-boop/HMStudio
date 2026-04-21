@@ -1,0 +1,265 @@
+import fs from 'fs';
+const path = 'src/App.tsx';
+const content = fs.readFileSync(path, 'utf8');
+const lines = content.split('\n');
+
+// Find the corrupted line
+const startIdx = lines.findIndex(l => l.includes('plac      {/* ── HM STUDIO EXPORT VIEW ── */}'));
+if (startIdx === -1) {
+  console.log('Target line not found');
+  process.exit(1);
+}
+
+// Correctly close the editingTemplate modal loop and then add the HM STUDIO UI
+const newSection = `                  <input type="text" value={f.value} onChange={e => updateTemplateFieldDef(editingTemplate.id, f.id, { value: e.target.value })} placeholder="기본값" style={{ background: "#18181b", border: \`1px solid \${BORDER}\`, borderRadius: 6, color: "#fff", padding: "6px 8px", fontSize: 11 }} />
+                  <button onClick={() => removeTemplateFieldDef(editingTemplate.id, f.id)} style={{ padding: "6px 10px", background: "#18181b", color: "#ef4444", border: \`1px solid \${BORDER}\`, borderRadius: 6, fontSize: 10, cursor: "pointer" }}>삭제</button>
+                </div>
+              ))}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
+              <button onClick={() => setEditingTemplateId(null)} style={{ padding: "6px 12px", background: "#18181b", color: "#a1a1aa", border: \`1px solid \${BORDER}\`, borderRadius: 6, fontSize: 11, cursor: "pointer" }}>닫기</button>
+              <button onClick={() => setEditingTemplateId(null)} style={{ padding: "6px 12px", background: ACCENT2, color: "#000", border: "none", borderRadius: 6, fontSize: 11, fontWeight: 700, cursor: "pointer" }}>저장</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {showAEPanel && (
+        <div style={{ position: "fixed", top: 50, left: 55, width: 320, background: "#111", border: \`1px solid \${ACCENT2}55\`, borderRadius: 10, padding: 16, zIndex: 150, boxShadow: "0 16px 32px rgba(0,0,0,0.5)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: ACCENT2 }}>🎨 자막/Lottie 템플릿 라이브러리</div>
+            <button onClick={() => setShowAEPanel(false)} style={{ background: "none", border: "none", color: "#71717a", cursor: "pointer", fontSize: 16 }}>✕</button>
+          </div>
+          {importedAE.length > 0 && (
+            <div>
+              <div style={{ fontSize: 10, color: "#52525b", marginBottom: 6 }}>불러온 템플릿 (Lottie)</div>
+              {importedAE.map(t => (
+                <div key={t.id}
+                  style={{ padding: 10, background: "#0a1a0a", border: \`1px solid \${ACCENT2}33\`, borderRadius: 6, marginBottom: 4 }}>
+                  <div onClick={() => addAETemplate(t)} style={{ cursor: "pointer" }}>
+                    <div style={{ width: "100%", height: 60, background: "#000", marginBottom: 6, borderRadius: 4, overflow: "hidden" }}>
+                      <TemplateThumbnail template={t} fontFamily="Pretendard, 'Noto Sans KR', sans-serif" />
+                    </div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: ACCENT2 }}>{t.name}</div>
+                    <div style={{ fontSize: 9, color: "#52525b" }}>{t.compName || "메인 컴프 미설정"}</div>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                    <button onClick={() => addAETemplate(t)} style={{ flex: 1, padding: 6, background: ACCENT2, color: "#000", border: "none", borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: "pointer" }}>삽입</button>
+                    <button onClick={() => setEditingTemplateId(t.id)} style={{ padding: "6px 10px", background: "#18181b", color: ACCENT2, border: \`1px solid \${ACCENT2}55\`, borderRadius: 4, fontSize: 10, cursor: "pointer" }}>설정</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <button onClick={() => aeFileRef.current?.click()}
+            style={{ width: "100%", padding: 8, background: "transparent", border: \`1px dashed \${ACCENT2}55\`, color: ACCENT2, borderRadius: 6, cursor: "pointer", fontSize: 11, marginTop: 4 }}>
+            + Lottie JSON + PNG 불러오기
+          </button>
+        </div>
+      )}
+      {/* ── HM STUDIO EXPORT VIEW ── */}
+      {isExportView && (
+        <div style={{ position: "fixed", inset: 0, background: "#0c0c0c", color: "#e4e4e7", display: "flex", flexDirection: "column", zIndex: 20000, fontFamily: "'Inter', sans-serif" }}>
+          {/* Top Bar */}
+          <div style={{ height: 48, background: "#141414", borderBottom: "1px solid #27272a", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 20px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <span style={{ fontWeight: 800, fontSize: 16, letterSpacing: "-0.02em" }}>HM STUDIO</span>
+            </div>
+            <div style={{ display: "flex", gap: 16 }}>
+              <button onClick={() => setIsExportView(false)} style={{ background: "none", border: "none", color: "#71717a", fontSize: 20, cursor: "pointer" }}>×</button>
+            </div>
+          </div>
+
+          <div style={{ height: 40, background: "#0c0c0c", display: "flex", alignItems: "center", padding: "0 20px", gap: 8 }}>
+            <span style={{ color: "#38bdf8", fontSize: 14 }}>📥</span>
+            <span style={{ fontSize: 11, color: "#a1a1aa" }}>내보내기 엔진 활성화됨</span>
+          </div>
+
+          {/* Main Content Area */}
+          <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+            {/* Left Sidebar - Presets */}
+            <div style={{ width: 240, background: "#141414", borderRight: "1px solid #27272a", display: "flex", flexDirection: "column", padding: 20 }}>
+              <div style={{ fontSize: 11, color: "#71717a", fontWeight: 700, marginBottom: 16 }}>내보내기 사전 설정</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {[
+                  { id: "4K", label: "3840×2160 (4K)", sub: "UHD" },
+                  { id: "FHD", label: "1920×1080 (FHD)", sub: "High Quality" },
+                  { id: "SIGNAGE", label: "7680×2160 (사이니지)", sub: "Ultra Wide" },
+                  { id: "HD", label: "1280×720 (HD)", sub: "Standard" },
+                ].map(p => (
+                  <div key={p.id} onClick={() => setExportSettings(s => ({ ...s, preset: p.id }))}
+                    style={{ padding: "12px 16px", borderRadius: 8, background: exportSettings.preset === p.id ? "#3b82f6" : "transparent", color: exportSettings.preset === p.id ? "#fff" : "#a1a1aa", cursor: "pointer", transition: "all 0.2s" }}>
+                    <div style={{ fontSize: 13, fontWeight: 700 }}>{p.label}</div>
+                  </div>
+                ))}
+                <div style={{ marginTop: 20, padding: "12px 16px", borderRadius: 8, border: "1px dashed #27272a", color: "#52525b", fontSize: 12, textAlign: "center", cursor: "pointer" }}>
+                  + 새 사용자 설정 추가
+                </div>
+              </div>
+            </div>
+
+            {/* Center - Preview */}
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#000", position: "relative" }}>
+              <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", position: "relative" }}>
+                <div style={{ width: "90%", height: "90%", background: "#111", borderRadius: 4, overflow: "hidden", position: "relative", boxShadow: "0 20px 50px rgba(0,0,0,0.5)" }}>
+                  {/* Mock Video Frame */}
+                  <img src="https://images.unsplash.com/photo-1536440136628-849c177e76a1?auto=format&fit=crop&q=80&w=1200" style={{ width: "100%", height: "100%", objectFit: "cover", opacity: 0.8 }} />
+                  
+                  {/* Overlay Info */}
+                  <div style={{ position: "absolute", top: 20, left: 20, background: "rgba(0,0,0,0.5)", padding: "4px 12px", borderRadius: 4, fontSize: 10, display: "flex", gap: 10, color: "#fff" }}>
+                    <span style={{ fontWeight: 800 }}>4K UHD</span> | <span>3840x2160</span>
+                  </div>
+                  <div style={{ position: "absolute", top: 20, right: 20, background: "rgba(0,0,0,0.5)", padding: "4px 12px", borderRadius: 4, fontSize: 10, color: "#fff" }}>
+                    FR: 23.976
+                  </div>
+                  
+                  {/* Time Overlay */}
+                  <div style={{ position: "absolute", bottom: 40, left: "50%", transform: "translateX(-50%)", color: "#f59e0b", fontSize: 18, fontWeight: 800, textShadow: "0 2px 4px rgba(0,0,0,0.5)" }}>
+                    00:14:22:12
+                  </div>
+                </div>
+              </div>
+
+              {/* Timeline Controls */}
+              <div style={{ height: 100, background: "#0c0c0c", padding: "0 40px", display: "flex", flexDirection: "column", justifyContent: "center" }}>
+                <div style={{ height: 4, background: "#27272a", borderRadius: 2, position: "relative", marginBottom: 16 }}>
+                  <div style={{ position: "absolute", left: "30%", right: "20%", height: "100%", background: "#3b82f6", borderRadius: 2 }} />
+                  <div style={{ position: "absolute", left: "45%", top: -6, width: 16, height: 16, background: "#fff", borderRadius: "50%", border: "2px solid #3b82f6" }} />
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#52525b" }}>
+                  <span>00:00:00:00</span>
+                  <div style={{ display: "flex", gap: 20 }}>
+                    <span>IN: 00:04:12:00</span>
+                    <span>OUT: 00:24:45:00</span>
+                  </div>
+                  <span>00:30:00:00</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Right Sidebar - Settings */}
+            <div style={{ width: 340, background: "#141414", borderLeft: "1px solid #27272a", padding: 24, overflowY: "auto" }}>
+              <div style={{ marginBottom: 32 }}>
+                <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>
+                  📄 파일 요약
+                </div>
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: 10, color: "#71717a", marginBottom: 6 }}>파일명</div>
+                  <input type="text" value={exportSettings.filename} onChange={e => setExportSettings(s => ({ ...s, filename: e.target.value }))}
+                    style={{ width: "100%", background: "#1c1c1e", border: "1px solid #27272a", borderRadius: 6, color: "#fff", padding: "10px 12px", fontSize: 12, outline: "none" }} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 10, color: "#71717a", marginBottom: 6 }}>저장 위치</div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <div style={{ flex: 1, background: "#1c1c1e", border: "1px solid #27272a", borderRadius: 6, color: "#52525b", padding: "10px 12px", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {exportSettings.path}
+                    </div>
+                    <button style={{ padding: "0 12px", background: "#1c1c1e", border: "1px solid #27272a", borderRadius: 6, color: "#a1a1aa", fontSize: 11, cursor: "pointer" }}>찾아보기...</button>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ marginBottom: 32 }}>
+                <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>
+                  🎛 인코더 설정
+                </div>
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: 10, color: "#71717a", marginBottom: 6 }}>형식</div>
+                  <select style={{ width: "100%", background: "#1c1c1e", border: "1px solid #27272a", borderRadius: 6, color: "#fff", padding: "10px 12px", fontSize: 12, outline: "none" }}>
+                    <option>MPEG-4 (.mp4)</option>
+                    <option>QuickTime (.mov)</option>
+                  </select>
+                </div>
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: 10, color: "#71717a", marginBottom: 6 }}>비디오 코덱</div>
+                  <select style={{ width: "100%", background: "#1c1c1e", border: "1px solid #27272a", borderRadius: 6, color: "#fff", padding: "10px 12px", fontSize: 12, outline: "none" }}>
+                    <option>H.264 / AVC (x264)</option>
+                    <option>H.265 / HEVC</option>
+                  </select>
+                </div>
+                <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 10, color: "#71717a", marginBottom: 6 }}>너비</div>
+                    <input type="number" value={exportSettings.width} onChange={e => setExportSettings(s => ({ ...s, width: Number(e.target.value) }))}
+                      style={{ width: "100%", background: "#1c1c1e", border: "1px solid #27272a", borderRadius: 6, color: "#fff", padding: "10px 12px", fontSize: 12, outline: "none" }} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 10, color: "#71717a", marginBottom: 6 }}>높이</div>
+                    <input type="number" value={exportSettings.height} onChange={e => setExportSettings(s => ({ ...s, height: Number(e.target.value) }))}
+                      style={{ width: "100%", background: "#1c1c1e", border: "1px solid #27272a", borderRadius: 6, color: "#fff", padding: "10px 12px", fontSize: 12, outline: "none" }} />
+                  </div>
+                </div>
+                <div style={{ marginBottom: 20 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#71717a", marginBottom: 8 }}>
+                    <span>목표 비트레이트 (MBPS)</span>
+                    <span style={{ color: "#3b82f6", fontWeight: 700 }}>{exportSettings.bitrate.toFixed(1)}</span>
+                  </div>
+                  <input type="range" min="1" max="100" step="0.1" value={exportSettings.bitrate} onChange={e => setExportSettings(s => ({ ...s, bitrate: Number(e.target.value) }))}
+                    style={{ width: "100%", accentColor: "#3b82f6" }} />
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "#a1a1aa", cursor: "pointer" }}>
+                    <input type="checkbox" checked={exportSettings.audioEnabled} onChange={e => setExportSettings(s => ({ ...s, audioEnabled: e.target.checked }))} />
+                    오디오 구성 (AAC Stereo, 48kHz)
+                  </label>
+                  <label style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "#a1a1aa", cursor: "pointer" }}>
+                    <input type="checkbox" checked={exportSettings.audioNormalize} onChange={e => setExportSettings(s => ({ ...s, audioNormalize: e.target.checked }))} />
+                    오디오 정규화
+                  </label>
+                </div>
+              </div>
+
+              <div style={{ marginTop: "auto", paddingTop: 20, borderTop: "1px solid #27272a" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#71717a", marginBottom: 12 }}>
+                  <span>예상 파일 크기</span>
+                  <span style={{ color: "#fff", fontWeight: 700 }}>4.85 GB</span>
+                </div>
+                <button onClick={() => { startActualRender(); setIsExportView(false); }}
+                  style={{ width: "100%", padding: 14, background: "transparent", color: "#3b82f6", border: "none", borderRadius: 8, fontSize: 14, fontWeight: 800, cursor: "pointer" }}>
+                  렌더링 시작
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Bottom Bar - Render Queue */}
+          <div style={{ height: 180, background: "#0a0a0a", borderTop: "1px solid #27272a", display: "flex", padding: 20, gap: 20 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div style={{ fontSize: 12, fontWeight: 800, display: "flex", alignItems: "center", gap: 8 }}>
+                📋 렌더 대기열
+              </div>
+              <div style={{ display: "flex", gap: 12 }}>
+                {renderQueue.map(item => (
+                  <div key={item.id} style={{ width: 300, background: "#141414", border: "1px solid #27272a", borderRadius: 8, padding: 12, display: "flex", gap: 12, alignItems: "center" }}>
+                    <div style={{ width: 48, height: 48, background: "#000", borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>🎬</div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4 }}>{item.name}</div>
+                      <div style={{ height: 4, background: "#27272a", borderRadius: 2, overflow: "hidden" }}>
+                        <div style={{ width: \`\${item.progress}%\`, height: "100%", background: "#3b82f6" }} />
+                      </div>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "#52525b", marginTop: 4 }}>
+                        <span>CPU 88% | GPU 42%</span>
+                        <span>{item.progress}%</span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{ marginLeft: "auto", display: "flex", alignItems: "flex-end" }}>
+              <button onClick={() => { startActualRender(); setIsExportView(false); }}
+                style={{ padding: "16px 40px", background: "#f59e0b", color: "#000", border: "none", borderRadius: 10, fontSize: 16, fontWeight: 800, cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}>
+                렌더 시작 ▶
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+\`;
+
+// Replace from startIdx to the end
+const finalContent = lines.slice(0, startIdx).join('\\n') + '\\n' + newSection;
+fs.writeFileSync(path, finalContent, 'utf8');
+console.log('Fixed!');

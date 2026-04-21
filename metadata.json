@@ -1,0 +1,6 @@
+{
+  "name": "VibeEdit",
+  "description": "A modern, minimalist web-based video editor powered by FFmpeg.wasm.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

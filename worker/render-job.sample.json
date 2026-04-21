@@ -1,0 +1,35 @@
+{
+  "workflow": "ae-2025-render-server",
+  "projectName": "sample_project.mp4",
+  "composition": {
+    "width": 7680,
+    "height": 2160,
+    "fps": 30,
+    "backgroundColor": "#000000"
+  },
+  "clips": [],
+  "graphics": [],
+  "templateInstances": [
+    {
+      "id": "template_01",
+      "templateName": "TopTitle",
+      "mainCompName": "TopTitle_F_04_AGL & NAVIADs",
+      "templatePath": "Desktop\\VibeEdit_AE_Render_Server\\templates\\sample.aep",
+      "timelineStart": 0,
+      "duration": 5,
+      "track": 2,
+      "x": 30,
+      "y": 18,
+      "width": 720,
+      "height": 220,
+      "scale": 100,
+      "rotation": 0,
+      "opacity": 1,
+      "fields": [
+        { "id": "subText", "label": "Sub_텍스트", "value": "AGL & NAVIADs" },
+        { "id": "mainTop", "label": "Main_텍스트 상", "value": "Reconstruction Project" },
+        { "id": "mainBottom", "label": "Main_텍스트 하", "value": "SHUAIBA AIR BASE" }
+      ]
+    }
+  ]
+}
