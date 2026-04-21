@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-ssr/
+*.local
+.runtime/
+HMStudio_AE_Render_Server/
+VibeEdit_AE_Render_Server/
+.DS_Store
+*.log
+.env*
+!.env.example
