@@ -1952,6 +1952,8 @@ export default function HMStudio() {
     setClips(cs => [...cs, ...newClips]);
     const nextTotal = Math.max(totalDur, ...newClips.map(c => c.ts + c.dur));
     setTotalDur(nextTotal);
+    setRenderIn(0);
+    setRenderOut(nextTotal);
   }, [clips.length, preparePreviewPopout, snap, time, totalDur]);
   const handleFileUpload = async e => {
     const files = Array.from(e.target.files ?? []);
