@@ -1297,6 +1297,51 @@ export default function HMStudio() {
     { id: "HD", type: "default", label: "1280×720 (HD)", w: 1280, h: 720, icon: "📄" },
     { id: "CUSTOM1", type: "custom", baseName: "사용자 설정 1", label: "3840×1080(사용자 설정 1)", w: 3840, h: 1080, icon: "⚙️" },
   ]);
+  const saveProject = () => {
+    const projectData = {
+      version: "1.0",
+      composition: comp,
+      clips: clips,
+      graphics: graphics,
+      exportSettings: exportSettings
+    };
+    const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${exportSettings.filename || "project"}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const loadProject = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    
+    // Preview window is already open from login, so we just load data
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target?.result as string);
+        if (data.composition) setComp(data.composition);
+        if (data.clips) {
+          const processed = data.clips.map(c => ({
+            ...c,
+            url: c.serverUrl || c.url
+          }));
+          setClips(processed);
+        }
+        if (data.graphics) setGraphics(data.graphics);
+        if (data.exportSettings) setExportSettings(data.exportSettings);
+        setSelClipId(null); setSelGfxId(null); setTime(0);
+      } catch (err) {
+        alert("올바른 프로젝트 파일이 아닙니다.");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
   const selectedPresetObj = exportPresets.find(p => p.id === exportSettings.preset);
   const isCustom = selectedPresetObj?.type === "custom";
 
@@ -1361,6 +1406,7 @@ export default function HMStudio() {
   const [previewZoom, setPreviewZoom] = useState(1);
   const fileRef = useRef(null);
   const aeFileRef = useRef(null);
+  const projectFileRef = useRef(null);
   const rafRef = useRef(null);
   const playStartRef = useRef({ wallTime: 0, editTime: 0 });
   const queryParams = useMemo(() => new URLSearchParams(window.location.search), []);
@@ -1420,16 +1466,7 @@ export default function HMStudio() {
     return () => { cancelled = true; };
   }, [isRenderMode, renderJobId, renderTsParam]);
 
-  const [isLoggedIn, setIsLoggedIn] = useState(() => {
-    const saved = localStorage.getItem('hmstudio_auth');
-    if (saved) {
-      try {
-        const { expiry } = JSON.parse(saved);
-        if (Date.now() < expiry) return true;
-      } catch {}
-    }
-    return false;
-  });
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
 
   const [systemStatus, setSystemStatus] = useState<any>(null);
   const [showSystemModal, setShowSystemModal] = useState(false);
@@ -1512,6 +1549,8 @@ export default function HMStudio() {
         const expiry = Date.now() + (24 * 60 * 60 * 1000);
         localStorage.setItem('hmstudio_auth', JSON.stringify({ userId: loginId, expiry }));
         setIsLoggedIn(true);
+        // Open the persistent preview window immediately on login gesture
+        openPreviewPopout();
       } else {
         setLoginError(data.message || "로그인 실패");
       }
@@ -2759,16 +2798,16 @@ export default function HMStudio() {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", height: 40, padding: "0 16px", borderBottom: `1px solid ${BORDER}`, background: "#0f0f0f", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
           <span style={{ fontWeight: 900, fontSize: 14, color: ACCENT, letterSpacing: "-0.04em" }}>HM Studio</span>
-          {["파일", "편집", "시퀀스", "클립", "그래픽"].map(l => (
-            <button key={l} style={{ background: "none", border: "none", color: "#71717a", fontSize: 11, cursor: "pointer", padding: "2px 0" }}>{l}</button>
-          ))}
           <button onClick={() => setShowSystemModal(true)} style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(255,255,255,0.03)', border: `1px solid ${BORDER}`, borderRadius: 4, padding: '2px 8px', color: systemStatus?.gpu?.supported ? ACCENT : '#71717a', cursor: 'pointer', fontSize: 10 }}>
             <span style={{ fontSize: 12 }}>{systemStatus?.gpu?.supported ? "⚡" : "⚙️"}</span> 시스템 상태
           </button>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <button onClick={() => setShowCompSettings(true)} style={{ ...btn(false), fontSize: 11 }}>컴포지션 설정</button>
-          <button onClick={handleRender} style={{ background: ACCENT, color: "#000", border: "none", borderRadius: 6, padding: "5px 16px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+          <button onClick={() => projectFileRef.current?.click()} style={{ ...btn(false), fontSize: 11, marginLeft: 8 }}>📂 프로젝트 불러오기</button>
+          <button onClick={saveProject} style={{ ...btn(false), fontSize: 11, marginLeft: 8 }}>💾 프로젝트 저장</button>
+          <input ref={projectFileRef} type="file" accept=".json" style={{ display: "none" }} onChange={loadProject} />
+          <button onClick={handleRender} style={{ background: ACCENT, color: "#000", border: "none", borderRadius: 6, padding: "5px 16px", fontSize: 11, fontWeight: 700, cursor: "pointer", marginLeft: 8 }}>
             ▶ Render
           </button>
         </div>
