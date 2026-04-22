@@ -607,37 +607,43 @@ async function renderJob(record: RenderJobRecord) {
       const finalPassTemp = path.join(RENDER_DIR, `${record.id}_final.mp4`);
       finalPassArgs.push(finalPassTemp);
 
-      console.log(`[Render ${record.id}] Final pass command: "${ffmpegBin()}" ${finalPassArgs.join(' ')}`);
-      
-      await new Promise((resolve, reject) => {
-        const finalProc = spawn(ffmpegBin(), finalPassArgs);
-        let err = '';
-        finalProc.stderr.on('data', d => {
-          const msg = d.toString();
-          if (msg.includes('Error')) console.error(`[Render ${record.id}] Final pass stderr: ${msg}`);
-          err += msg;
-        });
-        finalProc.on('close', code => {
-          if (code === 0) resolve(true);
-          else reject(new Error(`Final pass failed (code ${code}): ${err.slice(-200)}`));
-        });
-      });
-
-      console.log(`[Render ${record.id}] Moving final file to: ${outputPath}`);
       try {
+        console.log(`[Render ${record.id}] Final pass command: "${ffmpegBin()}" ${finalPassArgs.join(' ')}`);
+        
+        await new Promise((resolve, reject) => {
+          const finalProc = spawn(ffmpegBin(), finalPassArgs);
+          let err = '';
+          finalProc.stderr.on('data', d => {
+            const msg = d.toString();
+            if (msg.includes('Error')) console.error(`[Render ${record.id}] Final pass stderr: ${msg}`);
+            err += msg;
+          });
+          finalProc.on('close', code => {
+            if (code === 0) resolve(true);
+            else reject(new Error(`Final pass failed (code ${code}): ${err.slice(-200)}`));
+          });
+        });
+
+        console.log(`[Render ${record.id}] SUCCESSFULLY PROCESSED. Moving to: ${outputPath}`);
         await moveFile(finalPassTemp, outputPath);
         await fsp.unlink(tempOutputPath).catch(() => {});
-        console.log(`[Render ${record.id}] SUCCESSFULLY SAVED TO: ${outputPath}`);
+        console.log(`[Render ${record.id}] SAVED TO: ${outputPath}`);
       } catch (err: any) {
-        console.error(`[Render ${record.id}] FAILED TO MOVE FINAL FILE: ${err.message}`);
-        throw err;
+        console.warn(`[Render ${record.id}] Final pass (audio/thumb) failed, falling back to silent video: ${err.message}`);
+        // Fallback: move the temp video if final pass failed
+        if (fs.existsSync(tempOutputPath)) {
+          console.log(`[Render ${record.id}] EMERGENCY FALLBACK: Moving silent temp file to: ${outputPath}`);
+          await moveFile(tempOutputPath, outputPath).catch(e => console.error(`[Render ${record.id}] FALLBACK MOVE FAILED: ${e.message}`));
+        } else {
+          throw err;
+        }
       }
     } else {
       // No audio and no preview, just move the file
       console.log(`[Render ${record.id}] No final pass needed. Moving temp file to: ${outputPath}`);
       try {
         await moveFile(tempOutputPath, outputPath);
-        console.log(`[Render ${record.id}] SUCCESSFULLY SAVED TO: ${outputPath}`);
+        console.log(`[Render ${record.id}] SAVED TO: ${outputPath}`);
       } catch (err: any) {
         console.error(`[Render ${record.id}] FAILED TO MOVE TEMP FILE: ${err.message}`);
         throw err;
