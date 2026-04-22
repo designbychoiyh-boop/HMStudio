@@ -184,6 +184,22 @@ function ffmpegBin() {
   }
 }
 
+function ffprobeBin() {
+  const bin = ffmpegBin();
+  if (bin === 'ffmpeg') return 'ffprobe';
+  return bin.replace(/ffmpeg(\.exe)?$/i, 'ffprobe$1');
+}
+
+function hasAudioStream(filePath: string): boolean {
+  try {
+    const bin = ffprobeBin();
+    const out = execSync(`"${bin}" -v error -select_streams a -show_entries stream=index -of csv=p=0 "${filePath}"`, { encoding: 'utf8' });
+    return out.trim().length > 0;
+  } catch (e) {
+    return false;
+  }
+}
+
 function findLocalChrome() {
   const base = path.join(ROOT, '.runtime', 'chrome');
   if (!fs.existsSync(base)) return null;
@@ -518,7 +534,10 @@ async function renderJob(record: RenderJobRecord) {
     record.updatedAt = nowIso();
     await saveJob(record);
 
-    const audioClips = (record.payload?.clips || []).filter((c: any) => c.storedPath && fs.existsSync(c.storedPath));
+    const audioClips = (record.payload?.clips || []).filter((c: any) => {
+      if (!c.storedPath || !fs.existsSync(c.storedPath)) return false;
+      return hasAudioStream(c.storedPath);
+    });
     const hasAudio = audioClips.length > 0;
     
     if (hasAudio || fs.existsSync(previewPath)) {
