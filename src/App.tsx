@@ -1280,8 +1280,8 @@ export default function HMStudio() {
     path: "/Users/hmstudio/Projects/Export",
     format: "MPEG-4 (.mp4)",
     codec: "H.264 / AVC (x264)",
-    width: 3840,
-    height: 2160,
+    width: 1920,
+    height: 1080,
     bitrate: 45.0,
     audioEnabled: true,
     audioNormalize: false,
@@ -1290,7 +1290,7 @@ export default function HMStudio() {
   const [renderIn, setRenderIn] = useState(0);
   const [renderOut, setRenderOut] = useState(null);
   const [exportPresets, setExportPresets] = useState([
-    { id: "PROJECT", type: "default", label: "프로젝트 설정", w: 3840, h: 2160, icon: "🎞️" },
+    { id: "PROJECT", type: "default", label: "프로젝트 설정", w: 1920, h: 1080, icon: "🎞️" },
     { id: "4K", type: "default", label: "3840×2160 (4K)", w: 3840, h: 2160, icon: "📹" },
     { id: "FHD", type: "default", label: "1920×1080 (FHD)", w: 1920, h: 1080, icon: "🎬" },
     { id: "SIGNAGE", type: "default", label: "7680×2160 (사이니지)", w: 7680, h: 2160, icon: "📺" },
@@ -2368,8 +2368,8 @@ export default function HMStudio() {
     };
     payload.composition = {
       ...comp,
-      w: exportSettings.width || comp.w,
-      h: exportSettings.height || comp.h,
+      w: comp.w,
+      h: comp.h,
     };
     payload.renderRange = { in: renderIn, out: outPoint };
 
