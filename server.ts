@@ -187,9 +187,15 @@ function ffmpegBin() {
 function hasAudioStream(filePath: string): boolean {
   try {
     const bin = ffmpegBin();
-    // Use ffmpeg -i to probe for audio streams if ffprobe is missing
-    const out = execSync(`"${bin}" -i "${filePath}" 2>&1`, { encoding: 'utf8' });
-    return out.includes('Audio:');
+    let out = '';
+    try {
+      // ffmpeg -i always exits with code 1 because no output is specified,
+      // so we must catch the error to read the stderr output.
+      execSync(`"${bin}" -i "${filePath}"`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e: any) {
+      out = (e.stderr || '').toString() + (e.stdout || '').toString();
+    }
+    return out.toLowerCase().includes('audio:');
   } catch (e) {
     return false;
   }
@@ -608,7 +614,7 @@ async function renderJob(record: RenderJobRecord) {
       finalPassArgs.push(finalPassTemp);
 
       try {
-        console.log(`[Render ${record.id}] Final pass command: "${ffmpegBin()}" ${finalPassArgs.join(' ')}`);
+        console.log(`[Render ${record.id}] Starting final pass to: ${outputPath}`);
         
         await new Promise((resolve, reject) => {
           const finalProc = spawn(ffmpegBin(), finalPassArgs);
@@ -624,30 +630,26 @@ async function renderJob(record: RenderJobRecord) {
           });
         });
 
-        console.log(`[Render ${record.id}] SUCCESSFULLY PROCESSED. Moving to: ${outputPath}`);
-        await moveFile(finalPassTemp, outputPath);
-        await fsp.unlink(tempOutputPath).catch(() => {});
-        console.log(`[Render ${record.id}] SAVED TO: ${outputPath}`);
+        if (fs.existsSync(finalPassTemp)) {
+          await moveFile(finalPassTemp, outputPath);
+          await fsp.unlink(tempOutputPath).catch(() => {});
+          console.log(`[Render ${record.id}] SUCCESSFULLY SAVED TO: ${outputPath}`);
+        } else {
+          throw new Error('Final pass finished but output file missing');
+        }
       } catch (err: any) {
-        console.warn(`[Render ${record.id}] Final pass (audio/thumb) failed, falling back to silent video: ${err.message}`);
-        // Fallback: move the temp video if final pass failed
+        console.warn(`[Render ${record.id}] Final pass failed, using fallback: ${err.message}`);
         if (fs.existsSync(tempOutputPath)) {
-          console.log(`[Render ${record.id}] EMERGENCY FALLBACK: Moving silent temp file to: ${outputPath}`);
-          await moveFile(tempOutputPath, outputPath).catch(e => console.error(`[Render ${record.id}] FALLBACK MOVE FAILED: ${e.message}`));
+          await moveFile(tempOutputPath, outputPath);
+          console.log(`[Render ${record.id}] FALLBACK SAVED TO: ${outputPath}`);
         } else {
           throw err;
         }
       }
     } else {
-      // No audio and no preview, just move the file
-      console.log(`[Render ${record.id}] No final pass needed. Moving temp file to: ${outputPath}`);
-      try {
-        await moveFile(tempOutputPath, outputPath);
-        console.log(`[Render ${record.id}] SAVED TO: ${outputPath}`);
-      } catch (err: any) {
-        console.error(`[Render ${record.id}] FAILED TO MOVE TEMP FILE: ${err.message}`);
-        throw err;
-      }
+      console.log(`[Render ${record.id}] No audio/preview needed. Saving to: ${outputPath}`);
+      await moveFile(tempOutputPath, outputPath);
+      console.log(`[Render ${record.id}] SAVED TO: ${outputPath}`);
     }
 
     const totalElapsed = ((Date.now() - renderStartedAt) / 1000).toFixed(1);
