@@ -184,17 +184,12 @@ function ffmpegBin() {
   }
 }
 
-function ffprobeBin() {
-  const bin = ffmpegBin();
-  if (bin === 'ffmpeg') return 'ffprobe';
-  return bin.replace(/ffmpeg(\.exe)?$/i, 'ffprobe$1');
-}
-
 function hasAudioStream(filePath: string): boolean {
   try {
-    const bin = ffprobeBin();
-    const out = execSync(`"${bin}" -v error -select_streams a -show_entries stream=index -of csv=p=0 "${filePath}"`, { encoding: 'utf8' });
-    return out.trim().length > 0;
+    const bin = ffmpegBin();
+    // Use ffmpeg -i to probe for audio streams if ffprobe is missing
+    const out = execSync(`"${bin}" -i "${filePath}" 2>&1`, { encoding: 'utf8' });
+    return out.includes('Audio:');
   } catch (e) {
     return false;
   }
@@ -535,6 +530,7 @@ async function renderJob(record: RenderJobRecord) {
     await saveJob(record);
 
     const audioClips = (record.payload?.clips || []).filter((c: any) => {
+      if (c.type === 'image') return false;
       if (!c.storedPath || !fs.existsSync(c.storedPath)) return false;
       return hasAudioStream(c.storedPath);
     });

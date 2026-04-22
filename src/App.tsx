@@ -1893,6 +1893,7 @@ export default function HMStudio() {
       const file = files[i];
       const url = URL.createObjectURL(file);
       const isAudio = file.type.startsWith('audio/') || /\.(mp3|wav|m4a|aac|ogg)$/i.test(file.name);
+      const isImage = file.type.startsWith('image/') || /\.(jpg|jpeg|png|webp|gif)$/i.test(file.name);
       
       let meta: any = { dur: 5, w: 1920, h: 1080 };
       if (isAudio) {
@@ -1900,6 +1901,12 @@ export default function HMStudio() {
           const a = new Audio(); a.src = url;
           a.onloadedmetadata = () => res({ dur: a.duration || 5, w: 0, h: 0 });
           a.onerror = () => res({ dur: 5, w: 0, h: 0 });
+        });
+      } else if (isImage) {
+        meta = await new Promise(res => {
+          const img = new Image(); img.src = url;
+          img.onload = () => res({ dur: 5, w: img.width || 1920, h: img.height || 1080 });
+          img.onerror = () => res({ dur: 5, w: 1920, h: 1080 });
         });
       } else {
         meta = await new Promise(res => {
@@ -1929,7 +1936,7 @@ export default function HMStudio() {
       
       const clip = { 
         id: uid(), 
-        type: isAudio ? 'audio' : 'video',
+        type: isAudio ? 'audio' : (isImage ? 'image' : 'video'),
         file, url, serverUrl, storedPath, 
         name: file.name, 
         dur, ts: startAt, startT: 0, endT: dur, 
