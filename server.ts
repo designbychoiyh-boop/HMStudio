@@ -139,6 +139,30 @@ clearOldJobsOnStartup();
 
 let renderWorkerRunning = false;
 
+async function moveFile(src: string, dest: string) {
+  try {
+    // Ensure destination directory exists
+    const destDir = path.dirname(dest);
+    if (!fs.existsSync(destDir)) {
+      fs.mkdirSync(destDir, { recursive: true });
+    }
+    
+    // Check if destination exists and delete it (overwrite)
+    if (fs.existsSync(dest)) {
+      await fsp.unlink(dest).catch(() => {});
+    }
+
+    await fsp.rename(src, dest);
+  } catch (err: any) {
+    if (err.code === 'EXDEV') {
+      await fsp.copyFile(src, dest);
+      await fsp.unlink(src).catch(() => {});
+    } else {
+      throw err;
+    }
+  }
+}
+
 function findLocalFfmpeg() {
   const base = path.join(ROOT, '.runtime', 'ffmpeg');
   if (!fs.existsSync(base)) return null;
@@ -333,9 +357,14 @@ async function setRenderTime(client: CdpClient, ts: number) {
   await waitForRenderReady(client, 10000);
 }
 
-async function captureFrameBuffer(client: CdpClient): Promise<Buffer> {
+async function captureFrameBuffer(client: CdpClient, width: number, height: number): Promise<Buffer> {
   // Use JPEG 100 quality for massive speedup over PNG, avoiding heavy compression bottlenecks
-  const result = await client.send('Page.captureScreenshot', { format: 'jpeg', quality: 100 });
+  // Use 'clip' to capture ONLY the exact composition area, removing any black bars/letterboxing
+  const result = await client.send('Page.captureScreenshot', { 
+    format: 'jpeg', 
+    quality: 100,
+    clip: { x: 0, y: 0, width, height, scale: 1 }
+  });
   return Buffer.from(result.data, 'base64');
 }
 
@@ -416,7 +445,7 @@ async function renderJob(record: RenderJobRecord) {
       '-framerate', String(fps),
       '-i', '-',
       '-c:v', encoder,
-      ...(encoder === 'hevc_nvenc' ? ['-preset', 'p4', '-cq', '18'] : ['-preset', 'veryfast', '-crf', '18']),
+      ...(encoder === 'hevc_nvenc' ? ['-preset', 'p7', '-cq', '12'] : ['-preset', 'slow', '-crf', '12']),
       '-b:v', '0',
       '-pix_fmt', 'yuv420p',
       '-movflags', '+faststart',
@@ -452,7 +481,7 @@ async function renderJob(record: RenderJobRecord) {
         await setRenderTime(session.client, Number(ts.toFixed(6)));
       }
       const t2 = Date.now();
-      const frameBuffer = await captureFrameBuffer(session.client);
+      const frameBuffer = await captureFrameBuffer(session.client, width, height);
       const t3 = Date.now();
       
       if (!ffmpegProc.stdin.writable) {
@@ -560,25 +589,44 @@ async function renderJob(record: RenderJobRecord) {
 
       finalPassArgs.push('-c:v', 'copy');
       if (actuallyHasAudio) finalPassArgs.push('-c:a', 'aac', '-b:a', '192k');
-      finalPassArgs.push(outputPath);
+      const finalPassTemp = path.join(RENDER_DIR, `${record.id}_final.mp4`);
+      finalPassArgs.push(finalPassTemp);
 
+      console.log(`[Render ${record.id}] Final pass command: "${ffmpegBin()}" ${finalPassArgs.join(' ')}`);
+      
       await new Promise((resolve, reject) => {
         const finalProc = spawn(ffmpegBin(), finalPassArgs);
         let err = '';
-        finalProc.stderr.on('data', d => err += d.toString());
+        finalProc.stderr.on('data', d => {
+          const msg = d.toString();
+          if (msg.includes('Error')) console.error(`[Render ${record.id}] Final pass stderr: ${msg}`);
+          err += msg;
+        });
         finalProc.on('close', code => {
           if (code === 0) resolve(true);
           else reject(new Error(`Final pass failed (code ${code}): ${err.slice(-200)}`));
         });
       });
 
-      if (fs.existsSync(outputPath)) {
+      console.log(`[Render ${record.id}] Moving final file to: ${outputPath}`);
+      try {
+        await moveFile(finalPassTemp, outputPath);
         await fsp.unlink(tempOutputPath).catch(() => {});
-      } else {
-        await fsp.rename(tempOutputPath, outputPath).catch(() => {});
+        console.log(`[Render ${record.id}] SUCCESSFULLY SAVED TO: ${outputPath}`);
+      } catch (err: any) {
+        console.error(`[Render ${record.id}] FAILED TO MOVE FINAL FILE: ${err.message}`);
+        throw err;
       }
     } else {
-      await fsp.rename(tempOutputPath, outputPath).catch(() => {});
+      // No audio and no preview, just move the file
+      console.log(`[Render ${record.id}] No final pass needed. Moving temp file to: ${outputPath}`);
+      try {
+        await moveFile(tempOutputPath, outputPath);
+        console.log(`[Render ${record.id}] SUCCESSFULLY SAVED TO: ${outputPath}`);
+      } catch (err: any) {
+        console.error(`[Render ${record.id}] FAILED TO MOVE TEMP FILE: ${err.message}`);
+        throw err;
+      }
     }
 
     const totalElapsed = ((Date.now() - renderStartedAt) / 1000).toFixed(1);
@@ -856,11 +904,12 @@ app.post('/api/render-jobs/start', async (req, res) => {
     payload: {
       ...req.body,
       output: {
+        ...(req.body.output || {}),
         fileName: safeProjectName,
-        outputPath: path.join(RENDER_DIR, `${id}.mp4`),
-        previewPath: path.join(PREVIEW_DIR, `${id}.png`),
-        logPath: path.join(LOG_DIR, `${id}.log.txt`),
-        errorPath: path.join(LOG_DIR, `${id}.error.txt`),
+        outputPath: req.body.output?.outputPath || path.join(RENDER_DIR, `${id}.mp4`),
+        previewPath: req.body.output?.previewPath || path.join(PREVIEW_DIR, `${id}.png`),
+        logPath: req.body.output?.logPath || path.join(LOG_DIR, `${id}.log.txt`),
+        errorPath: req.body.output?.errorPath || path.join(LOG_DIR, `${id}.error.txt`),
       },
     },
   };

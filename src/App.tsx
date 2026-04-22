@@ -1211,8 +1211,12 @@ function PropRow({ label, value, min, max, step, unit = "", onChange, onCommit }
         <span style={{ fontSize: 10, color: "#71717a", textTransform: "uppercase", letterSpacing: "0.08em" }}>{label}</span>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <input type="number" value={typeof value === "number" ? value : 0} min={min} max={max} step={step}
-            onChange={e => onChange(clamp(Number(e.target.value), min, max))}
-            onBlur={onCommit}
+            onChange={e => onChange(Number(e.target.value))}
+            onBlur={() => {
+              onChange(clamp(value, min, max));
+              if (onCommit) onCommit();
+            }}
+            onFocus={e => e.target.select()}
             style={{ width: 76, background: "#18181b", border: "1px solid #3f3f46", borderRadius: 4, color: "#fff", fontSize: 10, padding: "2px 6px", outline: "none", fontFamily: "monospace" }} />
           <span style={{ fontSize: 10, color: "#a1a1aa", fontFamily: "monospace" }}>{unit}</span>
         </div>
@@ -1229,8 +1233,12 @@ function AnimPropRow({ label, value, min, max, step, unit = "", onChange, onComm
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <button onClick={onToggleKeyframe} style={{ background: keyframed ? "#f97316" : "#18181b", color: keyframed ? "#000" : "#a1a1aa", border: `1px solid ${keyframed ? "#f97316" : "#3f3f46"}`, borderRadius: 4, padding: "1px 6px", fontSize: 10, cursor: "pointer", fontWeight: 700 }}>◆</button>
           <input type="number" value={typeof value === "number" ? value : 0} min={min} max={max} step={step}
-            onChange={e => onChange(clamp(Number(e.target.value), min, max))}
-            onBlur={onCommit}
+            onChange={e => onChange(Number(e.target.value))}
+            onBlur={() => {
+              onChange(clamp(value, min, max));
+              if (onCommit) onCommit();
+            }}
+            onFocus={e => e.target.select()}
             style={{ width: 68, background: "#18181b", border: "1px solid #3f3f46", borderRadius: 4, color: "#fff", fontSize: 10, padding: "2px 6px", outline: "none", fontFamily: "monospace" }} />
           <span style={{ fontSize: 10, color: "#a1a1aa", fontFamily: "monospace" }}>{unit}</span>
         </div>
@@ -1364,7 +1372,7 @@ export default function HMStudio() {
   
   useEffect(() => {
     // @ts-ignore
-    window.__VIBE_SET_RENDER_TIME = async (ts) => {
+    window.__HM_SET_RENDER_TIME = async (ts) => {
       document.documentElement.setAttribute('data-render-ready', '0');
       document.body.setAttribute('data-render-ready', '0');
       
@@ -1376,7 +1384,7 @@ export default function HMStudio() {
     };
     return () => {
       // @ts-ignore
-      delete window.__VIBE_SET_RENDER_TIME;
+      delete window.__HM_SET_RENDER_TIME;
     };
   }, []);
 
@@ -2492,9 +2500,9 @@ export default function HMStudio() {
   ) : null;
 
   const renderOnlyStage = (
-    <div style={{ width: '100vw', height: '100vh', background: '#000', overflow: 'hidden' }}>
+    <div style={{ width: comp.w, height: comp.h, background: '#000', overflow: 'hidden' }}>
       {renderJobLoaded && (
-        <div style={{ position: 'relative', width: '100%', height: '100%', '--stage-scale': window.innerWidth / comp.w } as any}>
+        <div style={{ position: 'relative', width: comp.w, height: comp.h, '--stage-scale': 1 } as any}>
           <WebGLRenderStage
             composition={comp}
             clips={clips}
@@ -3113,6 +3121,7 @@ export default function HMStudio() {
                       <input type="number" value={selGfx.ts.toFixed(1)} min={0} step={0.1}
                         onChange={e => updateGfx(selGfx.id, { ts: Math.max(0, Number(e.target.value)) })}
                         onBlur={snap}
+                        onFocus={e => e.target.select()}
                         style={{ width: "100%", background: "#18181b", border: `1px solid ${BORDER}`, color: "#e4e4e7", fontSize: 11, padding: "3px 6px", borderRadius: 4, outline: "none", boxSizing: "border-box" }} />
                     </div>
                     <div>
@@ -3120,6 +3129,7 @@ export default function HMStudio() {
                       <input type="number" value={selGfx.dur.toFixed(1)} min={0.1} step={0.1}
                         onChange={e => updateGfx(selGfx.id, { dur: Math.max(0.1, Number(e.target.value)) })}
                         onBlur={snap}
+                        onFocus={e => e.target.select()}
                         style={{ width: "100%", background: "#18181b", border: `1px solid ${BORDER}`, color: "#e4e4e7", fontSize: 11, padding: "3px 6px", borderRadius: 4, outline: "none", boxSizing: "border-box" }} />
                     </div>
                   </div>
@@ -3205,7 +3215,12 @@ export default function HMStudio() {
                 <label key={k} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   <span style={{ fontSize: 11, color: "#71717a" }}>{l}</span>
                   <input type="number" value={comp[k]} min={mn} max={mx}
-                    onChange={e => setComp(c => ({ ...c, [k]: Math.max(mn, Math.min(mx, Number(e.target.value) || c[k])) }))}
+                    onChange={e => setComp(c => ({ ...c, [k]: Number(e.target.value) || 0 }))}
+                    onFocus={e => e.target.select()}
+                    onBlur={e => {
+                      const val = Number(e.target.value);
+                      setComp(c => ({ ...c, [k]: Math.max(mn, Math.min(mx, val || mn)) }));
+                    }}
                     style={{ background: "#0a0a0a", border: `1px solid ${BORDER}`, color: "#e4e4e7", fontSize: 13, padding: "6px 10px", borderRadius: 6, outline: "none" }} />
                 </label>
               ))}
@@ -3251,11 +3266,11 @@ export default function HMStudio() {
               <div>
                 <div style={{ marginBottom: 8 }}>
                   <div style={{ fontSize: 10, color: "#71717a", marginBottom: 3 }}>템플릿 이름</div>
-                  <input type="text" value={editingTemplate.name} onChange={e => updateTemplateAsset(editingTemplate.id, { name: e.target.value })} style={{ width: "100%", background: "#18181b", border: `1px solid ${BORDER}`, borderRadius: 6, color: "#fff", padding: "6px 8px", fontSize: 11, boxSizing: "border-box" }} />
+                  <input type="text" value={editingTemplate.name} onFocus={e => e.target.select()} onChange={e => updateTemplateAsset(editingTemplate.id, { name: e.target.value })} style={{ width: "100%", background: "#18181b", border: `1px solid ${BORDER}`, borderRadius: 6, color: "#fff", padding: "6px 8px", fontSize: 11, boxSizing: "border-box" }} />
                 </div>
                 <div style={{ marginBottom: 8 }}>
                   <div style={{ fontSize: 10, color: "#71717a", marginBottom: 3 }}>메인 컴프명</div>
-                  <input type="text" value={editingTemplate.compName || ""} onChange={e => updateTemplateAsset(editingTemplate.id, { compName: e.target.value })} style={{ width: "100%", background: "#18181b", border: `1px solid ${BORDER}`, borderRadius: 6, color: "#fff", padding: "6px 8px", fontSize: 11, boxSizing: "border-box" }} />
+                  <input type="text" value={editingTemplate.compName || ""} onFocus={e => e.target.select()} onChange={e => updateTemplateAsset(editingTemplate.id, { compName: e.target.value })} style={{ width: "100%", background: "#18181b", border: `1px solid ${BORDER}`, borderRadius: 6, color: "#fff", padding: "6px 8px", fontSize: 11, boxSizing: "border-box" }} />
                 </div>
                 <div style={{ display: "flex", gap: 12, marginBottom: 10 }}>
                   <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#a1a1aa" }}><input type="checkbox" checked={editingTemplate.allowFontChange ?? true} onChange={e => updateTemplateAsset(editingTemplate.id, { allowFontChange: e.target.checked })} />폰트 변경</label>
@@ -3270,8 +3285,8 @@ export default function HMStudio() {
               </div>
               {(editingTemplate.fields || []).map((f, idx) => (
                 <div key={f.id} style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 8, marginBottom: 8 }}>
-                  <input type="text" value={f.label} onChange={e => updateTemplateFieldDef(editingTemplate.id, f.id, { label: e.target.value })} placeholder={`필드 ${idx + 1} 이름`} style={{ background: "#18181b", border: `1px solid ${BORDER}`, borderRadius: 6, color: "#fff", padding: "6px 8px", fontSize: 11 }} />
-                  <input type="text" value={f.value} onChange={e => updateTemplateFieldDef(editingTemplate.id, f.id, { value: e.target.value })} placeholder="기본값" style={{ background: "#18181b", border: `1px solid ${BORDER}`, borderRadius: 6, color: "#fff", padding: "6px 8px", fontSize: 11 }} />
+                  <input type="text" value={f.label} onFocus={e => e.target.select()} onChange={e => updateTemplateFieldDef(editingTemplate.id, f.id, { label: e.target.value })} placeholder={`필드 ${idx + 1} 이름`} style={{ background: "#18181b", border: `1px solid ${BORDER}`, borderRadius: 6, color: "#fff", padding: "6px 8px", fontSize: 11 }} />
+                  <input type="text" value={f.value} onFocus={e => e.target.select()} onChange={e => updateTemplateFieldDef(editingTemplate.id, f.id, { value: e.target.value })} placeholder="기본값" style={{ background: "#18181b", border: `1px solid ${BORDER}`, borderRadius: 6, color: "#fff", padding: "6px 8px", fontSize: 11 }} />
                   <button onClick={() => removeTemplateFieldDef(editingTemplate.id, f.id)} style={{ padding: "6px 10px", background: "#18181b", color: "#ef4444", border: `1px solid ${BORDER}`, borderRadius: 6, fontSize: 10, cursor: "pointer" }}>삭제</button>
                 </div>
               ))}
@@ -3385,7 +3400,7 @@ export default function HMStudio() {
                 <div style={{ fontSize: 13, fontWeight: 800, marginBottom: 16, display: "flex", alignItems: "center", gap: 10 }}><span>📄</span> 파일 요약</div>
                 <div style={{ marginBottom: 16 }}>
                   <div style={{ fontSize: 10, color: "#71717a", marginBottom: 6 }}>저장 파일명</div>
-                  <input type="text" value={exportSettings.filename} onChange={e => setExportSettings(s => ({ ...s, filename: e.target.value }))}
+                  <input type="text" value={exportSettings.filename} onFocus={e => e.target.select()} onChange={e => setExportSettings(s => ({ ...s, filename: e.target.value }))}
                     style={{ width: "100%", background: "#1c1c1e", border: "1px solid #27272a", borderRadius: 6, color: "#fff", padding: "10px", fontSize: 12, outline: "none" }} />
                 </div>
                 <div>
@@ -3394,6 +3409,7 @@ export default function HMStudio() {
                     <input 
                       type="text" 
                       value={exportSettings.path} 
+                      onFocus={e => e.target.select()}
                       onChange={e => setExportSettings(s => ({ ...s, path: e.target.value }))}
                       placeholder="서버 절대 경로 입력 (예: C:\Exports)"
                       style={{ 
@@ -3420,12 +3436,12 @@ export default function HMStudio() {
                 <div style={{ display: "flex", gap: 12 }}>
                   <div style={{ flex: 1 }}>
                     <div style={{ fontSize: 10, color: "#71717a", marginBottom: 6 }}>너비</div>
-                    <input type="number" value={exportSettings.width} onChange={e => setExportSettings(s => ({ ...s, width: Number(e.target.value) }))} readOnly={!isCustom}
+                    <input type="number" value={exportSettings.width} onFocus={e => e.target.select()} onChange={e => setExportSettings(s => ({ ...s, width: Number(e.target.value) }))} readOnly={!isCustom}
                       style={{ width: "100%", background: isCustom ? "#1c1c1e" : "#0c0c0c", border: "1px solid #27272a", borderRadius: 6, color: isCustom ? "#fff" : "#71717a", padding: "10px", fontSize: 12, outline: "none" }} />
                   </div>
                   <div style={{ flex: 1 }}>
                     <div style={{ fontSize: 10, color: "#71717a", marginBottom: 6 }}>높이</div>
-                    <input type="number" value={exportSettings.height} onChange={e => setExportSettings(s => ({ ...s, height: Number(e.target.value) }))} readOnly={!isCustom}
+                    <input type="number" value={exportSettings.height} onFocus={e => e.target.select()} onChange={e => setExportSettings(s => ({ ...s, height: Number(e.target.value) }))} readOnly={!isCustom}
                       style={{ width: "100%", background: isCustom ? "#1c1c1e" : "#0c0c0c", border: "1px solid #27272a", borderRadius: 6, color: isCustom ? "#fff" : "#71717a", padding: "10px", fontSize: 12, outline: "none" }} />
                   </div>
                 </div>
@@ -3469,7 +3485,7 @@ export default function HMStudio() {
                           </div>
                         )}
                         {isDone && (
-                          <div style={{ fontSize: 10, color: "#22c55e", marginTop: 4 }}>✓ 파일이 저장되었습니다.</div>
+                          <div style={{ fontSize: 10, color: "#22c55e", marginTop: 4 }}>✓ 렌더링이 완료되었습니다.</div>
                         )}
                         {isFailed && item.error && (
                           <div style={{ fontSize: 9, color: "#ef4444", marginTop: 2 }}>{item.error}</div>

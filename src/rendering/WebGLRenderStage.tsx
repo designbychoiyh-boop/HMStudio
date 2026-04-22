@@ -48,7 +48,7 @@ async function ensureVideoReady(video: HTMLVideoElement) {
 
 async function syncVideoToTime(video: HTMLVideoElement, layer: any, time: number, fps = 30) {
   const local = Math.max(0, Number(time || 0) - Number(layer.ts || 0) + Number(layer.startT || 0));
-  const threshold = 0.25 / Math.max(1, Number(fps || 30));
+  const threshold = 0.001; // Tighter threshold for frame-perfect rendering
   await ensureVideoReady(video);
   try { video.pause(); } catch { }
   if (Math.abs((video.currentTime || 0) - local) > threshold) {
@@ -142,7 +142,11 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
       if (cancelled || token !== drawTokenRef.current) return;
       compositor.resize(project.composition.w, project.composition.h);
       compositor.render(project, time, { videos: videosRef.current });
-      onReady?.();
+      
+      // Ensure WebGL flush and DOM update before signaling ready
+      requestAnimationFrame(() => {
+        onReady?.();
+      });
     };
     draw();
     return () => { cancelled = true; };
@@ -153,7 +157,7 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
       ref={canvasRef}
       width={project.composition.w}
       height={project.composition.h}
-      style={{ width: '100vw', height: '100vh', display: 'block', background: project.composition.bg }}
+      style={{ width: project.composition.w, height: project.composition.h, display: 'block', background: project.composition.bg }}
     />
   );
 }
