@@ -1186,10 +1186,54 @@ function TransformHandles({ g, time, stageRef, onBeginInteract }) {
 // ── Slider ────────────────────────────────────────────────────────────────────
 function Slider({ value, min, max, step, onChange, onCommit, style }) {
   return (
-    <input type="range" min={min} max={max} step={step} value={value}
-      onChange={e => onChange(Number(e.target.value))}
-      onMouseUp={onCommit} onTouchEnd={onCommit}
-      style={{ width: "100%", accentColor: "#f97316", cursor: "pointer", ...style }} />
+    <div style={{ position: "relative", width: "100%", height: 32, display: "flex", alignItems: "center", ...style }}>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e => onChange(Number(e.target.value))}
+        onMouseUp={onCommit} onTouchEnd={onCommit}
+        style={{ 
+          width: "100%", 
+          appearance: "none", 
+          background: "#1e1e20", 
+          height: 8, 
+          borderRadius: 4, 
+          outline: "none", 
+          cursor: "pointer",
+          accentColor: "#f97316"
+        }} 
+      />
+      <style>{`
+        input[type=range]::-webkit-slider-thumb {
+          appearance: none;
+          width: 20px;
+          height: 20px;
+          background: #f97316;
+          border-radius: 50%;
+          cursor: pointer;
+          border: 3px solid #000;
+          box-shadow: 0 0 8px rgba(0,0,0,0.6);
+          transition: transform 0.1s ease;
+          margin-top: -6px; /* Center thumb on larger track */
+        }
+        input[type=range]::-webkit-slider-thumb:hover {
+          transform: scale(1.15);
+        }
+        /* Firefox support */
+        input[type=range]::-moz-range-thumb {
+          width: 20px;
+          height: 20px;
+          background: #f97316;
+          border-radius: 50%;
+          cursor: pointer;
+          border: 3px solid #000;
+          box-shadow: 0 0 8px rgba(0,0,0,0.6);
+        }
+        input[type=range]::-moz-range-track {
+          height: 8px;
+          background: #1e1e20;
+          border-radius: 4px;
+        }
+      `}</style>
+    </div>
   );
 }
 // ── Color Swatch ──────────────────────────────────────────────────────────────
@@ -1226,21 +1270,57 @@ function PropRow({ label, value, min, max, step, unit = "", onChange, onCommit }
   );
 }
 function AnimPropRow({ label, value, min, max, step, unit = "", onChange, onCommit, keyframed, onToggleKeyframe }) {
+  const icon = label.includes("위치 X") ? "↔" : label.includes("위치 Y") ? "↕" : label.includes("비율") ? "⛶" : label.includes("회전") ? "↺" : label.includes("불투명도") ? "◐" : "•";
   return (
-    <div style={{ marginBottom: 8 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 3 }}>
-        <span style={{ fontSize: 10, color: "#71717a", textTransform: "uppercase", letterSpacing: "0.08em" }}>{label}</span>
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <button onClick={onToggleKeyframe} style={{ background: keyframed ? "#f97316" : "#18181b", color: keyframed ? "#000" : "#a1a1aa", border: `1px solid ${keyframed ? "#f97316" : "#3f3f46"}`, borderRadius: 4, padding: "1px 6px", fontSize: 10, cursor: "pointer", fontWeight: 700 }}>◆</button>
-          <input type="number" value={typeof value === "number" ? value : 0} min={min} max={max} step={step}
-            onChange={e => onChange(Number(e.target.value))}
-            onBlur={() => {
-              onChange(clamp(value, min, max));
-              if (onCommit) onCommit();
-            }}
-            onFocus={e => e.target.select()}
-            style={{ width: 68, background: "#18181b", border: "1px solid #3f3f46", borderRadius: 4, color: "#fff", fontSize: 10, padding: "2px 6px", outline: "none", fontFamily: "monospace" }} />
-          <span style={{ fontSize: 10, color: "#a1a1aa", fontFamily: "monospace" }}>{unit}</span>
+    <div style={{ marginBottom: 14, background: "rgba(255,255,255,0.02)", padding: "10px 12px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.05)" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 14, color: "#f97316", opacity: 0.8 }}>{icon}</span>
+          <span style={{ fontSize: 11, color: "#a1a1aa", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={onToggleKeyframe} 
+            title="키프레임 설정"
+            style={{ 
+              background: keyframed ? "#f97316" : "transparent", 
+              color: keyframed ? "#000" : "#52525b", 
+              border: `1px solid ${keyframed ? "#f97316" : "#27272a"}`, 
+              borderRadius: 4, 
+              width: 18, 
+              height: 18, 
+              display: "flex", 
+              alignItems: "center", 
+              justifyContent: "center",
+              fontSize: 10, 
+              cursor: "pointer", 
+              transition: "all 0.1s" 
+            }}>
+            ◆
+          </button>
+          <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+            <input type="number" value={typeof value === "number" ? value : 0} min={min} max={max} step={step}
+              onChange={e => onChange(Number(e.target.value))}
+              onBlur={() => {
+                onChange(clamp(value, min, max));
+                if (onCommit) onCommit();
+              }}
+              onFocus={e => e.target.select()}
+              style={{ 
+                width: 60, 
+                background: "#000", 
+                border: "1px solid #27272a", 
+                borderRadius: 4, 
+                color: "#f97316", 
+                fontSize: 12, 
+                padding: "3px 6px", 
+                textAlign: "right",
+                outline: "none", 
+                fontFamily: "monospace",
+                fontWeight: 700
+              }} 
+            />
+            <span style={{ marginLeft: 4, fontSize: 10, color: "#52525b", fontWeight: 700, width: 14 }}>{unit}</span>
+          </div>
         </div>
       </div>
       <Slider value={value} min={min} max={max} step={step} onChange={onChange} onCommit={onCommit} />
@@ -1467,6 +1547,8 @@ export default function HMStudio() {
   }, [isRenderMode, renderJobId, renderTsParam]);
 
   const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isEditingTime, setIsEditingTime] = useState(false);
+  const [timeInput, setTimeInput] = useState("");
 
   const [systemStatus, setSystemStatus] = useState<any>(null);
   const [showSystemModal, setShowSystemModal] = useState(false);
@@ -1911,7 +1993,11 @@ export default function HMStudio() {
       } else {
         meta = await new Promise(res => {
           const v = document.createElement('video'); v.src = url; v.preload = 'metadata';
-          v.onloadedmetadata = () => res({ dur: v.duration || 5, w: v.videoWidth || 1920, h: v.videoHeight || 1080 });
+          v.onloadedmetadata = () => {
+            let d = v.duration;
+            if (!d || isNaN(d) || d === Infinity) d = 5;
+            res({ dur: d, w: v.videoWidth || 1920, h: v.videoHeight || 1080 });
+          };
           v.onerror = () => res({ dur: 5, w: 1920, h: 1080 });
         });
       }
@@ -1950,10 +2036,12 @@ export default function HMStudio() {
     }
     snap();
     setClips(cs => [...cs, ...newClips]);
-    const nextTotal = Math.max(totalDur, ...newClips.map(c => c.ts + c.dur));
-    setTotalDur(nextTotal);
-    setRenderIn(0);
-    setRenderOut(nextTotal);
+    const minNewTs = Math.min(...newClips.map(c => c.ts));
+    const maxNewEnd = Math.max(...newClips.map(c => c.ts + c.dur));
+    setTotalDur(prev => Math.max(prev, maxNewEnd));
+    setRenderIn(minNewTs);
+    setRenderOut(maxNewEnd);
+    setTime(minNewTs);
   }, [clips.length, preparePreviewPopout, snap, time, totalDur]);
   const handleFileUpload = async e => {
     const files = Array.from(e.target.files ?? []);
@@ -2187,12 +2275,9 @@ export default function HMStudio() {
   useEffect(() => () => { try { previewWinRef.current?.close(); } catch {} }, []);
 
   useEffect(() => {
-    setRenderOut(prev => {
-      const maxOut = Math.max(totalDur, 0.1);
-      if (prev == null) return maxOut;
-      return clamp(prev, 0.1, maxOut);
-    });
-    setRenderIn(prev => clamp(prev, 0, Math.max(0, totalDur)));
+    if (totalDur <= 0.1) return;
+    setRenderOut(prev => prev == null ? totalDur : prev);
+    setRenderIn(prev => prev == null ? 0 : prev);
   }, [totalDur]);
 
   useEffect(() => {
@@ -2525,10 +2610,6 @@ export default function HMStudio() {
       </button>
       <button onClick={() => setTime(t => Math.min(totalDur, t + 5))} style={{ background: 'none', border: 'none', color: '#71717a', fontSize: 14, cursor: 'pointer' }}>▷▷</button>
       <button onClick={() => { setTime(totalDur); setPlaying(false); }} style={{ background: 'none', border: 'none', color: '#71717a', fontSize: 16, cursor: 'pointer' }}>⏭</button>
-      <div style={{ marginLeft: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-        <span style={{ fontSize: 10, color: '#52525b' }}>Zoom:</span>
-        <input type='range' min={0.3} max={5} step={0.1} value={zoom} onChange={e => setZoom(Number(e.target.value))} style={{ width: 80, accentColor: ACCENT }} />
-      </div>
       <div style={{ display: 'flex', gap: 4 }}>
         <button onClick={undoFn} title='Undo (Ctrl+Z)' style={{ background: 'none', border: `1px solid ${BORDER}`, color: '#71717a', fontSize: 12, cursor: 'pointer', borderRadius: 4, padding: '2px 8px' }}>↩</button>
         <button onClick={redoFn} title='Redo (Ctrl+Shift+Z)' style={{ background: 'none', border: `1px solid ${BORDER}`, color: '#71717a', fontSize: 12, cursor: 'pointer', borderRadius: 4, padding: '2px 8px' }}>↪</button>
@@ -2607,13 +2688,11 @@ export default function HMStudio() {
             <div style={{ fontSize: 14, color: '#71717a' }}>v2.4.0-STABLE</div>
             
             <div style={{ marginTop: 60 }}>
-              <div style={{ fontSize: 12, color: '#52525b', fontWeight: 700, letterSpacing: '0.1em', marginBottom: 20 }}>AFFILIATED PARTNERS</div>
-              <div style={{ display: 'flex', gap: 24, opacity: 0.6, filter: 'grayscale(100%)' }}>
-                <span style={{ fontSize: 12, fontWeight: 800 }}>HANMAC</span>
-                <span style={{ fontSize: 12, fontWeight: 800 }}>SAMAN</span>
-                <span style={{ fontSize: 12, fontWeight: 800 }}>PTC</span>
-                <span style={{ fontSize: 12, fontWeight: 800 }}>HALLA</span>
-                <span style={{ fontSize: 12, fontWeight: 800 }}>BARON</span>
+              <div style={{ fontSize: 13, color: '#a1a1aa', fontWeight: 600, marginBottom: 16 }}>한맥가족사</div>
+              <div style={{ display: 'flex', gap: 24, flexWrap: 'nowrap', opacity: 0.6 }}>
+                {['HANMAC', 'SAMAN', 'JANGHEON', 'PTC', 'HALLA', 'BARON'].map(id => (
+                  <span key={id} style={{ fontSize: 12, fontWeight: 800 }}>{id}</span>
+                ))}
               </div>
             </div>
           </div>
@@ -2688,135 +2767,113 @@ export default function HMStudio() {
   if (!isLoggedIn && !isRenderMode) return LoginScreen;
 
   const SystemStatusModal = showSystemModal && (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(8px)' }}>
-      <div style={{ width: 480, background: '#121212', borderRadius: 12, border: `1px solid ${BORDER}`, padding: 30, boxShadow: '0 20px 40px rgba(0,0,0,0.4)' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
-          <h3 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: ACCENT }}>시스템 환경 진단</h3>
-          <button onClick={() => setShowSystemModal(false)} style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: 20 }}>&times;</button>
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.9)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(10px)' }}>
+      <div style={{ width: 520, background: '#121212', borderRadius: 16, border: `1px solid ${BORDER}`, padding: 32, boxShadow: '0 25px 50px rgba(0,0,0,0.5)' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 28 }}>
+          <h3 style={{ margin: 0, fontSize: 20, fontWeight: 900, color: ACCENT, letterSpacing: '-0.02em' }}>필수 프로그램 설치 확인</h3>
+          <button onClick={() => setShowSystemModal(false)} style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: 24 }}>&times;</button>
         </div>
         
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-          <div style={{ background: '#1a1a1a', padding: 16, borderRadius: 8 }}>
-            <div style={{ fontSize: 11, color: '#52525b', fontWeight: 700, marginBottom: 8, letterSpacing: '0.05em' }}>FFMPEG STATUS</div>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {/* FFmpeg Section */}
+          <div style={{ background: '#1a1a1a', padding: 20, borderRadius: 12, border: `1px solid ${systemStatus?.ffmpeg?.found ? '#22c55e33' : '#ef444433'}`, transition: 'all 0.2s' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
               <div>
-                <div style={{ fontSize: 14 }}>
-                  {systemStatus?.ffmpeg?.hasSystem 
-                    ? "✅ 시스템 FFmpeg 설치됨" 
-                    : (systemStatus?.ffmpeg?.isLocal 
-                        ? "📦 포터블 FFmpeg 설치됨" 
-                        : (systemStatus?.ffmpeg?.isBundled 
-                            ? "🎒 프로젝트 내장 FFmpeg 사용 중" 
-                            : "❌ FFmpeg 미설치"))}
-                </div>
-                <div style={{ fontSize: 10, color: '#71717a', marginTop: 4, maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {systemStatus?.ffmpeg?.path || "렌더링을 위해 FFmpeg이 필요합니다."}
+                <div style={{ fontSize: 11, color: '#52525b', fontWeight: 800, textTransform: 'uppercase', marginBottom: 6, letterSpacing: '0.05em' }}>영상 인코딩 엔진</div>
+                <div style={{ fontSize: 16, fontWeight: 700, color: systemStatus?.ffmpeg?.found ? '#22c55e' : '#ef4444', display: 'flex', alignItems: 'center', gap: 6 }}>
+                  {systemStatus?.ffmpeg?.found ? "✅ FFmpeg 설치됨" : "❌ FFmpeg 미설치"}
                 </div>
               </div>
               <button 
                 onClick={installFfmpeg}
                 disabled={isInstallingFfmpeg}
                 style={{ 
-                  padding: '6px 12px', 
-                  background: (systemStatus?.ffmpeg?.isLocal || systemStatus?.ffmpeg?.hasSystem) ? 'transparent' : ACCENT, 
-                  color: (systemStatus?.ffmpeg?.isLocal || systemStatus?.ffmpeg?.hasSystem) ? '#52525b' : '#000', 
-                  border: (systemStatus?.ffmpeg?.isLocal || systemStatus?.ffmpeg?.hasSystem) ? `1px solid ${BORDER}` : 'none', 
-                  borderRadius: 4, 
-                  fontSize: 10, 
-                  fontWeight: 700, 
+                  padding: '8px 16px', 
+                  background: systemStatus?.ffmpeg?.found ? '#27272a' : ACCENT, 
+                  color: systemStatus?.ffmpeg?.found ? '#a1a1aa' : '#000', 
+                  border: 'none', 
+                  borderRadius: 6, 
+                  fontSize: 12, 
+                  fontWeight: 800, 
                   cursor: 'pointer',
                   opacity: isInstallingFfmpeg ? 0.6 : 1
                 }}
               >
-                {isInstallingFfmpeg ? "설치 중..." : (systemStatus?.ffmpeg?.isLocal ? "재설치" : "포터블 설치")}
+                {isInstallingFfmpeg ? "설치 중..." : (systemStatus?.ffmpeg?.found ? "재설치" : "엔진 설치하기")}
               </button>
             </div>
-          </div>
-
-          <div style={{ background: '#1a1a1a', padding: 16, borderRadius: 8 }}>
-            <div style={{ fontSize: 11, color: '#52525b', fontWeight: 700, marginBottom: 8, letterSpacing: '0.05em' }}>GPU ACCELERATION</div>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <span style={{ fontSize: 14 }}>{systemStatus?.gpu?.supported ? "🚀 NVIDIA NVENC 지원됨" : "⚠️ 소프트웨어 인코딩 모드"}</span>
-              <span style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: systemStatus?.gpu?.supported ? `${ACCENT}22` : '#3f3f46', color: systemStatus?.gpu?.supported ? ACCENT : '#a1a1aa' }}>
-                {systemStatus?.gpu?.encoder}
-              </span>
+            <div style={{ fontSize: 12, color: '#71717a', lineHeight: 1.5 }}>
+              {systemStatus?.ffmpeg?.found 
+                ? `경로: ${systemStatus?.ffmpeg?.path}`
+                : "영상 저장 및 렌더링을 위해 FFmpeg 엔진이 반드시 필요합니다."}
             </div>
           </div>
 
-          <div style={{ background: '#1a1a1a', padding: 16, borderRadius: 8 }}>
-            <div style={{ fontSize: 11, color: '#52525b', fontWeight: 700, marginBottom: 8, letterSpacing: '0.05em' }}>BROWSER STATUS (RENDER ENGINE)</div>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          {/* Browser Engine Section */}
+          <div style={{ background: '#1a1a1a', padding: 20, borderRadius: 12, border: `1px solid ${systemStatus?.browser?.found ? '#22c55e33' : '#ef444433'}`, transition: 'all 0.2s' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
               <div>
-                <div style={{ fontSize: 14, color: systemStatus?.browser?.found ? '#fff' : '#ef4444' }}>
-                  {systemStatus?.browser?.hasSystem 
-                    ? "✅ 시스템 브라우저 설치됨" 
-                    : (systemStatus?.browser?.isLocal 
-                        ? "📦 포터블 브라우저 설치됨" 
-                        : "❌ 브라우저 미설치")}
-                </div>
-                <div style={{ fontSize: 10, color: '#71717a', marginTop: 4, maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {systemStatus?.browser?.path || "Chrome 또는 Edge가 설치되어 있어야 합니다."}
+                <div style={{ fontSize: 11, color: '#52525b', fontWeight: 800, textTransform: 'uppercase', marginBottom: 6, letterSpacing: '0.05em' }}>웹 렌더링 엔진</div>
+                <div style={{ fontSize: 16, fontWeight: 700, color: systemStatus?.browser?.found ? '#22c55e' : '#ef4444', display: 'flex', alignItems: 'center', gap: 6 }}>
+                  {systemStatus?.browser?.found ? "✅ Chrome/Edge 설치됨" : "❌ 브라우저 엔진 미설치"}
                 </div>
               </div>
-              {!systemStatus?.browser?.isLocal && !systemStatus?.browser?.hasSystem ? (
-                <button 
-                  onClick={installChrome}
-                  disabled={isInstallingChrome}
-                  style={{ 
-                    padding: '8px 16px', 
-                    background: ACCENT, 
-                    color: '#000', 
-                    border: 'none', 
-                    borderRadius: 6, 
-                    fontSize: 11, 
-                    fontWeight: 800, 
-                    cursor: 'pointer',
-                    boxShadow: '0 4px 12px rgba(249, 115, 22, 0.3)',
-                    opacity: isInstallingChrome ? 0.6 : 1
-                  }}
-                >
-                  {isInstallingChrome ? "설치 중..." : "포터블 설치하기"}
-                </button>
-              ) : (
-                <button 
-                  onClick={() => { if(confirm("브라우저를 다시 설치하시겠습니까?")) installChrome(); }}
-                  disabled={isInstallingChrome}
-                  style={{ background: 'none', border: `1px solid ${BORDER}`, color: '#52525b', fontSize: 9, padding: '4px 8px', borderRadius: 4, cursor: 'pointer' }}
-                >
-                  재설치
-                </button>
-              )}
+              <button 
+                onClick={installChrome}
+                disabled={isInstallingChrome}
+                style={{ 
+                  padding: '8px 16px', 
+                  background: systemStatus?.browser?.found ? '#27272a' : ACCENT, 
+                  color: systemStatus?.browser?.found ? '#a1a1aa' : '#000', 
+                  border: 'none', 
+                  borderRadius: 6, 
+                  fontSize: 12, 
+                  fontWeight: 800, 
+                  cursor: 'pointer',
+                  opacity: isInstallingChrome ? 0.6 : 1
+                }}
+              >
+                {isInstallingChrome ? "설치 중..." : (systemStatus?.browser?.found ? "재설치" : "엔진 설치하기")}
+              </button>
+            </div>
+            <div style={{ fontSize: 12, color: '#71717a', lineHeight: 1.5 }}>
+              {systemStatus?.browser?.found 
+                ? `경로: ${systemStatus?.browser?.path}`
+                : "고성능 렌더링을 위해 Chrome 또는 Edge 브라우저 엔진이 필요합니다."}
             </div>
           </div>
 
-          <div style={{ background: '#1a1a1a', padding: 16, borderRadius: 8 }}>
-            <div style={{ fontSize: 11, color: '#52525b', fontWeight: 700, marginBottom: 8, letterSpacing: '0.05em' }}>OS PLATFORM</div>
-            <div style={{ fontSize: 14 }}>{systemStatus?.platform} ({systemStatus?.arch})</div>
+          <div style={{ padding: '12px', background: '#f9731611', borderRadius: 8, border: '1px solid #f9731622', marginTop: 8 }}>
+            <div style={{ fontSize: 12, color: ACCENT, fontWeight: 700, marginBottom: 4 }}>💡 도움말</div>
+            <div style={{ fontSize: 11, color: '#a1a1aa', lineHeight: 1.6 }}>
+              위 프로그램들은 영상 편집 및 최종 파일 생성을 위한 핵심 구성 요소입니다.<br />
+              미설치 시 렌더링 기능이 작동하지 않을 수 있으므로 반드시 설치를 완료해 주세요.
+            </div>
           </div>
         </div>
 
-        <button onClick={() => setShowSystemModal(false)} style={{ width: '100%', marginTop: 32, padding: '12px', background: ACCENT, color: '#000', border: 'none', borderRadius: 6, fontWeight: 700, cursor: 'pointer' }}>확인 완료</button>
+        <button onClick={() => setShowSystemModal(false)} style={{ width: '100%', marginTop: 28, padding: '14px', background: ACCENT, color: '#000', border: 'none', borderRadius: 8, fontSize: 14, fontWeight: 900, cursor: 'pointer', boxShadow: '0 4px 15px rgba(249, 115, 22, 0.2)' }}>설정 완료</button>
       </div>
     </div>
   );
 
   return isRenderMode ? renderOnlyStage : (
-    <div style={{ display: "flex", flexDirection: "column", height: "100vh", width: "100vw", background: BG, color: "#e4e4e7", fontFamily: "'Inter', 'Noto Sans KR', sans-serif", fontSize: 12, overflow: "hidden", userSelect: "none" }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100vh", width: "100vw", background: BG, color: "#e4e4e7", fontFamily: "'Inter', 'Noto Sans KR', sans-serif", fontSize: 14, overflow: "hidden", userSelect: "none" }}>
       {SystemStatusModal}
       {/* ── HEADER ── */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", height: 40, padding: "0 16px", borderBottom: `1px solid ${BORDER}`, background: "#0f0f0f", flexShrink: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
-          <span style={{ fontWeight: 900, fontSize: 14, color: ACCENT, letterSpacing: "-0.04em" }}>HM Studio</span>
-          <button onClick={() => setShowSystemModal(true)} style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(255,255,255,0.03)', border: `1px solid ${BORDER}`, borderRadius: 4, padding: '2px 8px', color: systemStatus?.gpu?.supported ? ACCENT : '#71717a', cursor: 'pointer', fontSize: 10 }}>
-            <span style={{ fontSize: 12 }}>{systemStatus?.gpu?.supported ? "⚡" : "⚙️"}</span> 시스템 상태
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", height: 52, padding: "0 20px", borderBottom: `1px solid ${BORDER}`, background: "#0f0f0f", flexShrink: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 24 }}>
+          <span style={{ fontWeight: 900, fontSize: 18, color: ACCENT, letterSpacing: "-0.04em" }}>HM Studio</span>
+          <button onClick={() => setShowSystemModal(true)} style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(255,255,255,0.03)', border: `1px solid ${BORDER}`, borderRadius: 6, padding: '4px 12px', color: (systemStatus?.ffmpeg?.found && systemStatus?.browser?.found) ? ACCENT : '#ef4444', cursor: 'pointer', fontSize: 12 }}>
+            <span style={{ fontSize: 14 }}>{(systemStatus?.ffmpeg?.found && systemStatus?.browser?.found) ? "✅" : "⚠️"}</span> 필수 프로그램 설치 확인
           </button>
         </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <button onClick={() => setShowCompSettings(true)} style={{ ...btn(false), fontSize: 11 }}>컴포지션 설정</button>
-          <button onClick={() => projectFileRef.current?.click()} style={{ ...btn(false), fontSize: 11, marginLeft: 8 }}>📂 프로젝트 불러오기</button>
-          <button onClick={saveProject} style={{ ...btn(false), fontSize: 11, marginLeft: 8 }}>💾 프로젝트 저장</button>
+        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+          <button onClick={() => setShowCompSettings(true)} style={{ ...btn(false), fontSize: 13, padding: '6px 14px' }}>컴포지션 설정</button>
+          <button onClick={() => projectFileRef.current?.click()} style={{ ...btn(false), fontSize: 13, padding: '6px 14px' }}>📂 프로젝트 불러오기</button>
+          <button onClick={saveProject} style={{ ...btn(false), fontSize: 13, padding: '6px 14px' }}>💾 프로젝트 저장</button>
           <input ref={projectFileRef} type="file" accept=".json" style={{ display: "none" }} onChange={loadProject} />
-          <button onClick={handleRender} style={{ background: ACCENT, color: "#000", border: "none", borderRadius: 6, padding: "5px 16px", fontSize: 11, fontWeight: 700, cursor: "pointer", marginLeft: 8 }}>
+          <button onClick={handleRender} style={{ background: ACCENT, color: "#000", border: "none", borderRadius: 6, padding: "8px 24px", fontSize: 14, fontWeight: 800, cursor: "pointer", marginLeft: 8 }}>
             ▶ Render
           </button>
         </div>
@@ -2824,7 +2881,7 @@ export default function HMStudio() {
       {/* ── MAIN ── */}
       <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
         {/* ── LEFT TOOLBAR ── */}
-        <div style={{ width: 44, display: "flex", flexDirection: "column", alignItems: "center", borderRight: `1px solid ${BORDER}`, background: "#0f0f0f", padding: "10px 0", gap: 6, flexShrink: 0 }}>
+        <div style={{ width: 54, display: "flex", flexDirection: "column", alignItems: "center", borderRight: `1px solid ${BORDER}`, background: "#0f0f0f", padding: "16px 0", gap: 10, flexShrink: 0 }}>
           {[
             { t: "select", label: "↖", tip: "선택 (V)" },
             { t: "razor", label: "✂", tip: "자르기 (C)" },
@@ -2833,65 +2890,85 @@ export default function HMStudio() {
             { t: "circle", label: "●", tip: "원" },
           ].map(({ t, label, tip }) => (
             <button key={t} title={tip} onClick={() => setTool(t)}
-              style={{ width: 34, height: 34, borderRadius: 6, border: `1px solid ${tool === t ? ACCENT + "88" : BORDER}`, background: tool === t ? ACCENT + "18" : "transparent", color: tool === t ? ACCENT : "#71717a", fontSize: t === "text" ? 14 : 16, cursor: "pointer", fontWeight: 700 }}>
+              style={{ width: 42, height: 42, borderRadius: 8, border: `1px solid ${tool === t ? ACCENT + "88" : BORDER}`, background: tool === t ? ACCENT + "18" : "transparent", color: tool === t ? ACCENT : "#71717a", fontSize: t === "text" ? 18 : 20, cursor: "pointer", fontWeight: 700, transition: 'all 0.1s' }}>
               {label}
             </button>
           ))}
-          <div style={{ height: 1, width: 28, background: BORDER, margin: "4px 0" }} />
+          <div style={{ height: 1, width: 36, background: BORDER, margin: "6px 0" }} />
           <button title="삭제 (선택된 항목)" onClick={deleteSelected}
-            style={{ width: 34, height: 34, borderRadius: 6, border: `1px solid ${BORDER}`, background: "transparent", color: "#71717a", fontSize: 14, cursor: "pointer" }}>
+            style={{ width: 42, height: 42, borderRadius: 8, border: `1px solid ${BORDER}`, background: "transparent", color: "#71717a", fontSize: 18, cursor: "pointer" }}>
             🗑
           </button>
         </div>
         {/* ── ASSET PANEL ── */}
-        <div style={{ width: 220, borderRight: `1px solid ${BORDER}`, background: "#0d0d0d", display: "flex", flexDirection: "column", flexShrink: 0, overflow: "hidden" }}>
-          <div style={{ padding: "10px 12px 6px", borderBottom: `1px solid ${BORDER}` }}>
-            <div style={{ fontSize: 10, fontWeight: 700, color: "#52525b", textTransform: "uppercase", letterSpacing: "0.1em" }}>프로젝트</div>
+        <div style={{ width: 280, borderRight: `1px solid ${BORDER}`, background: "#0d0d0d", display: "flex", flexDirection: "column", flexShrink: 0, overflow: "hidden" }}>
+          <div style={{ padding: "16px 20px 12px", borderBottom: `1px solid ${BORDER}` }}>
+            <div style={{ fontSize: 14, fontWeight: 900, color: "#e4e4e7", textTransform: "uppercase", letterSpacing: "0.15em" }}>프로젝트 자산</div>
           </div>
           <div style={{ flex: 1, overflowY: "auto", padding: 10 }}>
             {/* Video Assets */}
-            <div style={{ marginBottom: 12 }}>
-              <div style={{ fontSize: 10, color: ACCENT, fontWeight: 700, marginBottom: 6, display: "flex", justifyContent: "space-between" }}>
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ fontSize: 16, color: ACCENT, fontWeight: 900, marginBottom: 12, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <span>📁 원본 푸티지</span>
-                <button onClick={() => { openVideoPicker(); }} style={{ background: "none", border: "none", color: "#71717a", fontSize: 11, cursor: "pointer" }}>+</button>
+                <button onClick={() => { openVideoPicker(); }} style={{ background: ACCENT + "22", border: `1px solid ${ACCENT}`, color: ACCENT, borderRadius: 4, width: 24, height: 24, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>+</button>
               </div>
-              {clips.map(c => (
-                <div key={c.id} onClick={() => { setSelClipId(c.id); setSelGfxId(null); }}
-                  style={{ padding: "4px 8px", borderRadius: 4, marginBottom: 2, background: selClipId === c.id ? ACCENT + "18" : "transparent", color: selClipId === c.id ? ACCENT : "#a1a1aa", cursor: "pointer", fontSize: 11, display: "flex", gap: 6, alignItems: "center" }}>
-                  <span>🎬</span><span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{c.name}</span>
-                </div>
-              ))}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
+                {clips.map(c => (
+                  <div key={c.id} onClick={() => { setSelClipId(c.id); setSelGfxId(null); }}
+                    style={{ 
+                      padding: 8, 
+                      borderRadius: 8, 
+                      background: selClipId === c.id ? ACCENT + "22" : "#141414", 
+                      border: `1px solid ${selClipId === c.id ? ACCENT : BORDER}`, 
+                      color: selClipId === c.id ? "#fff" : "#a1a1aa", 
+                      cursor: "pointer", 
+                      display: "flex", 
+                      flexDirection: "column", 
+                      gap: 8, 
+                      alignItems: "center",
+                      textAlign: "center",
+                      transition: "all 0.1s"
+                    }}>
+                    <div style={{ width: "100%", aspectRatio: "16/9", background: "#000", borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, boxShadow: "inset 0 0 10px rgba(0,0,0,0.5)" }}>
+                      🎬
+                    </div>
+                    <span style={{ fontSize: 12, fontWeight: 600, width: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</span>
+                  </div>
+                ))}
+              </div>
               <button onClick={() => { openVideoPicker(); }}
-                style={{ width: "100%", padding: "4px 8px", borderRadius: 4, background: "transparent", border: `1px dashed ${BORDER}`, color: "#52525b", fontSize: 11, cursor: "pointer", marginTop: 2 }}>
-                + 영상 추가
+                style={{ width: "100%", padding: "12px", borderRadius: 8, background: "transparent", border: `1px solid ${ACCENT}88`, color: ACCENT, fontSize: 14, fontWeight: 800, cursor: "pointer", marginTop: 4, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                <span style={{ fontSize: 18 }}>+</span> 영상 추가
               </button>
               <input ref={fileRef} type="file" accept="video/*,audio/*" multiple className="hidden" style={{ display: "none" }} onChange={handleFileUpload} />
             </div>
             <div style={{ height: 1, background: BORDER, margin: "8px 0" }} />
             {/* AE Templates */}
-            <div style={{ marginBottom: 12 }}>
-              <div style={{ fontSize: 10, color: ACCENT2, fontWeight: 700, marginBottom: 6 }}>
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ fontSize: 16, color: ACCENT2, fontWeight: 900, marginBottom: 12 }}>
                 <span>🎨 자막 템플릿</span>
               </div>
-              {importedAE.map(t => (
-                <div key={t.id}
-                  style={{ padding: "6px 8px", borderRadius: 4, background: "#0a1a0a", border: `1px dashed ${ACCENT2}44`, marginBottom: 4 }}>
-                  <div onClick={() => addAETemplate(t)} style={{ cursor: "pointer" }}>
-                    <div style={{ width: "100%", height: 58, background: "#000", borderRadius: 4, overflow: "hidden", marginBottom: 6, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                      <TemplateThumbnail template={t} fontFamily="Pretendard, 'Noto Sans KR', sans-serif" />
+              <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 12 }}>
+                {importedAE.map(t => (
+                  <div key={t.id}
+                    style={{ padding: 12, borderRadius: 8, background: "#0a1a0a", border: `1px solid ${ACCENT2}55`, marginBottom: 4 }}>
+                    <div onClick={() => addAETemplate(t)} style={{ cursor: "pointer" }}>
+                      <div style={{ width: "100%", height: 80, background: "#000", borderRadius: 6, overflow: "hidden", marginBottom: 10, display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
+                        <TemplateThumbnail template={t} fontFamily="Pretendard, 'Noto Sans KR', sans-serif" />
+                      </div>
+                      <div style={{ fontSize: 13, color: "#fff", fontWeight: 800, marginBottom: 2 }}>{t.name}</div>
+                      <div style={{ fontSize: 11, color: "#52525b" }}>{t.compName || "메인 컴프 미설정"}</div>
                     </div>
-                    <div style={{ fontSize: 10, color: ACCENT2, fontWeight: 700 }}>{t.name}</div>
-                    <div style={{ fontSize: 9, color: "#52525b" }}>{t.compName || "메인 컴프 미설정"}</div>
+                    <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                      <button onClick={() => addAETemplate(t)} style={{ flex: 1, padding: "8px", background: ACCENT2, color: "#000", border: "none", borderRadius: 6, fontSize: 12, fontWeight: 800, cursor: "pointer" }}>삽입</button>
+                      <button onClick={() => setEditingTemplateId(t.id)} style={{ padding: "8px 12px", background: "#18181b", color: ACCENT2, border: `1px solid ${ACCENT2}55`, borderRadius: 6, fontSize: 12, cursor: "pointer" }}>설정</button>
+                    </div>
                   </div>
-                  <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
-                    <button onClick={() => addAETemplate(t)} style={{ flex: 1, padding: "4px 6px", background: ACCENT2, color: "#000", border: "none", borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: "pointer" }}>삽입</button>
-                    <button onClick={() => setEditingTemplateId(t.id)} style={{ padding: "4px 8px", background: "#18181b", color: ACCENT2, border: `1px solid ${ACCENT2}55`, borderRadius: 4, fontSize: 10, cursor: "pointer" }}>설정</button>
-                  </div>
-                </div>
-              ))}
+                ))}
+              </div>
               <button onClick={() => aeFileRef.current?.click()}
-                style={{ width: "100%", padding: "4px 8px", borderRadius: 4, background: "transparent", border: `1px dashed ${BORDER}`, color: "#52525b", fontSize: 11, cursor: "pointer" }}>
-                + Lottie JSON + PNG 불러오기
+                style={{ width: "100%", padding: "12px", borderRadius: 8, background: "transparent", border: `1px solid ${ACCENT2}88`, color: ACCENT2, fontSize: 13, fontWeight: 800, cursor: "pointer", marginTop: 8, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                <span style={{ fontSize: 18 }}>+</span> Lottie JSON + PNG 불러오기
               </button>
               <input ref={aeFileRef} type="file" accept=".json,.aep,.png,.jpg,.jpeg,.webp" multiple style={{ display: "none" }} onChange={handleAEImport} />
             </div>
@@ -2906,24 +2983,82 @@ export default function HMStudio() {
           {!previewPopout && previewStageNode(false)}
           {/* Playback Controls */}
           {!previewPopout && renderTransportControls(false)}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: '#090909', borderBottom: `1px solid ${BORDER}`, flexShrink: 0 }}>
-            <button onClick={markRenderIn} style={{ background: 'transparent', color: '#22c55e', border: `1px solid ${BORDER}`, borderRadius: 4, padding: '4px 8px', fontSize: 11, cursor: 'pointer' }}>Render In</button>
-            <button onClick={markRenderOut} style={{ background: 'transparent', color: '#f43f5e', border: `1px solid ${BORDER}`, borderRadius: 4, padding: '4px 8px', fontSize: 11, cursor: 'pointer' }}>Render Out</button>
-            <button onClick={clearRenderRange} style={{ background: 'transparent', color: '#71717a', border: `1px solid ${BORDER}`, borderRadius: 4, padding: '4px 8px', fontSize: 11, cursor: 'pointer' }}>초기화</button>
-            <div style={{ fontSize: 11, color: '#a1a1aa', marginLeft: 6 }}>작업구간: {fmt(renderIn)} ~ {fmt(renderOut == null ? totalDur : renderOut)}</div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '10px 20px', background: '#090909', borderBottom: `1px solid ${BORDER}`, flexShrink: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <button onClick={markRenderIn} style={{ background: 'transparent', color: '#22c55e', border: `1px solid ${BORDER}`, borderRadius: 6, padding: '6px 14px', fontSize: 13, fontWeight: 700, cursor: 'pointer' }}>Render In</button>
+              <button onClick={markRenderOut} style={{ background: 'transparent', color: '#f43f5e', border: `1px solid ${BORDER}`, borderRadius: 6, padding: '6px 14px', fontSize: 13, fontWeight: 700, cursor: 'pointer' }}>Render Out</button>
+              <button onClick={clearRenderRange} style={{ background: 'transparent', color: '#71717a', border: `1px solid ${BORDER}`, borderRadius: 6, padding: '6px 14px', fontSize: 13, fontWeight: 700, cursor: 'pointer' }}>초기화</button>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
+              <div 
+                style={{ display: 'flex', alignItems: 'center', gap: 10, background: '#161616', padding: '6px 14px', borderRadius: 8, border: `1px solid ${isEditingTime ? ACCENT : BORDER}`, cursor: 'pointer', transition: 'all 0.1s' }}
+                title="클릭하여 시간 수정"
+              >
+                <span style={{ fontSize: 11, color: '#52525b', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.05em' }}>현재 시간</span>
+                {isEditingTime ? (
+                  <input
+                    autoFocus
+                    type="text"
+                    value={timeInput}
+                    onChange={e => setTimeInput(e.target.value)}
+                    onBlur={() => {
+                      setIsEditingTime(false);
+                      const input = timeInput;
+                      let newTime = 0;
+                      if (input.includes(":")) {
+                        const parts = input.split(":").map(Number);
+                        if (parts.length === 4) newTime = parts[0] * 3600 + parts[1] * 60 + parts[2] + parts[3] / 30;
+                        else if (parts.length === 3) newTime = parts[0] * 3600 + parts[1] * 60 + parts[2];
+                        else if (parts.length === 2) newTime = parts[0] * 60 + parts[1];
+                      } else {
+                        newTime = Number(input);
+                      }
+                      if (!isNaN(newTime)) setTime(clamp(newTime, 0, totalDur || 1));
+                    }}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') e.currentTarget.blur();
+                      if (e.key === 'Escape') setIsEditingTime(false);
+                    }}
+                    style={{ background: 'transparent', border: 'none', color: ACCENT, fontSize: 18, fontWeight: 900, fontFamily: 'monospace', width: 110, textAlign: 'center', outline: 'none', padding: 0 }}
+                  />
+                ) : (
+                  <span 
+                    onClick={() => {
+                      setTimeInput(fmt(time));
+                      setIsEditingTime(true);
+                    }}
+                    style={{ fontSize: 18, color: ACCENT, fontWeight: 900, fontFamily: 'monospace', minWidth: 110, textAlign: 'center' }}
+                  >
+                    {fmt(time)}
+                  </span>
+                )}
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <span style={{ fontSize: 11, color: '#52525b', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.05em' }}>타임라인 확대</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 12, color: '#3f3f46' }}>-</span>
+                  <input type='range' min={0.3} max={5} step={0.1} value={zoom} onChange={e => setZoom(Number(e.target.value))} 
+                    style={{ width: 120, height: 4, appearance: 'none', background: '#1e1e20', borderRadius: 2, outline: 'none', accentColor: ACCENT }} />
+                  <span style={{ fontSize: 12, color: '#3f3f46' }}>+</span>
+                </div>
+                <span style={{ fontSize: 11, color: '#a1a1aa', fontWeight: 700, minWidth: 32 }}>{Math.round(zoom * 100)}%</span>
+              </div>
+            </div>
           </div>
           {/* Timeline */}
           <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
-            <div style={{ width: 180, background: "#0a0a0a", borderRight: `1px solid ${BORDER}`, flexShrink: 0, paddingTop: 24 }}>
+            <div style={{ width: 220, background: "#0a0a0a", borderRight: `1px solid ${BORDER}`, flexShrink: 0, paddingTop: 32 }}>
               {timelineLayers.map((layer, idx) => {
                 const labelColor = layer.__type === 'video' ? ACCENT : layer.__type === 'audio' ? '#38bdf8' : ACCENT2;
                 const labelIcon = layer.__type === 'video' ? 'V' : layer.__type === 'audio' ? 'A' : 'G';
                 return (
-                  <div key={layer.id} style={{ height: 44, display: "flex", alignItems: "center", gap: 8, padding: "0 10px", fontSize: 10, color: "#a1a1aa", fontWeight: 600, borderBottom: `1px solid ${BORDER}`, background: idx % 2 ? "#0a0a0a" : "#080808" }}>
-                    <button onClick={e => { e.stopPropagation(); toggleLayerVisible(layer.__kind, layer.id); snap(); }} style={{ width: 20, height: 20, borderRadius: 4, border: `1px solid ${BORDER}`, background: "transparent", color: layer.visible === false ? "#52525b" : labelColor, cursor: "pointer", fontSize: 11, padding: 0 }}>
+                  <div key={layer.id} style={{ height: 56, display: "flex", alignItems: "center", gap: 10, padding: "0 14px", fontSize: 12, color: "#a1a1aa", fontWeight: 600, borderBottom: `1px solid ${BORDER}`, background: idx % 2 ? "#0a0a0a" : "#080808" }}>
+                    <button onClick={e => { e.stopPropagation(); toggleLayerVisible(layer.__kind, layer.id); snap(); }} style={{ width: 24, height: 24, borderRadius: 6, border: `1px solid ${BORDER}`, background: "transparent", color: layer.visible === false ? "#52525b" : labelColor, cursor: "pointer", fontSize: 13, padding: 0 }}>
                       {layer.visible === false ? '○' : '◉'}
                     </button>
-                    <div style={{ width: 28, textAlign: 'center', color: labelColor, fontSize: 10, fontWeight: 800 }}>{labelIcon}</div>
+                    <div style={{ width: 32, textAlign: 'center', color: labelColor, fontSize: 12, fontWeight: 900 }}>{labelIcon}</div>
                     <div style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{layer.__label}</div>
                   </div>
                 );
@@ -2933,24 +3068,30 @@ export default function HMStudio() {
               <div
                 style={{ position: "relative", minWidth: "100%", width: `${Math.max(600, totalDur * 20 * zoom + 200)}px`, cursor: tool === "razor" ? "crosshair" : "default" }}
                 onClick={handleTimelineClick}>
-                <div style={{ height: 24, background: "#0a0a0a", borderBottom: `1px solid ${BORDER}`, position: "sticky", top: 0, zIndex: 10, display: "flex", alignItems: "flex-end" }}>
+                <div style={{ height: 32, background: "#0a0a0a", borderBottom: `1px solid ${BORDER}`, position: "sticky", top: 0, zIndex: 10, display: "flex", alignItems: "flex-end" }}>
                   {Array.from({ length: Math.ceil(totalDur / 1) + 5 }).map((_, i) => (
-                    <div key={i} style={{ position: "absolute", left: i * 20 * zoom, fontSize: 9, color: "#3f3f46", paddingBottom: 2, pointerEvents: "none", whiteSpace: "nowrap" }}>
+                    <div key={i} style={{ position: "absolute", left: i * 20 * zoom, fontSize: 11, color: "#52525b", paddingBottom: 4, pointerEvents: "none", whiteSpace: "nowrap", fontWeight: 600 }}>
                       {i % Math.max(1, Math.round(5 / zoom)) === 0 ? fmt(i) : ""}
-                      <div style={{ width: 1, height: i % Math.max(1, Math.round(5 / zoom)) === 0 ? 8 : 4, background: "#3f3f46", position: "absolute", bottom: 0, left: 0 }} />
+                      <div style={{ width: 1, height: i % Math.max(1, Math.round(5 / zoom)) === 0 ? 10 : 5, background: "#3f3f46", position: "absolute", bottom: 0, left: 0 }} />
                     </div>
                   ))}
                 </div>
-                <div style={{ position: 'absolute', top: 24, bottom: 0, left: renderIn * 20 * zoom, width: Math.max(2, (Math.max(renderIn, renderOut == null ? totalDur : renderOut) - renderIn) * 20 * zoom), background: 'rgba(34,197,94,0.08)', boxShadow: 'inset 0 0 0 1px rgba(34,197,94,0.18)', pointerEvents: 'none' }} />
-                <div style={{ position: 'absolute', top: 24, bottom: 0, left: renderIn * 20 * zoom, width: 2, background: '#22c55e', zIndex: 49, pointerEvents: 'none' }} />
-                <div style={{ position: 'absolute', top: 24, bottom: 0, left: (renderOut == null ? totalDur : renderOut) * 20 * zoom, width: 2, background: '#f43f5e', zIndex: 49, pointerEvents: 'none' }} />
+                <div style={{ position: 'absolute', top: 32, bottom: 0, left: renderIn * 20 * zoom, width: Math.max(2, (Math.max(renderIn, renderOut == null ? totalDur : renderOut) - renderIn) * 20 * zoom), background: 'rgba(34,197,94,0.08)', boxShadow: 'inset 0 0 0 1px rgba(34,197,94,0.18)', pointerEvents: 'none' }} />
+                <div style={{ position: 'absolute', top: 32, bottom: 0, left: renderIn * 20 * zoom, width: 2, background: '#22c55e', zIndex: 110, pointerEvents: 'none' }}>
+                  <div style={{ position: 'absolute', top: -14, left: -4, width: 0, height: 0, borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderTop: '10px solid #22c55e' }} />
+                  <div style={{ position: 'absolute', top: -32, left: -14, background: '#22c55e', color: '#000', fontSize: 11, fontWeight: 900, padding: '3px 6px', borderRadius: 4 }}>IN</div>
+                </div>
+                <div style={{ position: 'absolute', top: 32, bottom: 0, left: (renderOut == null ? totalDur : renderOut) * 20 * zoom, width: 2, background: '#f43f5e', zIndex: 110, pointerEvents: 'none' }}>
+                  <div style={{ position: 'absolute', top: -14, left: -4, width: 0, height: 0, borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderTop: '10px solid #f43f5e' }} />
+                  <div style={{ position: 'absolute', top: -32, left: -18, background: '#f43f5e', color: '#fff', fontSize: 11, fontWeight: 900, padding: '3px 6px', borderRadius: 4 }}>OUT</div>
+                </div>
                 <div style={{ position: "absolute", top: 0, bottom: 0, left: time * 20 * zoom, width: 2, background: ACCENT, zIndex: 50, pointerEvents: "none" }}>
-                  <div style={{ width: 10, height: 10, background: ACCENT, position: "absolute", top: 24, left: -4, transform: "rotate(45deg)" }} />
+                  <div style={{ width: 14, height: 14, background: ACCENT, position: "absolute", top: 32, left: -6, transform: "rotate(45deg)" }} />
                 </div>
                 {timelineLayers.map((layer, rowIdx) => {
-                  const commonStyle = { position: 'absolute', top: 4, height: 36, left: layer.ts * 20 * zoom, width: Math.max(4, layer.dur * 20 * zoom), borderRadius: 4, cursor: tool === 'razor' && layer.__kind === 'clip' ? 'crosshair' : 'move', overflow: 'hidden', boxSizing: 'border-box' };
+                  const commonStyle = { position: 'absolute', top: 4, height: 48, left: layer.ts * 20 * zoom, width: Math.max(4, layer.dur * 20 * zoom), borderRadius: 6, cursor: tool === 'razor' && layer.__kind === 'clip' ? 'crosshair' : 'move', overflow: 'hidden', boxSizing: 'border-box' };
                   return (
-                    <div key={layer.id + '-row'} style={{ position: 'relative', height: 44, background: rowIdx % 2 ? '#0a0a0a' : '#080808', borderBottom: `1px solid ${BORDER}` }}>
+                    <div key={layer.id + '-row'} style={{ position: 'relative', height: 56, background: rowIdx % 2 ? '#0a0a0a' : '#080808', borderBottom: `1px solid ${BORDER}` }}>
                       <div
                         style={{ 
                           ...commonStyle, 
@@ -2994,25 +3135,26 @@ export default function HMStudio() {
           </div>
         </div>
         {/* ── RIGHT: EFFECT CONTROLS ── */}
-        <div style={{ width: 260, borderLeft: `1px solid ${BORDER}`, background: "#0d0d0d", display: "flex", flexDirection: "column", flexShrink: 0, overflow: "hidden" }}>
-          <div style={{ padding: "10px 12px 6px", borderBottom: `1px solid ${BORDER}` }}>
-            <div style={{ fontSize: 10, fontWeight: 700, color: "#52525b", textTransform: "uppercase", letterSpacing: "0.1em" }}>효과 컨트롤</div>
+        {/* ── RIGHT PANEL: EFFECT CONTROLS ── */}
+        <div style={{ width: 320, borderLeft: `1px solid ${BORDER}`, background: "#0d0d0d", display: "flex", flexDirection: "column", flexShrink: 0, overflow: "hidden" }}>
+          <div style={{ padding: "14px 16px 10px", borderBottom: `1px solid ${BORDER}` }}>
+            <div style={{ fontSize: 12, fontWeight: 800, color: "#52525b", textTransform: "uppercase", letterSpacing: "0.1em" }}>효과 컨트롤</div>
           </div>
           <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
             {selGfx ? (
               <>
-                <div style={{ fontSize: 11, fontWeight: 700, color: selGfx.type === "ae_template" ? ACCENT2 : ACCENT, marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
-                  <span>{selGfx.type === "ae_template" ? "🎨" : selGfx.type === "text" ? "T" : "■"}</span>
+                <div style={{ fontSize: 13, fontWeight: 800, color: selGfx.type === "ae_template" ? ACCENT2 : ACCENT, marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 16 }}>{selGfx.type === "ae_template" ? "🎨" : selGfx.type === "text" ? "T" : "■"}</span>
                   <span>{selGfx.type === "ae_template" ? "템플릿" : selGfx.type === "text" ? "텍스트" : "도형"}</span>
                 </div>
                 {/* AE Template fields */}
                 {selGfx.type === "ae_template" && (
-                  <div style={{ marginBottom: 12 }}>
-                    <div style={{ fontSize: 10, color: "#52525b", fontWeight: 700, textTransform: "uppercase", marginBottom: 6 }}>템플릿 정보</div>
-                    <div style={{ fontSize: 10, color: "#52525b", marginBottom: 8, padding: "6px 8px", background: "#0a1a0a", borderRadius: 4, border: `1px solid ${ACCENT2}22` }}>
+                  <div style={{ marginBottom: 16 }}>
+                    <div style={{ fontSize: 12, color: "#52525b", fontWeight: 800, textTransform: "uppercase", marginBottom: 8 }}>템플릿 정보</div>
+                    <div style={{ fontSize: 13, color: "#a1a1aa", marginBottom: 12, padding: "10px 12px", background: "#0a1a0a", borderRadius: 6, border: `1px solid ${ACCENT2}22` }}>
                       {selGfx.compName}
                     </div>
-                    <div style={{ fontSize: 10, color: "#52525b", fontWeight: 700, textTransform: "uppercase", margin: "10px 0 6px" }}>텍스트 필드</div>
+                    <div style={{ fontSize: 12, color: "#52525b", fontWeight: 800, textTransform: "uppercase", margin: "16px 0 10px" }}>텍스트 필드</div>
                     {(selGfx.fields || []).length > 0 ? (selGfx.fields || []).map((f, idx) => {
                       const internalMode = !shouldUseOverlayForField(f, selGfx.glyphChars || []);
                       const selectedFontKey = internalMode ? `internal:${f.fontKey || selGfx.fontOptions?.find(option => option.mode === 'internal')?.value || ""}` : `overlay:${f.fontFamily || "Pretendard, 'Noto Sans KR', sans-serif"}`;
@@ -3186,13 +3328,7 @@ export default function HMStudio() {
             ) : selClip ? (
               <>
                 <div style={{ fontSize: 11, fontWeight: 700, color: ACCENT, marginBottom: 12 }}>🎬 {selClip.name}</div>
-                <div style={{ fontSize: 10, color: "#52525b", fontWeight: 700, textTransform: "uppercase", marginBottom: 6 }}>변형 (TRANSFORM)</div>
-                <div style={{ marginBottom: 8 }}>
-                  <div style={{ fontSize: 10, color: "#71717a", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 3 }}>트랙</div>
-                  <select value={selClip.track} onChange={e => { updateClip(selClip.id, { track: Number(e.target.value) }); snap(); }} style={{ width: "100%", background: "#18181b", border: `1px solid ${BORDER}`, color: "#e4e4e7", fontSize: 11, padding: "4px 6px", borderRadius: 4, outline: "none" }}>
-                    <option value={1}>V1</option><option value={2}>V2</option><option value={3}>V3</option>
-                  </select>
-                </div>
+                <div style={{ fontSize: 12, color: "#52525b", fontWeight: 800, textTransform: "uppercase", marginBottom: 12 }}>변형 (TRANSFORM)</div>
                 <AnimPropRow label="위치 X" value={Math.round(selClip.x * 10) / 10} min={0} max={100} step={0.1} unit="%"
                   keyframed={hasKeyframeAt(selClip, "x", clamp(time - selClip.ts, 0, selClip.dur))}
                   onToggleKeyframe={() => toggleClipKeyframe(selClip, "x")}
@@ -3222,11 +3358,11 @@ export default function HMStudio() {
             )}
           </div>
           {/* Audio Meter */}
-          <div style={{ height: 100, borderTop: `1px solid ${BORDER}`, padding: "10px 12px", background: "#080808" }}>
-            <div style={{ fontSize: 10, color: "#52525b", fontWeight: 700, textTransform: "uppercase", marginBottom: 6 }}>오디오 미터</div>
-            <div style={{ display: "flex", gap: 8, height: 56 }}>
+          <div style={{ height: 140, borderTop: `1px solid ${BORDER}`, padding: "16px 20px", background: "#080808" }}>
+            <div style={{ fontSize: 12, color: "#52525b", fontWeight: 800, textTransform: "uppercase", marginBottom: 12 }}>오디오 미터</div>
+            <div style={{ display: "flex", gap: 10, height: 72 }}>
               {[playing ? Math.random() * 60 + 20 : 0, playing ? Math.random() * 50 + 15 : 0].map((h, i) => (
-                <div key={i} style={{ flex: 1, background: "#18181b", borderRadius: 2, position: "relative", overflow: "hidden" }}>
+                <div key={i} style={{ flex: 1, background: "#18181b", borderRadius: 4, position: "relative", overflow: "hidden" }}>
                   <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, background: "linear-gradient(to top, #22c55e, #eab308, #ef4444)", height: `${h}%`, transition: "height 0.1s" }} />
                 </div>
               ))}
@@ -3236,17 +3372,17 @@ export default function HMStudio() {
       </div>
       {previewPortal}
       {/* ── STATUS BAR ── */}
-      <div style={{ height: 24, borderTop: `1px solid ${BORDER}`, background: "#0a0a0a", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 12px", flexShrink: 0 }}>
-        <div style={{ display: "flex", gap: 12, fontSize: 10, color: "#52525b" }}>
+      <div style={{ height: 32, borderTop: `1px solid ${BORDER}`, background: "#0a0a0a", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 16px", flexShrink: 0 }}>
+        <div style={{ display: "flex", gap: 16, fontSize: 12, color: "#52525b" }}>
           <span style={{ color: ACCENT, fontWeight: 700 }}>HM Studio Pro</span>
           <span>컴포지션 {comp.w}×{comp.h} @ {comp.fps}fps</span>
           <span>클립: {clips.length}개</span>
           <span>그래픽: {graphics.length}개</span>
         </div>
-        <div style={{ display: "flex", gap: 12, fontSize: 10, color: "#52525b" }}>
+        <div style={{ display: "flex", gap: 16, fontSize: 12, color: "#52525b" }}>
           <span>{fmt(time)} / {fmt(totalDur)}</span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <span style={{ width: 6, height: 6, borderRadius: "50%", background: renderStatus === "done" ? ACCENT2 : renderStatus === "rendering" ? "#38bdf8" : renderStatus === "queued" ? ACCENT : "#52525b", display: "inline-block" }} />
+          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ width: 8, height: 8, borderRadius: "50%", background: renderStatus === "done" ? ACCENT2 : renderStatus === "rendering" ? "#38bdf8" : renderStatus === "queued" ? ACCENT : "#52525b", display: "inline-block" }} />
             렌더 서버: {renderStatus === "idle" ? "대기" : renderStatus === "queued" ? "큐잉" : renderStatus === "rendering" ? "렌더 중" : "완료"}
           </span>
         </div>
@@ -3432,7 +3568,7 @@ export default function HMStudio() {
                   display: "flex", alignItems: "center", justifyContent: "center" 
                 }}>
                   <div style={{ width: "100%", height: "100%", pointerEvents: "none" }}>
-                    <WebGLRenderStage clips={clips} graphics={graphics} comp={comp} time={time} renderIn={renderIn} renderOut={renderOut == null ? totalDur : renderOut} />
+                    <WebGLRenderStage clips={clips} graphics={graphics} composition={comp} time={time} />
                   </div>
                   <div onClick={() => setPlaying(!playing)} style={{ position: "absolute", inset: 0, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10 }}>
                     {!playing && <div style={{ width: 80, height: 80, background: "rgba(0,0,0,0.4)", borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 40, color: "#fff", backdropFilter: "blur(4px)" }}>▶</div>}

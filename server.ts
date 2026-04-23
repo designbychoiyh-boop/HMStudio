@@ -799,6 +799,7 @@ app.get('/api/system-status', async (_req, res) => {
   res.json({
     ffmpeg: {
       path: bin,
+      found: !!bin,
       hasSystem: hasSystemFfmpeg,
       isLocal: bin ? bin.includes('.runtime') : false,
       isBundled: bin ? bin.includes('node_modules') : false
@@ -871,26 +872,43 @@ app.get('/api/render-jobs/:id', async (req, res) => {
 
 app.post('/api/login', async (req, res) => {
   const { userId, password } = req.body;
-  try {
-    const response = await fetch('http://erp.baroncs.co.kr/intranet/sys/popup/login_ok.php', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
-      body: new URLSearchParams({
-        user_id: userId,
-        user_pw: password,
-        user_ip: '127.0.0.1',
-        user_contact_area: 'OUT',
-        checksaveid: '1',
-        is_ajax: '1',
-        browser: 'Mozilla/5.0',
-      }),
-    });
+  const endpoints = [
+    'http://erp.hanmaceng.co.kr/intranet/sys/popup/login_ok.php',
+    'http://erp.samaneng.com/intranet/sys/popup/login_ok.php',
+    'http://erp.jangheon.co.kr/intranet/sys/popup/login_ok.php',
+    'http://erp.pre-cast.co.kr/intranet/sys/popup/login_ok.php',
+    'http://intranet.hallasanup.com/intranet/sys/popup/login_ok.php',
+    'http://erp.baroncs.co.kr/intranet/sys/popup/login_ok.php',
+  ];
 
-    const text = await response.text();
-    if (text.trim() === '1') {
+  try {
+    const results = await Promise.all(endpoints.map(async (url) => {
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          },
+          body: new URLSearchParams({
+            user_id: userId,
+            user_pw: password,
+            user_ip: '127.0.0.1',
+            user_contact_area: 'OUT',
+            checksaveid: '1',
+            is_ajax: '1',
+            browser: 'Mozilla/5.0',
+          }),
+        });
+        const text = await response.text();
+        return { success: text.trim() === '1', url };
+      } catch (e) {
+        return { success: false, url };
+      }
+    }));
+
+    const successful = results.find(r => r.success);
+    if (successful) {
       res.json({ success: true });
     } else {
       res.json({ success: false, message: '사원번호 또는 비밀번호가 올바르지 않습니다.' });
