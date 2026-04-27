@@ -2,7 +2,7 @@ import express from 'express';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
-import { spawn, execSync } from 'child_process';
+import { spawn, execSync, exec } from 'child_process';
 import os from 'os';
 import crypto from 'crypto';
 import multer from 'multer';
@@ -93,9 +93,10 @@ function jobJsonPath(id: string) {
 }
 
 function refreshJobFromDisk(job: RenderJobRecord) {
-  const mp4 = path.join(RENDER_DIR, `${job.id}.mp4`);
-  const previewPng = path.join(PREVIEW_DIR, `${job.id}.png`);
-  const errorLog = path.join(LOG_DIR, `${job.id}.error.txt`);
+  const output = job.payload?.output || {};
+  const mp4 = output.outputPath || path.join(RENDER_DIR, output.fileName || `${job.id}.mp4`);
+  const previewPng = output.previewPath || path.join(PREVIEW_DIR, `${job.id}.png`);
+  const errorLog = output.errorPath || path.join(LOG_DIR, `${job.id}.error.txt`);
 
   if (fs.existsSync(mp4)) {
     job.status = 'completed';
@@ -134,7 +135,8 @@ function clearOldJobsOnStartup() {
 }
 
 ensureDirs();
-clearOldJobsOnStartup();
+// clearOldJobsOnStartup(); // Disabled to prevent accidental deletion of renders on restart
+
 
 
 let renderWorkerRunning = false;
@@ -387,10 +389,19 @@ async function captureFrameBuffer(client: CdpClient, width: number, height: numb
 
 async function renderJob(record: RenderJobRecord) {
   const output = record.payload?.output || {};
-  const outputPath = output.outputPath || path.join(RENDER_DIR, `${record.id}.mp4`);
+  const outputPath = output.outputPath || path.join(RENDER_DIR, output.fileName || `${record.id}.mp4`);
+  console.log(`[Render ${record.id}] Final outputPath resolved to: ${outputPath}`);
+
+
   const outDir = path.dirname(outputPath);
-  if (!fs.existsSync(outDir)) {
-    fs.mkdirSync(outDir, { recursive: true });
+  try {
+    if (!fs.existsSync(outDir)) {
+      console.log(`[Render ${record.id}] Creating output directory: ${outDir}`);
+      fs.mkdirSync(outDir, { recursive: true });
+    }
+  } catch (err: any) {
+    console.error(`[Render ${record.id}] Failed to create output directory ${outDir}:`, err);
+    // Continue anyway, moveFile will also try to create it
   }
   const tempOutputPath = path.join(RENDER_DIR, `${record.id}_tmp.mp4`);
   const previewPath = output.previewPath || path.join(PREVIEW_DIR, `${record.id}.jpg`);
@@ -859,6 +870,44 @@ app.post('/api/system/install-chrome', async (_req, res) => {
   }
 });
 
+app.post('/api/system/browse-folder', async (_req, res) => {
+  // PowerShell command to open a folder browser dialog and return the selected path
+  const psCommand = `
+    Add-Type -AssemblyName System.Windows.Forms;
+    $f = New-Object System.Windows.Forms.SaveFileDialog;
+    $f.Title = '저장할 폴더로 이동하신 후 ''저장'' 버튼을 클릭하세요.';
+    $f.Filter = '폴더 선택|*';
+    $f.FileName = '여기에 저장';
+    $f.AddExtension = $false;
+    $f.CheckPathExists = $true;
+    $f.OverwritePrompt = $false;
+    if($f.ShowDialog() -eq 'OK') {
+      [System.IO.Path]::GetDirectoryName($f.FileName)
+    }
+  `;
+  
+  const fullCommand = `powershell -NoProfile -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${psCommand.replace(/\n/g, ' ')}"`;
+  
+  exec(fullCommand, { encoding: 'utf8' }, (error, stdout, stderr) => {
+    if (error) {
+      console.error('Folder picker error:', error);
+      res.status(500).json({ ok: false, error: error.message });
+      return;
+    }
+    
+    const result = stdout.trim();
+    console.log(`[System] Folder picker stdout: "${stdout}"`);
+    console.log(`[System] Folder picker result: "${result}"`);
+    if (result) {
+      res.json({ ok: true, path: result });
+    } else {
+      res.json({ ok: false, message: '취소됨' });
+    }
+  });
+});
+
+
+
 app.get('/api/render-jobs/:id', async (req, res) => {
   const job = renderJobs.get(req.params.id);
   if (!job) {
@@ -947,7 +996,8 @@ app.post('/api/render-jobs/start', async (req, res) => {
       output: {
         ...(req.body.output || {}),
         fileName: safeProjectName,
-        outputPath: req.body.output?.outputPath || path.join(RENDER_DIR, `${id}.mp4`),
+        outputPath: req.body.output?.outputPath || path.join(RENDER_DIR, safeProjectName),
+
         previewPath: req.body.output?.previewPath || path.join(PREVIEW_DIR, `${id}.png`),
         logPath: req.body.output?.logPath || path.join(LOG_DIR, `${id}.log.txt`),
         errorPath: req.body.output?.errorPath || path.join(LOG_DIR, `${id}.error.txt`),
@@ -963,14 +1013,20 @@ app.post('/api/render-jobs/start', async (req, res) => {
 app.get('/api/render-jobs/:id/download', (req, res) => {
   const id = req.params.id;
   const job = renderJobs.get(id);
-  const mp4 = path.join(RENDER_DIR, `${id}.mp4`);
-  if (!fs.existsSync(mp4)) return res.status(404).end();
   const fileName = job?.payload?.output?.fileName || `${id}.mp4`;
-  res.download(mp4, fileName);
+  const output = job?.payload?.output || {};
+  const mp4 = output.outputPath || path.join(RENDER_DIR, output.fileName || `${id}.mp4`);
+
+  if (!fs.existsSync(mp4)) return res.status(404).end();
+  res.download(mp4, output.fileName || `${id}.mp4`);
+
 });
 
 app.get('/api/render-jobs/:id/download/:filename', (req, res) => {
-  const mp4 = path.join(RENDER_DIR, `${req.params.id}.mp4`);
+  const job = renderJobs.get(req.params.id);
+  const output = job?.payload?.output || {};
+  const mp4 = output.outputPath || path.join(RENDER_DIR, output.fileName || `${req.params.id}.mp4`);
+
   if (!fs.existsSync(mp4)) return res.status(404).end();
   res.download(mp4, req.params.filename);
 });

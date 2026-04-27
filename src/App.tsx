@@ -1357,7 +1357,8 @@ export default function HMStudio() {
   const [isExportView, setIsExportView] = useState(false);
   const [exportSettings, setExportSettings] = useState({
     filename: "Untitled_Project",
-    path: "/Users/hmstudio/Projects/Export",
+    path: "C:\\Users\\user\\Desktop\\HMStudio_AE_Render_Server\\renders",
+
     format: "MPEG-4 (.mp4)",
     codec: "H.264 / AVC (x264)",
     width: 1920,
@@ -1458,24 +1459,23 @@ export default function HMStudio() {
   };
 
   const pickExportDirectory = async () => {
-    if (!window.showDirectoryPicker) {
-      const manualPath = prompt("현재 보안 연결(HTTPS)이 아니어서 폴더 선택창을 열 수 없습니다.\n서버의 절대 경로를 직접 입력하시겠습니까?", exportSettings.path);
+    try {
+      const res = await fetch('/api/system/browse-folder', { method: 'POST' });
+      const data = await res.json();
+      if (data.ok && data.path) {
+        setExportSettings(s => ({ ...s, path: data.path }));
+        console.log("Selected export directory via server:", data.path);
+      }
+    } catch (e) {
+      console.error("Server-side folder picker error:", e);
+      // Fallback to manual prompt if server picker fails
+      const manualPath = prompt("폴더 경로를 직접 입력하세요:", exportSettings.path);
       if (manualPath) {
         setExportSettings(s => ({ ...s, path: manualPath }));
       }
-      return;
-    }
-    try {
-      // @ts-ignore
-      const handle = await window.showDirectoryPicker();
-      console.log("Selected export directory:", handle.name);
-      // @ts-ignore
-      window._exportDirHandle = handle;
-      setExportSettings(s => ({ ...s, path: `📁 ${handle.name}` }));
-    } catch (e) {
-      console.log("Directory picker error or cancelled:", e);
     }
   };
+
   const videoRefs = useRef({});
   const stageRef = useRef(null);
   const popupStageRef = useRef(null);
@@ -1565,8 +1565,24 @@ export default function HMStudio() {
   useEffect(() => {
     if (isLoggedIn) {
       fetchSystemStatus();
+      
+      // Also fetch server root folder to set default export path
+      fetch('/api/render-server/status')
+        .then(r => r.json())
+        .then(data => {
+          if (data.ok && data.folders?.renders) {
+            setExportSettings(s => ({ 
+              ...s, 
+              path: s.path === "C:\\Users\\user\\Desktop\\HMStudio_AE_Render_Server\\renders" || !s.path 
+                ? data.folders.renders 
+                : s.path 
+            }));
+          }
+        })
+        .catch(console.error);
     }
   }, [isLoggedIn, fetchSystemStatus]);
+
 
   const installChrome = async () => {
     if (isInstallingChrome) return;
@@ -2316,7 +2332,9 @@ export default function HMStudio() {
             
             if (jobItem.status === 'completed' && (window as any)._exportDirHandle && !savedJobsRef.current.has(jobItem.id)) {
                savedJobsRef.current.add(jobItem.id);
-               saveRemoteJobLocally(queueItem);
+               // Only attempt auto-save if we have a handle and it's a fresh completion
+               // We catch the error silently to avoid spamming the console with SecurityErrors
+               saveRemoteJobLocally(queueItem).catch(() => {});
             }
           }
 
@@ -2387,8 +2405,12 @@ export default function HMStudio() {
       
       // Update UI to show saved status
       setRenderQueue(q => q.map(item => item.id === job.id ? { ...item, statusText: '✓ 파일이 지정된 위치에 저장되었습니다.' } : item));
-    } catch (err) {
-      console.error(`Failed to auto-save job ${job.id}:`, err);
+    } catch (err: any) {
+      if (err.name === 'SecurityError') {
+        console.warn(`Auto-save for job ${job.id} skipped (User activation required for FileSystem API).`);
+      } else {
+        console.error(`Failed to auto-save job ${job.id}:`, err);
+      }
     }
   };
 
@@ -2467,24 +2489,38 @@ export default function HMStudio() {
     };
     payload.renderRange = { in: renderIn, out: outPoint };
 
-    // Set absolute output path if manual path is provided (doesn't start with 📁)
-    if (exportSettings.path && !exportSettings.path.startsWith('📁')) {
-      const separator = exportSettings.path.includes('\\') ? '\\' : '/';
-      payload.output = {
-        ...payload.output,
-        outputPath: exportSettings.path.endsWith(separator) 
-          ? `${exportSettings.path}${outputFileName}` 
-          : `${exportSettings.path}${separator}${outputFileName}`
-      };
+    // Set absolute output path if manual path is provided
+    if (exportSettings.path) {
+      const isWindows = exportSettings.path.includes('\\') || exportSettings.path.includes(':');
+      const separator = isWindows ? '\\' : '/';
+      
+      // Check if path already includes the filename
+      const looksLikeFile = exportSettings.path.toLowerCase().endsWith('.mp4');
+      
+      if (looksLikeFile) {
+        payload.output = {
+          ...payload.output,
+          outputPath: exportSettings.path
+        };
+      } else {
+        payload.output = {
+          ...payload.output,
+          outputPath: exportSettings.path.endsWith(separator) 
+            ? `${exportSettings.path}${outputFileName}` 
+            : `${exportSettings.path}${separator}${outputFileName}`
+        };
+      }
     }
+
 
     setRenderStatus('rendering');
     
     try {
       // Automatically clear previous render jobs so they don't accumulate
-      await fetch('/api/render-jobs/clear', { method: 'POST' });
-      setRenderQueue([]);
-      savedJobsRef.current.clear();
+      // await fetch('/api/render-jobs/clear', { method: 'POST' });
+      // setRenderQueue([]);
+      // savedJobsRef.current.clear();
+
 
       const res = await fetch('/api/render-jobs/start', {
         method: 'POST',
