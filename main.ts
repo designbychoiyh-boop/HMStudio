@@ -7,6 +7,17 @@ import os from 'os';
 import crypto from 'crypto';
 import ffmpegStaticPath from 'ffmpeg-static';
 
+// Configure Chromium command line switches to disable background throttling and force hardware acceleration for hidden windows
+if (app) {
+  app.commandLine.appendSwitch('enable-gpu');
+  app.commandLine.appendSwitch('ignore-gpu-blocklist');
+  app.commandLine.appendSwitch('enable-webgl');
+  app.commandLine.appendSwitch('enable-accelerated-2d-canvas');
+  app.commandLine.appendSwitch('disable-background-timer-throttling');
+  app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+  app.commandLine.appendSwitch('disable-renderer-backgrounding');
+}
+
 // Define directories in Main Process
 const ROOT = (app && app.isPackaged) ? path.dirname(process.execPath) : process.cwd();
 const APP_PORT = 3001; // Port used for Vite development server (fallback)
@@ -328,8 +339,11 @@ async function executeRenderJob(record: RenderJobRecord) {
     '-framerate', String(fps),
     '-i', '-', // Standard input pipe
     '-c:v', encoder,
-    ...(encoder === 'hevc_nvenc' ? ['-preset', 'p7', '-cq', '12'] : ['-preset', 'slow', '-crf', '12']),
-    '-b:v', '0',
+    // [FIX] NVENC preset system: p1(fast)~p7(quality). '-preset p7 -cq 12' sets
+    // max quality mode; add -rc vbr -maxrate/bufsize for proper VBR rate control.
+    ...(encoder === 'hevc_nvenc'
+      ? ['-preset', 'p7', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '50M', '-bufsize', '100M']
+      : ['-preset', 'medium', '-crf', '18']),
     '-pix_fmt', 'yuv420p',
     '-movflags', '+faststart',
     tempOutputPath,
@@ -345,6 +359,7 @@ async function executeRenderJob(record: RenderJobRecord) {
     width,
     height,
     show: false, // Background/invisible window
+    paintWhenInitiallyHidden: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       webSecurity: false,
@@ -423,15 +438,26 @@ async function executeRenderJob(record: RenderJobRecord) {
               const trimStart = (clip.startT || 0) + Math.max(0, renderIn - clip.ts);
               const delayMs = Math.max(0, Math.round((clip.ts - renderIn) * 1000));
               const label = `aud${idx}`;
-              
-              filterComplex += `[${idx + aStartIdx}:a]atrim=start=${trimStart.toFixed(3)}:duration=${overlapDur.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}|${delayMs}[${label}];`;
+
+              // [FIX] Use adelay=delays=X:all=1 to handle all channel layouts
+              // (stereo-only adelay=X|X breaks 5.1ch and multichannel clips).
+              // Also add aresample=async=1 to prevent PTS drift accumulation.
+              filterComplex += `[${idx + aStartIdx}:a]atrim=start=${trimStart.toFixed(3)}:duration=${overlapDur.toFixed(3)},asetpts=PTS-STARTPTS,adelay=delays=${delayMs}:all=1,aresample=async=1:first_pts=0[${label}];`;
               amixLabels.push(`[${label}]`);
               mixCount++;
             }
 
             if (mixCount > 0) {
-              filterComplex += `${amixLabels.join('')}amix=inputs=${mixCount}[outa]`;
-              finalPassArgs.push('-filter_complex', filterComplex);
+              let audioMixFilter: string;
+              if (mixCount === 1) {
+                // [FIX] Bypass amix entirely for single track to prevent -3dB attenuation
+                audioMixFilter = filterComplex + `${amixLabels[0]}anull[outa]`;
+              } else {
+                // [FIX] normalize=0 prevents automatic volume reduction based on input count.
+                // duration=longest ensures the mix covers the full render range.
+                audioMixFilter = filterComplex + `${amixLabels.join('')}amix=inputs=${mixCount}:normalize=0:duration=longest[outa]`;
+              }
+              finalPassArgs.push('-filter_complex', audioMixFilter);
               finalPassArgs.push('-map', '0:v');
               finalPassArgs.push('-map', '[outa]');
               finalPassArgs.push('-c:v', 'copy');
@@ -494,32 +520,57 @@ async function executeRenderJob(record: RenderJobRecord) {
 
     try {
       // Load the app render stage in the background window
-      // Note: we can use either the active running dev server or direct file path.
       const url = `http://localhost:${APP_PORT}/?renderJob=${jobId}&renderTs=${encodeURIComponent(renderIn.toFixed(6))}`;
       await renderWin.loadURL(url);
 
       record.status = 'rendering';
       record.progress = 10.00;
-      record.statusText = `?꾨젅??罹≪쿂 ?쒖옉... (0/${frameCount})`;
+      record.statusText = `\ub80c\ub354\ub9c1 \uc2dc\uc791... (0/${frameCount})`;
       await saveJob(record);
 
-      // Main frame orchestration loop!
+      // Step 1: Send start-client-render so App.tsx registers __onElectronFrameReady
+      // before the frame loop begins.
+      renderWin.webContents.send('start-client-render', {
+        jobId,
+        fps,
+        totalFrames: frameCount,
+      });
+
+      // Give the renderer process a tick to register the IPC listener
+      // and set window.__onElectronFrameReady before we start firing frames.
+      await new Promise(r => setTimeout(r, 200));
+
+      // Step 2: Frame loop.
+      // executeJavaScript calls window.__HM_SET_RENDER_TIME(ts) which:
+      //   - calls setTime(ts) in React
+      //   - returns a Promise that resolves ONLY when WebGLRenderStage.onReady fires
+      //     (or after 100ms fallback)
+      // Inside onReady, __onElectronFrameReady(canvas) is called, which:
+      //   - calls ipcRenderer.invoke('frame-captured') — this writes RGBA to FFmpeg stdin
+      //   - the invoke BLOCKS the renderer until ipcMain.handle returns { ok: true }
+      //   - ipcMain.handle returns AFTER the stdin write (with backpressure)
+      // So: await executeJavaScript = await full pixel pipeline for that frame.
       for (let i = 0; i < frameCount; i++) {
         const ts = renderIn + i / fps;
-        
-        // Execute frame shift in the background browser window
-        // This blocks until the React renderer successfully captures pixels and sends them via IPC!
-        await renderWin.webContents.executeJavaScript(`window.__HM_SET_RENDER_TIME(${ts})`);
 
-        // Update main process job state
+        try {
+          await renderWin.webContents.executeJavaScript(
+            `window.__HM_SET_RENDER_TIME(${ts})`
+          );
+        } catch (frameErr) {
+          // executeJavaScript can throw if the window is destroyed mid-render
+          console.error(`[Render ${jobId}] Frame ${i} executeJavaScript error:`, frameErr);
+          throw frameErr;
+        }
+
         record.currentFrame = i + 1;
         record.progress = Number((10 + ((i + 1) / frameCount) * 85).toFixed(2));
-        record.statusText = `?꾨젅??罹≪쿂 以?(${i + 1}/${frameCount})`;
+        record.statusText = `\ud504\ub808\uc784 \ub80c\ub354\ub9c1 \uc911 (${i + 1}/${frameCount})`;
         record.updatedAt = nowIso();
         await saveJob(record);
       }
 
-      // Close write stream and signal completion
+      // All frames written \u2014 close FFmpeg stdin and finalise.
       ffmpegProc.stdin.end();
       const session = activeRenders.get(jobId);
       if (session) {
@@ -954,18 +1005,21 @@ ipcMain.handle('frame-captured', async (event, { jobId, width, height, buffer })
   const session = activeRenders.get(jobId);
   if (!session) return { ok: false, error: 'Render session inactive' };
 
-  return new Promise<void>((resolve, reject) => {
+  // Write raw RGBA bytes into FFmpeg stdin with backpressure.
+  // ipcMain.handle returning { ok: true } is what resolves the renderer's
+  // ipcRenderer.invoke('frame-captured') call, which in turn allows
+  // __HM_SET_RENDER_TIME's Promise to resolve, which unblocks main.ts's
+  // await executeJavaScript(...) for that frame. Serial, no deadlock.
+  await new Promise<void>((resolve, reject) => {
     const nodeBuffer = Buffer.from(buffer);
-    
-    // Direct backpressure handling
     if (!session.ffmpegProc.stdin.write(nodeBuffer)) {
-      session.ffmpegProc.stdin.once('drain', () => {
-        resolve();
-      });
+      session.ffmpegProc.stdin.once('drain', resolve);
     } else {
       resolve();
     }
   });
+
+  return { ok: true };
 });
 
 // Register custom protocol handler for local files

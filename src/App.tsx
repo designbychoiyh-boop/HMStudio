@@ -2353,17 +2353,75 @@ export default function HMStudio() {
     
     // Preview window is already open from login, so we just load data
     const reader = new FileReader();
-    reader.onload = (ev) => {
+    reader.onload = async (ev) => {
       try {
         const data = JSON.parse(ev.target?.result as string);
         if (data.composition) setComp(data.composition);
+        
         if (data.clips) {
-          const processed = data.clips.map(c => ({
-            ...c,
-            url: c.serverUrl || c.url
-          }));
+          // Attempt to fetch server assets to auto-relink missing files
+          let assetFiles = [];
+          try {
+            const res = await fetch('/api/system/assets');
+            if (res.ok) {
+              const resData = await res.json();
+              if (resData.ok && Array.isArray(resData.files)) {
+                assetFiles = resData.files;
+              }
+            }
+          } catch (err) {
+            console.warn("Could not fetch system assets for auto-relinking:", err);
+          }
+
+          const isElectron = !!(window as any).electron;
+
+          const processed = data.clips.map(c => {
+            let resolvedUrl = c.serverUrl || c.url;
+            let resolvedPath = c.storedPath;
+
+            const getSafeName = (name: string) => name.replace(/[^a-zA-Z0-9._-]+/g, '_');
+
+            if (assetFiles.length > 0) {
+              const cleanName = getSafeName(c.name).replace(/\.[^/.]+$/, "");
+              const cleanExt = (c.name.split('.').pop() || "").toLowerCase();
+              
+              const match = assetFiles.find(f => {
+                const lowerF = f.toLowerCase();
+                if (!lowerF.endsWith("." + cleanExt)) return false;
+                
+                const cleanPart = cleanName.replace(/_+/g, '_').replace(/^_|_$/g, '');
+                const fClean = lowerF.replace(/_+/g, '_');
+                
+                return cleanPart && fClean.includes(cleanPart.toLowerCase());
+              });
+
+              if (match) {
+                resolvedUrl = `/assets/${match}`;
+                console.log(`[Frontend Relinking] Relinked "${c.name}" to url: "${resolvedUrl}"`);
+              } else {
+                // Suffix fallback
+                const parts = c.name.split('_');
+                const lastPart = parts[parts.length - 1];
+                if (lastPart && lastPart.length > 5) {
+                  const match2 = assetFiles.find(f => f.toLowerCase().endsWith(lastPart.toLowerCase()));
+                  if (match2) {
+                    resolvedUrl = `/assets/${match2}`;
+                    console.log(`[Frontend Relinking] Suffix fallback relinked "${c.name}" to url: "${resolvedUrl}"`);
+                  }
+                }
+              }
+            }
+
+            return {
+              ...c,
+              url: resolvedUrl,
+              serverUrl: resolvedUrl,
+              storedPath: resolvedPath
+            };
+          });
           setClips(processed);
         }
+        
         if (data.graphics) setGraphics(data.graphics);
         if (data.exportSettings) setExportSettings(data.exportSettings);
         setSelClipId(null); setSelGfxId(null); setTime(0);
@@ -2529,11 +2587,31 @@ export default function HMStudio() {
     window.__HM_SET_RENDER_TIME = async (ts) => {
       document.documentElement.setAttribute('data-render-ready', '0');
       document.body.setAttribute('data-render-ready', '0');
-      
+
+      setTime(ts);
+
+      // In Electron render mode, this Promise resolves ONLY after onReady fires AND
+      // __onElectronFrameReady completes its ipcRenderer.invoke('frame-captured').
+      // That invoke writes the RGBA buffer into FFmpeg stdin and waits for
+      // ipcMain.handle to return { ok: true }.
+      // So: await executeJavaScript('__HM_SET_RENDER_TIME(ts)') in main.ts
+      // = await the full pixel capture + stdin write for that frame. Serial, no deadlock.
+      //
+      // In CDP/server render mode, this resolves when data-render-ready=1 is polled.
+      // In that case we use a 3s hard timeout as fallback.
       return new Promise(resolve => {
         // @ts-ignore
         renderReadyResolverRef.current = resolve;
-        setTime(ts);
+        // Hard timeout: if onReady never fires (e.g. empty timeline), unblock after 3s.
+        // In Electron IPC mode, onReady ALWAYS fires because WebGLRenderStage
+        // skips nextPaint() and calls onReady synchronously after draw().
+        const tid = setTimeout(() => {
+          document.documentElement.setAttribute('data-render-ready', '1');
+          document.body.setAttribute('data-render-ready', '1');
+          resolve(true);
+        }, 3000);
+        // @ts-ignore
+        (renderReadyResolverRef as any)._tid = tid;
       });
     };
     return () => {
@@ -2556,13 +2634,26 @@ export default function HMStudio() {
         const payload = job.payload || {};
         const loadedClips = Array.isArray(payload.clips) ? payload.clips.map((clip) => ({ ...clip, url: clip.serverUrl || clip.url })) : [];
         const loadedGraphics = Array.isArray(payload.graphics) ? payload.graphics : [];
-        setComp(payload.composition || { w: 3840, h: 2160, fps: 30, bg: '#000000' });
-        setClips(loadedClips);
+        
+        const isTransparent = queryParams.get('transparent') === '1';
+        const isOnlyGraphics = queryParams.get('onlyGraphics') === '1';
+        
+        const rawComp = payload.composition || { w: 3840, h: 2160, fps: 30, bg: '#000000' };
+        setComp({
+          ...rawComp,
+          bg: isTransparent ? 'transparent' : (rawComp.bg || '#000000')
+        });
+        setClips(isOnlyGraphics ? [] : loadedClips);
         setGraphics(loadedGraphics);
         setTime(renderTsParam);
         setSelClipId(null); setSelGfxId(null); setEditingGfxId(null); setPlaying(false);
         document.body.style.margin = '0';
-        document.body.style.background = '#000';
+        document.body.style.padding = '0';
+        document.body.style.overflow = 'hidden';
+        document.documentElement.style.margin = '0';
+        document.documentElement.style.padding = '0';
+        document.documentElement.style.overflow = 'hidden';
+        document.body.style.background = isTransparent ? 'transparent' : '#000';
         setRenderJobLoaded(true);
         // 렌더 준비 신호는 WebGLRenderStage가 실제 첫 프레임을 그린 뒤 onReady에서 보낸다.
         // 여기서 먼저 ready=1을 보내면 서버가 검은 빈 화면을 캡처할 수 있다.
@@ -2593,58 +2684,54 @@ export default function HMStudio() {
       const originalTime = time;
 
       const onFrameReady = async (canvas: HTMLCanvasElement) => {
+        // Guard: main loop drives frame advancement via __HM_SET_RENDER_TIME,
+        // so onFrameReady must NOT advance frame or call setTime itself.
+        // Its sole job is to (1) extract pixels and (2) invoke 'frame-captured'
+        // so main.ts can write bytes to FFmpeg stdin and release the per-frame latch.
         if (frame >= totalFrames) return;
 
         try {
           const width = canvas.width;
           const height = canvas.height;
           const ctx = canvas.getContext('2d');
-          if (!ctx) throw new Error("Could not get 2D context from canvas");
+          if (!ctx) throw new Error('Could not get 2D context from canvas');
 
           const imgData = ctx.getImageData(0, 0, width, height);
-          
-          // Send raw Uint8ClampedArray pixel buffer directly to Electron Main
-          (window as any).electron.ipcRenderer.send('render-frame-chunk', {
+
+          // invoke (not send) so we await the write + backpressure in main.ts.
+          // This also triggers the per-frame latch release in executeRenderJob.
+          await (window as any).electron.ipcRenderer.invoke('frame-captured', {
             jobId,
             frame,
             width,
             height,
-            buffer: imgData.data.buffer
-          });
-
-          // Report progress back to Main IPC API responder
-          const progress = Math.min(100, Math.floor((frame / totalFrames) * 100));
-          await fetch(`/api/render-jobs/${jobId}/progress`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ progress, currentFrame: frame, totalFrames })
+            buffer: imgData.data.buffer,
           });
 
           frame++;
-          if (frame < totalFrames) {
-            // Seek to the next frame time
-            setTime(frame / fps);
-          } else {
-            // Completed! Notify Electron Main to finalize video encoding
-            (window as any).electron.ipcRenderer.send('render-frame-complete', { jobId });
+          // Do NOT call setTime here \u2014 main.ts drives the next frame via
+          // executeJavaScript('window.__HM_SET_RENDER_TIME(ts)').
+          // Calling setTime here would double-advance and de-sync the loop.
+          if (frame >= totalFrames) {
+            // Last frame sent \u2014 clean up renderer state.
             setIsElectronRendering(false);
             setRenderJobLoaded(false);
             setTime(originalTime);
           }
         } catch (err: any) {
-          console.error("[ClientRender] Capture error:", err);
-          (window as any).electron.ipcRenderer.send('render-frame-error', { jobId, error: err.message });
+          console.error('[ClientRender] Capture error:', err);
           setIsElectronRendering(false);
           setRenderJobLoaded(false);
           setTime(originalTime);
         }
       };
 
-      // Set the global hook for WebGLRenderStage onReady
+      // Register the per-frame hook BEFORE main.ts starts sending timestamps.
       (window as any).__onElectronFrameReady = onFrameReady;
 
-      // Start the frame loop from frame 0
-      setTime(0);
+      // Do NOT call setTime(0) here \u2014 main.ts will call
+      // executeJavaScript('window.__HM_SET_RENDER_TIME(0)') for frame 0
+      // once start-client-render has been processed.
     });
 
     return () => {
@@ -4639,8 +4726,9 @@ export default function HMStudio() {
     });
   }, [graphics]);
 
+  const isTransparent = queryParams.get('transparent') === '1';
   const renderOnlyStage = (
-    <div style={{ width: comp.w, height: comp.h, background: '#000', overflow: 'hidden' }}>
+    <div style={{ position: 'fixed', top: 0, left: 0, width: comp.w, height: comp.h, background: isTransparent ? 'transparent' : '#000', overflow: 'hidden', margin: 0, padding: 0, border: 'none' }}>
       {renderJobLoaded && (
         <div style={{ position: 'relative', width: comp.w, height: comp.h, '--stage-scale': 1 } as any}>
           <WebGLRenderStage
@@ -4648,18 +4736,31 @@ export default function HMStudio() {
             clips={clips}
             graphics={processedGraphicsForWebGL}
             time={time}
-            onReady={(canvas) => {
+            onReady={async (canvas) => {
               document.documentElement.setAttribute('data-render-ready', '1');
               document.body.setAttribute('data-render-ready', '1');
+
               if ((window as any).electron && (window as any).__onElectronFrameReady) {
-                (window as any).__onElectronFrameReady(canvas);
+                // In Electron IPC mode: invoke('frame-captured') inside __onElectronFrameReady
+                // writes RGBA bytes to FFmpeg stdin and awaits ipcMain.handle's return.
+                // We MUST await this before resolving renderReadyResolverRef so that
+                // executeJavaScript in main.ts does NOT unblock until the pixel write is done.
+                await (window as any).__onElectronFrameReady(canvas);
               }
+
+              // Resolve the Promise returned by __HM_SET_RENDER_TIME.
+              // In Electron mode: this happens AFTER the invoke completes (pixel written).
+              // In CDP mode: this signals data-render-ready=1 for screenshot capture.
               // @ts-ignore
               if (renderReadyResolverRef.current) {
                 // @ts-ignore
                 const resolve = renderReadyResolverRef.current;
                 // @ts-ignore
                 renderReadyResolverRef.current = null;
+                // Clear the hard-timeout so it doesn't fire after we've moved on
+                // @ts-ignore
+                const tid = (renderReadyResolverRef as any)._tid;
+                if (tid) clearTimeout(tid);
                 resolve(true);
               }
             }}

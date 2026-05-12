@@ -1,8 +1,8 @@
-﻿import express from 'express';
+import express from 'express';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
-import { spawn, execSync, exec } from 'child_process';
+import { spawn, execSync, exec, execFileSync, spawnSync } from 'child_process';
 import os from 'os';
 import crypto from 'crypto';
 import multer from 'multer';
@@ -88,7 +88,7 @@ function resolveBundledFfmpeg() {
 
 function verifyFfmpegExecutable(filePath: string) {
   if (!fs.existsSync(filePath)) throw new Error(`FFmpeg copy failed: ${filePath}`);
-  execSync(`"${filePath}" -version`, { stdio: 'ignore' });
+  execFileSync(filePath, ['-version'], { stdio: 'ignore' });
 }
 const ALL_DIRS = [AE_RENDER_ROOT, ASSET_DIR, TEMPLATE_DIR, JOB_DIR, RENDER_DIR, PREVIEW_DIR, LOG_DIR, TEMP_DIR];
 
@@ -271,7 +271,7 @@ function hasAudioStream(filePath: string): boolean {
     try {
       // ffmpeg -i always exits with code 1 because no output is specified,
       // so we must catch the error to read the stderr output.
-      execSync(`"${bin}" -i "${filePath}"`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      execFileSync(bin, ['-i', filePath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     } catch (e: any) {
       out = (e.stderr || '').toString() + (e.stdout || '').toString();
     }
@@ -490,6 +490,21 @@ async function renderJob(record: RenderJobRecord) {
   const previewPath = output.previewPath || path.join(PREVIEW_DIR, `${record.id}.jpg`);
   const logPath = output.logPath || path.join(LOG_DIR, `${record.id}.log.txt`);
   const errorPath = output.errorPath || path.join(LOG_DIR, `${record.id}.error.txt`);
+
+  // Delete existing files to prevent immediate 1-second short-circuit from refreshJobFromDisk
+  try {
+    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+  } catch {}
+  try {
+    if (fs.existsSync(tempOutputPath)) fs.unlinkSync(tempOutputPath);
+  } catch {}
+  try {
+    if (fs.existsSync(errorPath)) fs.unlinkSync(errorPath);
+  } catch {}
+  try {
+    if (fs.existsSync(previewPath)) fs.unlinkSync(previewPath);
+  } catch {}
+
   const comp = record.payload?.composition || {};
   const width = Math.max(2, Number(comp.w || 1920));
   const height = Math.max(2, Number(comp.h || 1080));
@@ -509,7 +524,7 @@ async function renderJob(record: RenderJobRecord) {
 
   record.status = 'preparing';
   record.progress = 2.00;
-  record.statusText = `?됰슢??怨? ??뽰삂 餓?.. (${frameCount}?袁⑥쟿??`;
+  record.statusText = `렌더링을 준비 중입니다... (총 ${frameCount}프레임)`;
   record.totalFrames = frameCount;
   record.currentFrame = 0;
   record.updatedAt = nowIso();
@@ -518,119 +533,492 @@ async function renderJob(record: RenderJobRecord) {
   if (!browserPath) {
     record.status = 'failed';
     record.progress = -1;
-    record.error = 'Chrome ?癒?뮉 Edge ??쎈뻬 ???뵬??筌≪뼚? 筌륁궢六??щ빍?? CHROME_PATH??筌왖?類λ퉸 雅뚯눘苑??';
+    record.error = 'Chrome 또는 Edge 브라우저를 찾을 수 없습니다. CHROME_PATH 환경 변수를 설정해 주세요.';
     record.updatedAt = nowIso();
     await fsp.writeFile(errorPath, record.error, 'utf8').catch(() => {});
     await saveJob(record);
     return;
   }
 
+  let hybridRenderSuccess = false;
+  let clips = record.payload?.clips || [];
+  
+  // Auto-resolve missing or null storedPath / url from ASSET_DIR
+  clips = clips.map((c: any) => {
+    let resolvedPath = c.storedPath;
+    let resolvedUrl = c.serverUrl || c.url;
+    
+    const pathExists = resolvedPath && fs.existsSync(resolvedPath);
+    if (!pathExists) {
+      console.log(`[Auto-Resolve] Clip "${c.name}" has missing/null storedPath. Searching ASSET_DIR: ${ASSET_DIR}`);
+      if (fs.existsSync(ASSET_DIR)) {
+        const files = fs.readdirSync(ASSET_DIR);
+        const cleanName = safeName(c.name).replace(/\.[^/.]+$/, "");
+        const cleanExt = path.extname(c.name).toLowerCase();
+        
+        const match = files.find(f => {
+          const lowerF = f.toLowerCase();
+          if (!lowerF.endsWith(cleanExt)) return false;
+          
+          const cleanPart = cleanName.replace(/_+/g, '_').replace(/^_|_$/g, '');
+          const fClean = lowerF.replace(/_+/g, '_');
+          
+          return cleanPart && fClean.includes(cleanPart.toLowerCase());
+        });
+        
+        if (match) {
+          resolvedPath = path.join(ASSET_DIR, match);
+          resolvedUrl = `/assets/${match}`;
+          console.log(`[Auto-Resolve] Resolved clip "${c.name}" to "${resolvedPath}"`);
+        } else {
+          // Suffix fallback
+          const parts = c.name.split('_');
+          const lastPart = parts[parts.length - 1];
+          if (lastPart && lastPart.length > 5) {
+            const match2 = files.find(f => f.toLowerCase().endsWith(lastPart.toLowerCase()));
+            if (match2) {
+              resolvedPath = path.join(ASSET_DIR, match2);
+              resolvedUrl = `/assets/${match2}`;
+              console.log(`[Auto-Resolve] Suffix fallback resolved clip "${c.name}" to "${resolvedPath}"`);
+            }
+          }
+        }
+      }
+    }
+    return {
+      ...c,
+      storedPath: resolvedPath,
+      serverUrl: resolvedUrl,
+      url: resolvedUrl
+    };
+  });
+
+  if (record.payload) {
+    record.payload.clips = clips;
+  }
+
+  const graphics = record.payload?.graphics || [];
+  
+  const videoClips = clips.filter((c: any) => (c.type === 'video' || c.type === 'clip' || !c.type) && c.storedPath && fs.existsSync(c.storedPath));
+  const isSimpleImage = (c: any) => c.type === 'image' && c.storedPath && fs.existsSync(c.storedPath) && (!c.kf || Object.keys(c.kf).length === 0) && !c.rotation;
+  const imageClips = clips.filter(isSimpleImage);
+  const hasComplexClips = clips.some((c: any) => c.type === 'image' && !isSimpleImage(c));
+  const hasComplexGraphics = graphics.some((g: any) => g.visible !== false && g.type !== 'ae_template');
+  const hasGraphics = graphics.some((g: any) => g.visible !== false);
+
+  const canRunHybrid = !hasComplexClips;
+
+  if (canRunHybrid) {
+    console.log(`[Render ${record.id}] TRIGGERED ADVANCED HYBRID RENDER PATH!`);
+    const hybridDir = path.join(TEMP_DIR, `hybrid_${record.id}`);
+    if (!fs.existsSync(hybridDir)) {
+      fs.mkdirSync(hybridDir, { recursive: true });
+    }
+    
+    let transSession = null;
+    try {
+      let staticFramePath = null;
+      let introFrameCount = 0;
+      let introDuration = 0;
+
+      if (hasGraphics) {
+        const transparentUrl = `http://localhost:${APP_PORT}/?renderJob=${record.id}&renderTs=${encodeURIComponent(renderIn.toFixed(6))}&transparent=1&onlyGraphics=1`;
+        transSession = await launchRenderSession(browserPath, width, height, transparentUrl);
+
+        // [FIX] Warm up: set to first frame and wait for render-ready signal
+        // (replaces the unreliable fixed sleep(500) heuristic)
+        await setRenderTime(transSession.client, Number(renderIn.toFixed(6)));
+        await waitForRenderReady(transSession.client, 8000);
+
+        // [FIX] Read actual Lottie animation duration from the browser context
+        // instead of hardcoding Math.min(2.0, duration)
+        try {
+          const lottieDurResult = await transSession.client.send('Runtime.evaluate', {
+            expression: `(() => {
+              try {
+                const instances = window.__HM_LOTTIE_INSTANCES;
+                if (instances && instances.length > 0) {
+                  const anim = instances[0];
+                  if (anim && anim.totalFrames > 0 && anim.frameRate > 0) {
+                    return anim.totalFrames / anim.frameRate;
+                  }
+                }
+                // fallback: read from lottie-web internal registry
+                const keys = Object.keys(window).filter(k => k.startsWith('lottie'));
+                return null;
+              } catch(e) { return null; }
+            })()`,
+            returnByValue: true,
+            awaitPromise: false,
+          });
+          const detectedDur = lottieDurResult?.result?.value;
+          if (typeof detectedDur === 'number' && detectedDur > 0) {
+            introDuration = Math.min(detectedDur, duration);
+            console.log(`[Hybrid Render] Lottie introDuration detected from browser: ${introDuration.toFixed(3)}s`);
+          } else {
+            introDuration = Math.min(2.0, duration);
+            console.log(`[Hybrid Render] Could not detect Lottie duration, using fallback: ${introDuration.toFixed(3)}s`);
+          }
+        } catch (e) {
+          introDuration = Math.min(2.0, duration);
+          console.warn(`[Hybrid Render] Lottie duration detection failed, using fallback: ${introDuration.toFixed(3)}s`, e);
+        }
+
+        introFrameCount = Math.max(1, Math.ceil(introDuration * fps));
+
+        record.statusText = `자막템플릿 캐싱중 (0/${introFrameCount})`;
+        record.updatedAt = nowIso();
+        await saveJob(record);
+
+        console.log(`[Hybrid Render] Rendering intro transparent WebP sequence (${introFrameCount} frames)...`);
+        
+        for (let i = 0; i < introFrameCount; i++) {
+          const ts = renderIn + i / fps;
+          await setRenderTime(transSession.client, Number(ts.toFixed(6)));
+          
+          // [FIX] Use WebP lossless instead of PNG: preserves alpha channel,
+          // 40-60% smaller payload, fromSurface bypasses CPU readback overhead
+          const result = await transSession.client.send('Page.captureScreenshot', {
+            format: 'webp',
+            quality: 90,
+            clip: { x: 0, y: 0, width, height, scale: 1 },
+            fromSurface: true,
+          });
+          const frameBuffer = Buffer.from(result.data, 'base64');
+          // Keep .png extension so FFmpeg image2 demuxer pattern still works;
+          // WebP is valid input for FFmpeg overlay regardless of extension
+          const framePath = path.join(hybridDir, `frame_${String(i).padStart(3, '0')}.png`);
+          await fsp.writeFile(framePath, frameBuffer);
+          
+          record.progress = Number((10 + (i / introFrameCount) * 40).toFixed(2));
+          record.currentFrame = i;
+          record.statusText = `자막템플릿 캐싱중 (${i + 1}/${introFrameCount})`;
+          record.updatedAt = nowIso();
+          await saveJob(record);
+        }
+        
+        if (duration > introDuration) {
+          console.log(`[Hybrid Render] Rendering static hold frame (WebP)...`);
+          const ts = renderIn + introDuration;
+          await setRenderTime(transSession.client, Number(ts.toFixed(6)));
+
+          // [FIX] WebP lossless + fromSurface for static hold frame
+          const result = await transSession.client.send('Page.captureScreenshot', {
+            format: 'webp',
+            quality: 90,
+            clip: { x: 0, y: 0, width, height, scale: 1 },
+            fromSurface: true,
+          });
+          const staticBuffer = Buffer.from(result.data, 'base64');
+          staticFramePath = path.join(hybridDir, 'static.png');
+          await fsp.writeFile(staticFramePath, staticBuffer);
+        }
+        
+        await transSession.dispose();
+        transSession = null;
+      }
+      
+      record.statusText = '하이브리드 비디오/이미지 병합 및 인코딩 중...';
+      record.progress = 60.0;
+      record.updatedAt = nowIso();
+      await saveJob(record);
+      
+      const bin = ffmpegBin();
+      let encoder = 'h264_nvenc';
+      try {
+        const encoders = execFileSync(bin, ['-encoders'], { encoding: 'utf8' });
+        if (!encoders.includes('h264_nvenc')) {
+          encoder = 'libx264';
+        }
+      } catch (e) {
+        encoder = 'libx264';
+      }
+      
+      const hybridArgs = ['-y'];
+      
+      // Input 0: base black canvas
+      hybridArgs.push('-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:d=${duration.toFixed(6)}:r=${fps}`);
+      
+      // Inputs 1 to M: video clips
+      for (const clip of videoClips) {
+        const clipIn = Math.max(clip.ts, renderIn);
+        const clipOut = Math.min(clip.ts + clip.dur, renderOut);
+        const overlapDur = clipOut - clipIn;
+        const trimStart = (clip.startT || 0) + Math.max(0, renderIn - clip.ts);
+        
+        hybridArgs.push('-ss', trimStart.toFixed(6), '-t', overlapDur.toFixed(6), '-i', clip.storedPath);
+      }
+      
+      // Inputs M+1 to M+N: simple image clips
+      for (const clip of imageClips) {
+        const clipIn = Math.max(clip.ts, renderIn);
+        const clipOut = Math.min(clip.ts + clip.dur, renderOut);
+        const overlapDur = clipOut - clipIn;
+        
+        hybridArgs.push('-loop', '1', '-t', overlapDur.toFixed(6), '-i', clip.storedPath);
+      }
+      
+      // Subtitle template inputs (if present)
+      if (hasGraphics) {
+        hybridArgs.push('-framerate', String(fps), '-i', path.join(hybridDir, 'frame_%03d.png'));
+        if (staticFramePath && fs.existsSync(staticFramePath)) {
+          hybridArgs.push('-loop', '1', '-i', staticFramePath);
+        }
+      }
+      
+      let filterComplex = '';
+      let lastV = '0:v';
+      let currentInputIdx = 1;
+      
+      // Process background videos
+      for (let idx = 0; idx < videoClips.length; idx++) {
+        const clip = videoClips[idx];
+        const relativeTs = Math.max(0, clip.ts - renderIn);
+        const overlapDur = Math.min(clip.ts + clip.dur, renderOut) - Math.max(clip.ts, renderIn);
+        
+        const delayedLabel = `v_delay_${idx}`;
+        const nextLabel = `v_step_${idx}`;
+        
+        filterComplex += `[${currentInputIdx}:v]scale=${width}:${height},setpts=PTS-STARTPTS+${relativeTs.toFixed(6)}/TB[${delayedLabel}];`;
+        filterComplex += `[${lastV}][${delayedLabel}]overlay=0:0:enable='between(t,${relativeTs.toFixed(6)},${(relativeTs + overlapDur).toFixed(6)})'[${nextLabel}];`;
+        
+        lastV = nextLabel;
+        currentInputIdx++;
+      }
+      
+      // Process simple images
+      for (let idx = 0; idx < imageClips.length; idx++) {
+        const clip = imageClips[idx];
+        const relativeTs = Math.max(0, clip.ts - renderIn);
+        const overlapDur = Math.min(clip.ts + clip.dur, renderOut) - Math.max(clip.ts, renderIn);
+        
+        const scale = (clip.scale ?? 100) / 100;
+        const srcW = clip.sourceW || width;
+        const srcH = clip.sourceH || height;
+        const finalW = Math.round(srcW * scale);
+        const finalH = Math.round(srcH * scale);
+        const xPct = clip.x ?? 50;
+        const yPct = clip.y ?? 50;
+        const fx = Math.round((xPct / 100) * width - finalW / 2);
+        const fy = Math.round((yPct / 100) * height - finalH / 2);
+        
+        const delayedLabel = `img_delay_${idx}`;
+        const nextLabel = `img_step_${idx}`;
+        
+        filterComplex += `[${currentInputIdx}:v]scale=${finalW}:${finalH},setpts=PTS-STARTPTS+${relativeTs.toFixed(6)}/TB[${delayedLabel}];`;
+        filterComplex += `[${lastV}][${delayedLabel}]overlay=${fx}:${fy}:enable='between(t,${relativeTs.toFixed(6)},${(relativeTs + overlapDur).toFixed(6)})'[${nextLabel}];`;
+        
+        lastV = nextLabel;
+        currentInputIdx++;
+      }
+      
+      // Process subtitle templates (if present)
+      if (hasGraphics) {
+        const subIntroIdx = currentInputIdx;
+        const subIntroLabel = `sub_intro`;
+        filterComplex += `[${subIntroIdx}:v]setpts=PTS-STARTPTS[${subIntroLabel}];`;
+        
+        const finalSubLabel = `sub_step`;
+        filterComplex += `[${lastV}][${subIntroLabel}]overlay=0:0:enable='lte(t,${introDuration.toFixed(6)})'[${finalSubLabel}];`;
+        lastV = finalSubLabel;
+        currentInputIdx++;
+        
+        if (staticFramePath && fs.existsSync(staticFramePath)) {
+          const subStaticIdx = currentInputIdx;
+          const subStaticLabel = `sub_static`;
+          filterComplex += `[${subStaticIdx}:v]setpts=PTS-STARTPTS[${subStaticLabel}];`;
+          
+          const lastOutLabel = `outv`;
+          filterComplex += `[${lastV}][${subStaticLabel}]overlay=0:0:enable='gt(t,${introDuration.toFixed(6)})'[${lastOutLabel}];`;
+          lastV = lastOutLabel;
+        }
+      }
+      
+      // Trim filter complex trailing semicolon
+      if (filterComplex.endsWith(';')) {
+        filterComplex = filterComplex.slice(0, -1);
+      }
+      
+      if (filterComplex.length > 0) {
+        hybridArgs.push('-filter_complex', filterComplex);
+        hybridArgs.push('-map', `[${lastV}]`);
+      } else {
+        hybridArgs.push('-map', '0:v');
+      }
+      
+      hybridArgs.push('-c:v', encoder);
+      // [FIX] NVENC uses p1~p7 preset scale, not libx264's slow/medium/fast strings.
+      // Using 'slow' on nvenc causes unpredictable fallback behavior.
+      if (encoder.endsWith('_nvenc')) {
+        hybridArgs.push('-preset', 'p4', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '50M', '-bufsize', '100M');
+      } else {
+        hybridArgs.push('-preset', 'medium', '-crf', '18');
+      }
+      hybridArgs.push('-pix_fmt', 'yuv420p');
+      hybridArgs.push('-movflags', '+faststart');
+      hybridArgs.push(tempOutputPath);
+      
+      console.log(`[Hybrid Render] Running advanced FFmpeg overlay:`, hybridArgs.join(' '));
+      
+      await new Promise<void>((resolve, reject) => {
+        const p = spawn(bin, hybridArgs);
+        let err = '';
+        p.stderr.on('data', d => { err += d.toString(); });
+        p.on('close', code => {
+          if (code === 0) resolve();
+          else reject(new Error(`FFmpeg hybrid overlay failed (code ${code}): ${err}`));
+        });
+      });
+      
+      const previewSec = (duration / 2).toFixed(3);
+      const previewArgs = ['-y', '-ss', previewSec, '-i', tempOutputPath, '-vframes', '1', '-q:v', '2', previewPath];
+      await new Promise<void>((resolve) => {
+        const p = spawn(bin, previewArgs);
+        p.on('close', () => resolve());
+      });
+      
+      hybridRenderSuccess = true;
+      console.log(`[Hybrid Render] COMPLETED SUCCESSFULLY!`);
+    } catch (err: any) {
+      console.error(`[Hybrid Render] FAILED, FALLING BACK TO STANDARD CAPTURE:`, err);
+      if (transSession) {
+        await transSession.dispose().catch(() => {});
+      }
+      try {
+        if (fs.existsSync(hybridDir)) {
+          const files = fs.readdirSync(hybridDir);
+          for (const f of files) fs.unlinkSync(path.join(hybridDir, f));
+          fs.rmdirSync(hybridDir);
+        }
+      } catch {}
+    } finally {
+      // [FIX] Always clean up temporary PNG/WebP frame sequence after hybrid render
+      // (success path previously left hundreds of MB of frames on disk)
+      if (hybridRenderSuccess) {
+        fsp.rm(hybridDir, { recursive: true, force: true })
+          .catch(e => console.warn('[Hybrid] tempdir cleanup failed:', e));
+      }
+    }
+  }
+
   let session: Awaited<ReturnType<typeof launchRenderSession>> | null = null;
   let ffmpegProc: any = null;
   try {
-    const url = `http://localhost:${APP_PORT}/?renderJob=${record.id}&renderTs=${encodeURIComponent(renderIn.toFixed(6))}`;
-    session = await launchRenderSession(browserPath, width, height, url);
+    if (!hybridRenderSuccess) {
+      const url = `http://localhost:${APP_PORT}/?renderJob=${record.id}&renderTs=${encodeURIComponent(renderIn.toFixed(6))}`;
+      session = await launchRenderSession(browserPath, width, height, url);
 
-    console.log(`[Render ${record.id}] Browser launched in ${Date.now() - renderStartedAt}ms`);
-    record.status = 'rendering';
-    record.progress = 10.00;
-    record.statusText = `?袁⑥쟿??筌╈돦荑???뽰삂... (0/${frameCount})`;
-    record.updatedAt = nowIso();
-    await saveJob(record);
-
-    const bin = ffmpegBin();
-    let encoder = 'hevc_nvenc';
-    try {
-      const encoders = execSync(`"${bin}" -encoders`, { encoding: 'utf8' });
-      if (!encoders.includes('hevc_nvenc')) {
-        console.warn('[Render] hevc_nvenc not supported, falling back to libx264');
-        encoder = 'libx264';
-      }
-    } catch (e) {
-      encoder = 'libx264';
-    }
-
-    const ffmpegArgs = [
-      '-y',
-      '-f', 'image2pipe',
-      '-vcodec', 'mjpeg',
-      '-framerate', String(fps),
-      '-i', '-',
-      '-c:v', encoder,
-      ...(encoder === 'hevc_nvenc' ? ['-preset', 'p7', '-cq', '12'] : ['-preset', 'slow', '-crf', '12']),
-      '-b:v', '0',
-      '-pix_fmt', 'yuv420p',
-      '-movflags', '+faststart',
-      tempOutputPath,
-    ];
-
-    const logStream = fs.createWriteStream(logPath, { flags: 'a' });
-    ffmpegProc = spawn(bin, ffmpegArgs);
-    ffmpegProc.stdout.pipe(logStream);
-    ffmpegProc.stderr.pipe(logStream);
-
-    const ffmpegPromise = new Promise((resolve, reject) => {
-      ffmpegProc.on('close', (code) => {
-        if (code === 0) resolve(code);
-        else reject(new Error(`FFmpeg exited with code ${code}`));
-      });
-      ffmpegProc.on('error', reject);
-    });
-
-    let ffmpegCrashed = false;
-    ffmpegProc.on('exit', (code) => {
-      if (code !== 0 && code !== null) ffmpegCrashed = true;
-    });
-
-    for (let i = 0; i < frameCount; i++) {
-      if (!renderJobs.has(record.id)) {
-        console.log(`[Render ${record.id}] Job was removed from queue. Aborting...`);
-        throw new Error('cancelled');
-      }
-      if (ffmpegCrashed) {
-        throw new Error('?紐꾪맜???袁⑥쨮?紐꾨뮞(FFmpeg)揶쎛 ??쑴??怨몄읅??곗쨮 ?ル굝利??뤿???щ빍??');
-      }
-      const ts = renderIn + i / fps;
-      const t1 = Date.now();
-      
-      if (i > 0) {
-        await setRenderTime(session.client, Number(ts.toFixed(6)));
-      }
-      const t2 = Date.now();
-      const frameBuffer = await captureFrameBuffer(session.client, width, height);
-      const t3 = Date.now();
-      
-      if (!ffmpegProc.stdin.writable) {
-         throw new Error('FFmpeg ??낆젾 ???뵠?袁? ???굧??щ빍??');
-      }
-
-      if (!ffmpegProc.stdin.write(frameBuffer)) {
-        await new Promise(r => ffmpegProc.stdin.once('drain', r));
-      }
-      const t4 = Date.now();
-
-      if (i === Math.floor(frameCount / 2)) {
-        await fsp.writeFile(previewPath, frameBuffer).catch(() => {});
-      }
-
-      if (i < 10 || i % 30 === 0) console.log(`[Render ${record.id}] Frame ${i}/${frameCount}: setTime ${t2 - t1}ms, capture ${t3 - t2}ms, pipe ${t4 - t3}ms, elapsed ${((Date.now() - renderStartedAt) / 1000).toFixed(1)}s`);
-      
-      const elapsed = ((Date.now() - renderStartedAt) / 1000).toFixed(0);
-      record.progress = Number((10 + ((i + 1) / frameCount) * 85).toFixed(2));
-      record.currentFrame = i + 1;
-      record.statusText = `Rendering frames (${i + 1}/${frameCount}) - ${elapsed}s`;
+      console.log(`[Render ${record.id}] Browser launched in ${Date.now() - renderStartedAt}ms`);
+      record.status = 'rendering';
+      record.progress = 10.00;
+      record.statusText = `프레임 렌더링 중... (0/${frameCount})`;
       record.updatedAt = nowIso();
       await saveJob(record);
-    }
 
-    console.log(`[Render ${record.id}] All ${frameCount} frames piped in ${((Date.now() - renderStartedAt) / 1000).toFixed(1)}s, waiting for FFmpeg...`);
-    ffmpegProc.stdin.end();
-    await ffmpegPromise;
-    console.log(`[Render ${record.id}] FFmpeg finished in ${((Date.now() - renderStartedAt) / 1000).toFixed(1)}s`);
+      const bin = ffmpegBin();
+      let encoder = 'h264_nvenc';
+      try {
+        const encoders = execFileSync(bin, ['-encoders'], { encoding: 'utf8' });
+        if (!encoders.includes('h264_nvenc')) {
+          console.warn('[Render] h264_nvenc not supported, falling back to libx264');
+          encoder = 'libx264';
+        }
+      } catch (e) {
+        encoder = 'libx264';
+      }
+
+      const ffmpegArgs = [
+        '-y',
+        '-f', 'image2pipe',
+        '-vcodec', 'mjpeg',
+        '-framerate', String(fps),
+        '-i', '-',
+        '-c:v', encoder,
+        // [FIX] NVENC preset system: p1(fast)~p7(quality). 'slow' is a libx264 term,
+        // not valid for nvenc and causes undefined fallback behavior.
+        ...(encoder.endsWith('_nvenc')
+          ? ['-preset', 'p4', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '50M', '-bufsize', '100M']
+          : ['-preset', 'medium', '-crf', '18']),
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
+        tempOutputPath,
+      ];
+
+      const logStream = fs.createWriteStream(logPath, { flags: 'a' });
+      ffmpegProc = spawn(bin, ffmpegArgs);
+      ffmpegProc.stdout.pipe(logStream);
+      ffmpegProc.stderr.pipe(logStream);
+
+      const ffmpegPromise = new Promise((resolve, reject) => {
+        ffmpegProc.on('close', (code) => {
+          if (code === 0) resolve(code);
+          else reject(new Error(`FFmpeg exited with code ${code}`));
+        });
+        ffmpegProc.on('error', reject);
+      });
+
+      let ffmpegCrashed = false;
+      ffmpegProc.on('exit', (code) => {
+        if (code !== 0 && code !== null) ffmpegCrashed = true;
+      });
+
+      let lastSavedAt = 0;
+      for (let i = 0; i < frameCount; i++) {
+        if (!renderJobs.has(record.id)) {
+          console.log(`[Render ${record.id}] Job was removed from queue. Aborting...`);
+          throw new Error('cancelled');
+        }
+        if (ffmpegCrashed) {
+          throw new Error('렌더링 도중 비디오 백엔드(FFmpeg)가 비정상 종료되었습니다. 상세 내용은 로그를 확인하세요.');
+        }
+        const ts = renderIn + i / fps;
+        const t1 = Date.now();
+        
+        if (i > 0) {
+          await setRenderTime(session.client, Number(ts.toFixed(6)));
+        }
+        const t2 = Date.now();
+        const frameBuffer = await captureFrameBuffer(session.client, width, height);
+        const t3 = Date.now();
+        
+        if (!ffmpegProc.stdin.writable) {
+           throw new Error('FFmpeg ??낆젾 ???뵠?袁? ???굧??щ빍??');
+        }
+
+        if (!ffmpegProc.stdin.write(frameBuffer)) {
+          await new Promise(r => ffmpegProc.stdin.once('drain', r));
+        }
+        const t4 = Date.now();
+
+        if (i === Math.floor(frameCount / 2)) {
+          await fsp.writeFile(previewPath, frameBuffer).catch(() => {});
+        }
+
+        if (i < 10 || i % 30 === 0) console.log(`[Render ${record.id}] Frame ${i}/${frameCount}: setTime ${t2 - t1}ms, capture ${t3 - t2}ms, pipe ${t4 - t3}ms, elapsed ${((Date.now() - renderStartedAt) / 1000).toFixed(1)}s`);
+        
+        const elapsed = ((Date.now() - renderStartedAt) / 1000).toFixed(0);
+        record.progress = Number((10 + ((i + 1) / frameCount) * 85).toFixed(2));
+        record.currentFrame = i + 1;
+        record.statusText = `프레임 렌더링 중... (${i + 1}/${frameCount}) - ${elapsed}초 경과`;
+        record.updatedAt = nowIso();
+        // [FIX] Debounce saveJob to once per second — 30fps x 30s = 900 fsync calls
+        // was adding measurable I/O latency per frame on every write.
+        const nowMs = Date.now();
+        if (nowMs - lastSavedAt > 1000) {
+          await saveJob(record);
+          lastSavedAt = nowMs;
+        }
+      }
+
+      console.log(`[Render ${record.id}] All ${frameCount} frames piped in ${((Date.now() - renderStartedAt) / 1000).toFixed(1)}s, waiting for FFmpeg...`);
+      ffmpegProc.stdin.end();
+      await ffmpegPromise;
+      console.log(`[Render ${record.id}] FFmpeg finished in ${((Date.now() - renderStartedAt) / 1000).toFixed(1)}s`);
+    }
 
     // --- Final Pass: Audio Mixing & Thumbnail ---
     record.progress = 96.00;
-    record.statusText = '?紐꾪맜???袁⑥┷, ??삳탵????밴쉐 獄??紐껉퐬????뚯뿯 餓?..';
+    record.statusText = '렌더링 완료, 오디오 합성 및 인코딩 진행 중...';
     record.updatedAt = nowIso();
     await saveJob(record);
 
@@ -641,7 +1029,7 @@ async function renderJob(record: RenderJobRecord) {
     });
     const hasAudio = audioClips.length > 0;
     
-    if (hasAudio || fs.existsSync(previewPath)) {
+    if (hasAudio) {
       const finalPassArgs = ['-y'];
       
       // Input 0: Rendered Video (No audio)
@@ -653,15 +1041,9 @@ async function renderJob(record: RenderJobRecord) {
         audioInputs.push(c);
         finalPassArgs.push('-i', c.storedPath);
       }
-      
-      // Input N: Preview image (if exists)
-      if (fs.existsSync(previewPath)) {
-        finalPassArgs.push('-i', previewPath);
-      }
  
       const vIdx = 0;
       const aStartIdx = 1;
-      const imgIdx = aStartIdx + audioInputs.length;
 
       let filterComplex = '';
       if (hasAudio) {
@@ -683,14 +1065,20 @@ async function renderJob(record: RenderJobRecord) {
           const delayMs = Math.max(0, Math.round((clip.ts - renderIn) * 1000));
           
           const label = `aud${idx}`;
-          // Trim -> Reset PTS -> Delay
-          audioFilters += `[${idx + aStartIdx}:a]atrim=start=${trimStart.toFixed(3)}:duration=${overlapDur.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}|${delayMs}[${label}];`;
+          // Trim -> Reset PTS -> Delay using modern all=1 option for robust multi-channel support
+          audioFilters += `[${idx + aStartIdx}:a]atrim=start=${trimStart.toFixed(3)}:duration=${overlapDur.toFixed(3)},asetpts=PTS-STARTPTS,adelay=delays=${delayMs}:all=1[${label}];`;
           amixLabels.push(`[${label}]`);
           mixCount++;
         }
         
         if (mixCount > 0) {
-          filterComplex = `${audioFilters}${amixLabels.join('')}amix=inputs=${mixCount}[outa]`;
+          if (mixCount === 1) {
+            // Bypass amix filter to prevent attenuation when there is only 1 audio stream
+            filterComplex = audioFilters.replace(`[${amixLabels[0].slice(1, -1)}]`, 'outa');
+          } else {
+            // Mix multiple audios with normalize=0 to preserve full volume
+            filterComplex = `${audioFilters}${amixLabels.join('')}amix=inputs=${mixCount}:normalize=0[outa]`;
+          }
         }
       }
 
@@ -700,11 +1088,6 @@ async function renderJob(record: RenderJobRecord) {
       if (actuallyHasAudio) {
         finalPassArgs.push('-filter_complex', filterComplex);
         finalPassArgs.push('-map', '[outa]');
-      }
-      
-      if (fs.existsSync(previewPath)) {
-        finalPassArgs.push('-map', `${imgIdx}:v`);
-        finalPassArgs.push('-disposition:v:1', 'attached_pic');
       }
 
       finalPassArgs.push('-c:v', 'copy');
@@ -910,10 +1293,10 @@ app.get('/api/system-status', async (_req, res) => {
   let hasGpu = false;
   let encoder = 'libx264';
   try {
-    const encoders = execSync(`"${bin}" -encoders`, { encoding: 'utf8' });
-    if (encoders.includes('hevc_nvenc')) {
+    const encoders = execFileSync(bin, ['-encoders'], { encoding: 'utf8' });
+    if (encoders.includes('h264_nvenc')) {
       hasGpu = true;
-      encoder = 'hevc_nvenc';
+      encoder = 'h264_nvenc';
     }
   } catch (e) {}
 
@@ -967,7 +1350,7 @@ app.post('/api/system/install-ffmpeg', async (_req, res) => {
       try {
         const binDir = targetDir;
         const psCommand = `$u=[Environment]::GetEnvironmentVariable('Path','User'); if($u -notlike '*${binDir}*'){$n=$u+';'+'${binDir}';[Environment]::SetEnvironmentVariable('Path',$n,'User')}`;
-        execSync(`powershell -NoProfile -Command "${psCommand}"`);
+        execFileSync('powershell', ['-NoProfile', '-Command', psCommand]);
         console.log('[Setup] FFmpeg added to User PATH');
       } catch (e) {
         console.warn('[Setup] Could not update PATH:', e);
@@ -990,7 +1373,8 @@ app.post('/api/system/install-chrome', async (_req, res) => {
     fs.mkdirSync(installPath, { recursive: true });
     
     const cmd = `npx @puppeteer/browsers install chrome@stable --path "${installPath}"`;
-    execSync(cmd, { stdio: 'inherit' });
+    const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+    execFileSync(npxCmd, ['@puppeteer/browsers', 'install', 'chrome@stable', '--path', installPath], { stdio: 'inherit' });
     
     const newPath = browserBin();
     res.json({ ok: true, path: newPath });
@@ -1027,6 +1411,19 @@ app.post('/api/system/browse-folder', async (_req, res) => {
       res.json({ ok: false, message: 'Canceled' });
     }
   });
+});
+
+
+app.get('/api/system/assets', (_req, res) => {
+  try {
+    if (!fs.existsSync(ASSET_DIR)) {
+      return res.json({ ok: true, files: [] });
+    }
+    const files = fs.readdirSync(ASSET_DIR);
+    res.json({ ok: true, files });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 

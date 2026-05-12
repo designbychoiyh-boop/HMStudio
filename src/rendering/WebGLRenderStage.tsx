@@ -253,8 +253,11 @@ function renderCanvas2D(ctx: CanvasRenderingContext2D, project: any, time: numbe
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
   ctx.clearRect(0, 0, comp.w, comp.h);
-  ctx.fillStyle = comp.bg || '#000000';
-  ctx.fillRect(0, 0, comp.w, comp.h);
+  const isTransparentParam = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('transparent') === '1';
+  if (comp.bg !== 'transparent' && !isTransparentParam) {
+    ctx.fillStyle = comp.bg || '#000000';
+    ctx.fillRect(0, 0, comp.w, comp.h);
+  }
   ctx.restore();
 
   const ordered = [...project.layers]
@@ -314,6 +317,25 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
       imagesRef.current.clear();
     };
   }, []);
+
+  // [FIX] Destroy Lottie instances for layers that are no longer in the graphics list.
+  // Without this, removed/swapped layers accumulate hidden RAF loops and Canvas GPU
+  // contexts, leading to unbounded memory growth during long render sessions.
+  useEffect(() => {
+    const activeLottieIds = new Set(
+      graphics
+        .filter((g: any) => g.type === 'ae_template' && g.lottieData)
+        .map((g: any) => g.id)
+    );
+    for (const [id, item] of lottiesRef.current.entries()) {
+      if (!activeLottieIds.has(id)) {
+        try { item.anim.destroy(); } catch {}
+        // Setting width=0 releases the GPU texture held by the offscreen canvas
+        try { item.canvas.width = 0; } catch {}
+        lottiesRef.current.delete(id);
+      }
+    }
+  }, [graphics]);
 
   useEffect(() => {
     const videoMap = videosRef.current;
@@ -392,7 +414,7 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
 
     const draw = async () => {
       const canvas = canvasRef.current;
-      const ctx = canvas?.getContext('2d', { alpha: false });
+      const ctx = canvas?.getContext('2d', { alpha: true });
       if (!canvas || !ctx) return;
 
       canvas.width = project.composition.w;
@@ -420,7 +442,17 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
         templates: templateCanvases
       });
 
-      await nextPaint();
+      const isRender = typeof window !== 'undefined' && (
+        new URLSearchParams(window.location.search).has('renderJob') ||
+        document.documentElement.getAttribute('data-render-ready') !== null
+      );
+      // [FIX] In render mode, skip nextPaint() entirely.
+      // Chromium background windows throttle requestAnimationFrame to ~1fps,
+      // which would stall the frame capture loop. Synchronous canvas painting
+      // is correct here because __HM_SET_RENDER_TIME awaits this draw() Promise.
+      if (!isRender) {
+        await nextPaint();
+      }
       if (!cancelled && token === drawTokenRef.current && canvas) onReady?.(canvas);
     };
 

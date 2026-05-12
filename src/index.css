@@ -175,3 +175,17 @@ input[type=number] {
   -ms-overflow-style: none;  /* IE and Edge */
   scrollbar-width: none;  /* Firefox */
 }
+
+/* Hide all scrollbars during rendering to prevent viewport adjustments and black/grey scrollbars */
+html[data-render-ready],
+body[data-render-ready],
+[data-render-ready] * {
+  scrollbar-width: none !important;
+}
+html[data-render-ready] ::-webkit-scrollbar,
+body[data-render-ready] ::-webkit-scrollbar,
+[data-render-ready] ::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
