@@ -45,7 +45,7 @@ function drawField(ctx: CanvasRenderingContext2D, field: TemplateField, boxW: nu
   ctx.globalAlpha = alpha;
   ctx.font = `700 ${fontSize}px ${fontFamily}`;
   ctx.textAlign = textAlign as CanvasTextAlign;
-  ctx.textBaseline = 'alphabetic'; // Changed from 'middle' to better match AE anchor points
+  ctx.textBaseline = hasSize ? 'middle' : 'alphabetic'; // Use middle inside a bounding box, alphabetic for direct baseline coordinates
   ctx.fillStyle = fill;
   if (stroke && strokeWidth > 0) {
     ctx.lineWidth = strokeWidth;
@@ -165,7 +165,7 @@ export function drawData9Template(ctx: CanvasRenderingContext2D, template: AETem
     ctx.globalAlpha = textAlpha;
     ctx.font = `${field.fontWeight || '700'} ${fontSize}px ${fontFamily}`;
     ctx.textAlign = textAlign as CanvasTextAlign;
-    ctx.textBaseline = 'middle';
+    ctx.textBaseline = typeof pair.textYInBar === 'number' ? 'alphabetic' : 'middle';
     ctx.fillStyle = field.color || pair.color || '#ffffff';
     const strokeWidth = typeof field.strokeWidth === 'number' ? field.strokeWidth * sx : Number(pair.strokeWidth || 0) * sx;
     const strokeColor = field.strokeColor || pair.strokeColor;

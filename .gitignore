@@ -9,3 +9,7 @@ VibeEdit_AE_Render_Server/
 *.log
 .env*
 !.env.example
+dist-electron/
+dist-packaged/
+HMStudio.exe
+

@@ -1,0 +1,34 @@
+{
+  "productName": "HMStudio",
+  "appId": "com.hanmac.hmstudio",
+  "asar": true,
+  "asarUnpack": [
+    "node_modules/ffmpeg-static/ffmpeg.exe",
+    "dist-electron/**/*",
+    "dist/**/*"
+  ],
+  "directories": {
+    "output": "dist-packaged"
+  },
+  "files": [
+    "dist/**/*",
+    "dist-electron/**/*",
+    "package.json",
+    "node_modules/**/*"
+  ],
+  "extraResources": [
+    {
+      "from": "Template_Json",
+      "to": "Template_Json",
+      "filter": ["**/*.json"]
+    }
+  ],
+  "win": {
+    "target": "portable",
+    "icon": "public/HMStudio_logo.png",
+    "requestedExecutionLevel": "asInvoker"
+  },
+  "portable": {
+    "artifactName": "HMStudio.exe"
+  }
+}

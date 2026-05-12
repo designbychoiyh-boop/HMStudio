@@ -1,4 +1,4 @@
-import express from 'express';
+﻿import express from 'express';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
@@ -37,7 +37,8 @@ function getInternalIP() {
   return 'localhost';
 }
 
-const ROOT = process.cwd();
+const ROOT = process.env.NODE_ENV === 'production' ? path.join(__dirname, '..') : process.cwd();
+const APP_PATH = ROOT;
 const APP_PORT = Number(process.env.PORT || 3001);
 const AE_RENDER_ROOT = process.env.AE_RENDER_ROOT 
   ? path.resolve(process.env.AE_RENDER_ROOT)
@@ -48,12 +49,47 @@ const AE_RENDER_ROOT = process.env.AE_RENDER_ROOT
 const ASSET_DIR = path.join(AE_RENDER_ROOT, 'assets');
 const TEMPLATE_DIR = path.join(AE_RENDER_ROOT, 'templates');
 const JOB_DIR = path.join(AE_RENDER_ROOT, 'jobs');
-const EXTERNAL_TEMPLATE_DIR = path.join(ROOT, 'Template_Json');
+const resolveExternalTemplateDir = () => {
+  const candidates = [
+    process.env.EXE_DIR ? path.join(process.env.EXE_DIR, 'Template_Json') : null,
+    path.join(ROOT, 'Template_Json'),
+    (process as any).resourcesPath ? path.join((process as any).resourcesPath, 'Template_Json') : null,
+    process.env.APP_PATH ? path.join(process.env.APP_PATH, 'Template_Json') : null,
+  ].filter(Boolean) as string[];
+  return candidates.find(dir => fs.existsSync(dir)) || candidates[0] || path.join(ROOT, 'Template_Json');
+};
+const EXTERNAL_TEMPLATE_DIR = resolveExternalTemplateDir();
 const RENDER_DIR = path.join(AE_RENDER_ROOT, 'renders');
 const PREVIEW_DIR = path.join(AE_RENDER_ROOT, 'previews');
 const LOG_DIR = path.join(AE_RENDER_ROOT, 'logs');
 const TEMP_DIR = path.join(AE_RENDER_ROOT, 'temp');
+const RUNTIME_BASE = path.join(os.homedir(), '.hmstudio_runtime');
+const FFMPEG_RUNTIME_DIR = path.join(RUNTIME_BASE, 'ffmpeg');
 
+function ffmpegExeName() {
+  return process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+}
+
+function resolveBundledFfmpeg() {
+  const candidates = [];
+  if (ffmpegPath) {
+    candidates.push(ffmpegPath);
+    if (ffmpegPath.includes('app.asar') && !ffmpegPath.includes('app.asar.unpacked')) {
+      candidates.push(ffmpegPath.replace('app.asar', 'app.asar.unpacked'));
+    }
+  }
+  candidates.push(path.join(ROOT, 'node_modules', 'ffmpeg-static', ffmpegExeName()));
+
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function verifyFfmpegExecutable(filePath: string) {
+  if (!fs.existsSync(filePath)) throw new Error(`FFmpeg copy failed: ${filePath}`);
+  execSync(`"${filePath}" -version`, { stdio: 'ignore' });
+}
 const ALL_DIRS = [AE_RENDER_ROOT, ASSET_DIR, TEMPLATE_DIR, JOB_DIR, RENDER_DIR, PREVIEW_DIR, LOG_DIR, TEMP_DIR];
 
 function ensureDirs() {
@@ -70,16 +106,15 @@ async function ensureSystemBins() {
   if (!ffmpeg) {
     console.log('[Setup] Local FFmpeg not found. Auto-installing...');
     try {
-      const targetDir = path.join(ROOT, '.runtime', 'ffmpeg');
+      const targetDir = FFMPEG_RUNTIME_DIR;
       if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
-      const source = ffmpegPath;
-      if (source) {
-        const exe = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
-        const destination = path.join(targetDir, exe);
-        fs.copyFileSync(source, destination);
-        if (process.platform !== 'win32') fs.chmodSync(destination, 0o755);
-        console.log(`[Setup] FFmpeg installed to ${destination}`);
-      }
+      const source = resolveBundledFfmpeg();
+      if (!source) throw new Error('ffmpeg-static executable not found');
+      const destination = path.join(targetDir, ffmpegExeName());
+      fs.copyFileSync(source, destination);
+      if (process.platform !== 'win32') fs.chmodSync(destination, 0o755);
+      verifyFfmpegExecutable(destination);
+      console.log(`[Setup] FFmpeg installed to ${destination}`);
     } catch (err) {
       console.error('[Setup] FFmpeg auto-install failed:', err);
     }
@@ -93,7 +128,7 @@ async function ensureSystemBins() {
     console.log('[Setup] Local Chrome not found. It will be installed on first request or you can trigger it via UI.');
     // We won't auto-install chrome on startup because it's heavy and might block startup for too long.
     // But we'll make sure the directory exists.
-    const chromeDir = path.join(ROOT, '.runtime', 'chrome');
+    const chromeDir = path.join(RUNTIME_BASE, 'chrome');
     if (!fs.existsSync(chromeDir)) fs.mkdirSync(chromeDir, { recursive: true });
   } else {
     console.log('[Setup] Chrome found:', chrome);
@@ -125,7 +160,7 @@ function nowIso() {
 }
 
 function safeName(name: string) {
-  return name.replace(/[^a-zA-Z0-9._가-힣-]+/g, '_');
+  return name.replace(/[^a-zA-Z0-9._-]+/g, '_');
 }
 
 function jobJsonPath(id: string) {
@@ -157,6 +192,9 @@ function refreshJobFromDisk(job: RenderJobRecord) {
 }
 
 async function saveJob(job: RenderJobRecord) {
+  if (!renderJobs.has(job.id)) {
+    return;
+  }
   await fsp.writeFile(jobJsonPath(job.id), JSON.stringify(job, null, 2), 'utf8');
 }
 
@@ -206,10 +244,9 @@ async function moveFile(src: string, dest: string) {
 }
 
 function findLocalFfmpeg() {
-  const base = path.join(ROOT, '.runtime', 'ffmpeg');
+  const base = FFMPEG_RUNTIME_DIR;
   if (!fs.existsSync(base)) return null;
-  const exe = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
-  const full = path.join(base, exe);
+  const full = path.join(base, ffmpegExeName());
   return fs.existsSync(full) ? full : null;
 }
 
@@ -245,7 +282,7 @@ function hasAudioStream(filePath: string): boolean {
 }
 
 function findLocalChrome() {
-  const base = path.join(ROOT, '.runtime', 'chrome');
+  const base = path.join(RUNTIME_BASE, 'chrome');
   if (!fs.existsSync(base)) return null;
   try {
     // Recursively look for chrome.exe in .runtime/chrome
@@ -374,6 +411,11 @@ async function launchRenderSession(browserPath: string, width: number, height: n
   const browser = spawn(browserPath, [
     `--remote-debugging-port=${debugPort}`,
     '--headless=new',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-extensions',
+    '--disable-dev-shm-usage',
+    `--user-data-dir=${path.join(TEMP_DIR, `chrome-profile-${debugPort}`)}`,
     '--enable-gpu',
     '--ignore-gpu-blocklist',
     '--enable-features=Vulkan,UseSkiaRenderer,CanvasOopRasterization',
@@ -467,7 +509,7 @@ async function renderJob(record: RenderJobRecord) {
 
   record.status = 'preparing';
   record.progress = 2.00;
-  record.statusText = `브라우저 시작 중... (${frameCount}프레임)`;
+  record.statusText = `?됰슢??怨? ??뽰삂 餓?.. (${frameCount}?袁⑥쟿??`;
   record.totalFrames = frameCount;
   record.currentFrame = 0;
   record.updatedAt = nowIso();
@@ -476,7 +518,7 @@ async function renderJob(record: RenderJobRecord) {
   if (!browserPath) {
     record.status = 'failed';
     record.progress = -1;
-    record.error = 'Chrome 또는 Edge 실행 파일을 찾지 못했습니다. CHROME_PATH를 지정해 주세요.';
+    record.error = 'Chrome ?癒?뮉 Edge ??쎈뻬 ???뵬??筌≪뼚? 筌륁궢六??щ빍?? CHROME_PATH??筌왖?類λ퉸 雅뚯눘苑??';
     record.updatedAt = nowIso();
     await fsp.writeFile(errorPath, record.error, 'utf8').catch(() => {});
     await saveJob(record);
@@ -484,6 +526,7 @@ async function renderJob(record: RenderJobRecord) {
   }
 
   let session: Awaited<ReturnType<typeof launchRenderSession>> | null = null;
+  let ffmpegProc: any = null;
   try {
     const url = `http://localhost:${APP_PORT}/?renderJob=${record.id}&renderTs=${encodeURIComponent(renderIn.toFixed(6))}`;
     session = await launchRenderSession(browserPath, width, height, url);
@@ -491,7 +534,7 @@ async function renderJob(record: RenderJobRecord) {
     console.log(`[Render ${record.id}] Browser launched in ${Date.now() - renderStartedAt}ms`);
     record.status = 'rendering';
     record.progress = 10.00;
-    record.statusText = `프레임 캡처 시작... (0/${frameCount})`;
+    record.statusText = `?袁⑥쟿??筌╈돦荑???뽰삂... (0/${frameCount})`;
     record.updatedAt = nowIso();
     await saveJob(record);
 
@@ -522,7 +565,7 @@ async function renderJob(record: RenderJobRecord) {
     ];
 
     const logStream = fs.createWriteStream(logPath, { flags: 'a' });
-    const ffmpegProc = spawn(bin, ffmpegArgs);
+    ffmpegProc = spawn(bin, ffmpegArgs);
     ffmpegProc.stdout.pipe(logStream);
     ffmpegProc.stderr.pipe(logStream);
 
@@ -540,8 +583,12 @@ async function renderJob(record: RenderJobRecord) {
     });
 
     for (let i = 0; i < frameCount; i++) {
+      if (!renderJobs.has(record.id)) {
+        console.log(`[Render ${record.id}] Job was removed from queue. Aborting...`);
+        throw new Error('cancelled');
+      }
       if (ffmpegCrashed) {
-        throw new Error('인코딩 프로세스(FFmpeg)가 비정상적으로 종료되었습니다.');
+        throw new Error('?紐꾪맜???袁⑥쨮?紐꾨뮞(FFmpeg)揶쎛 ??쑴??怨몄읅??곗쨮 ?ル굝利??뤿???щ빍??');
       }
       const ts = renderIn + i / fps;
       const t1 = Date.now();
@@ -554,7 +601,7 @@ async function renderJob(record: RenderJobRecord) {
       const t3 = Date.now();
       
       if (!ffmpegProc.stdin.writable) {
-         throw new Error('FFmpeg 입력 파이프가 닫혔습니다.');
+         throw new Error('FFmpeg ??낆젾 ???뵠?袁? ???굧??щ빍??');
       }
 
       if (!ffmpegProc.stdin.write(frameBuffer)) {
@@ -571,7 +618,7 @@ async function renderJob(record: RenderJobRecord) {
       const elapsed = ((Date.now() - renderStartedAt) / 1000).toFixed(0);
       record.progress = Number((10 + ((i + 1) / frameCount) * 85).toFixed(2));
       record.currentFrame = i + 1;
-      record.statusText = `프레임 캡처 중 (${i + 1}/${frameCount}) - ${elapsed}초 경과`;
+      record.statusText = `Rendering frames (${i + 1}/${frameCount}) - ${elapsed}s`;
       record.updatedAt = nowIso();
       await saveJob(record);
     }
@@ -583,7 +630,7 @@ async function renderJob(record: RenderJobRecord) {
 
     // --- Final Pass: Audio Mixing & Thumbnail ---
     record.progress = 96.00;
-    record.statusText = '인코딩 완료, 오디오 합성 및 썸네일 삽입 중...';
+    record.statusText = '?紐꾪맜???袁⑥┷, ??삳탵????밴쉐 獄??紐껉퐬????뚯뿯 餓?..';
     record.updatedAt = nowIso();
     await saveJob(record);
 
@@ -711,7 +758,7 @@ async function renderJob(record: RenderJobRecord) {
 
     record.status = 'completed';
     record.progress = 100.00;
-    record.statusText = `완료 (${frameCount}프레임, ${totalElapsed}초, ${outputSizeMB}MB)`;
+    record.statusText = `?袁⑥┷ (${frameCount}?袁⑥쟿?? ${totalElapsed}?? ${outputSizeMB}MB)`;
     record.elapsedSeconds = Number(totalElapsed);
     record.outputSizeMB = Number(outputSizeMB);
     record.downloadUrl = `/api/render-jobs/${record.id}/download`;
@@ -719,9 +766,12 @@ async function renderJob(record: RenderJobRecord) {
     record.updatedAt = nowIso();
     await saveJob(record);
   } catch (err: any) {
+    if (ffmpegProc) {
+      try { ffmpegProc.kill(); } catch {}
+    }
     record.status = 'failed';
     record.progress = -1;
-    record.statusText = '실패';
+    record.statusText = '??쎈솭';
     record.error = String(err?.message || err || 'render failed');
     record.updatedAt = nowIso();
     await fsp.writeFile(errorPath, record.error, 'utf8').catch(() => {});
@@ -871,14 +921,14 @@ app.get('/api/system-status', async (_req, res) => {
 
   // For FFmpeg, we consider it "found" for the setup flow only if it's in the system path or local .runtime folder.
   // If it's only in node_modules (bundled), we want to encourage a proper "install" to .runtime + PATH.
-  const isFound = !!bin && (hasSystemFfmpeg || (bin ? bin.includes('.runtime') : false));
+  const isFound = !!bin && (hasSystemFfmpeg || (bin ? (bin.includes('.runtime') || bin.includes('.hmstudio_runtime')) : false));
 
   res.json({
     ffmpeg: {
       path: bin,
       found: isFound,
       hasSystem: hasSystemFfmpeg,
-      isLocal: bin ? bin.includes('.runtime') : false,
+      isLocal: bin ? (bin.includes('.runtime') || bin.includes('.hmstudio_runtime')) : false,
       isBundled: bin ? bin.includes('node_modules') : false
     },
     gpu: {
@@ -888,8 +938,8 @@ app.get('/api/system-status', async (_req, res) => {
     browser: {
       path: browserPath,
       found: !!browserPath,
-      hasSystem: browserPath ? !browserPath.includes('.runtime') : false,
-      isLocal: browserPath ? browserPath.includes('.runtime') : false
+      hasSystem: browserPath ? !(browserPath.includes('.runtime') || browserPath.includes('.hmstudio_runtime')) : false,
+      isLocal: browserPath ? (browserPath.includes('.runtime') || browserPath.includes('.hmstudio_runtime')) : false
     },
     platform: process.platform,
     arch: process.arch
@@ -899,18 +949,18 @@ app.get('/api/system-status', async (_req, res) => {
 
 app.post('/api/system/install-ffmpeg', async (_req, res) => {
   try {
-    const targetDir = path.join(ROOT, '.runtime', 'ffmpeg');
+    const targetDir = FFMPEG_RUNTIME_DIR;
     if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
     
     console.log('[Setup] Installing local FFmpeg...');
-    const source = ffmpegPath;
-    if (!source) throw new Error('ffmpeg-static path not found');
+    const source = resolveBundledFfmpeg();
+    if (!source) throw new Error('ffmpeg-static executable not found');
     
-    const exe = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
-    const destination = path.join(targetDir, exe);
+    const destination = path.join(targetDir, ffmpegExeName());
     
     fs.copyFileSync(source, destination);
     if (process.platform !== 'win32') fs.chmodSync(destination, 0o755);
+    verifyFfmpegExecutable(destination);
 
     // Set User PATH environment variable on Windows for convenience
     if (process.platform === 'win32') {
@@ -936,7 +986,7 @@ app.post('/api/system/install-ffmpeg', async (_req, res) => {
 app.post('/api/system/install-chrome', async (_req, res) => {
   try {
     console.log('Installing Chrome/Chromium via puppeteer...');
-    const installPath = path.join(ROOT, '.runtime', 'chrome');
+    const installPath = path.join(RUNTIME_BASE, 'chrome');
     fs.mkdirSync(installPath, { recursive: true });
     
     const cmd = `npx @puppeteer/browsers install chrome@stable --path "${installPath}"`;
@@ -951,18 +1001,11 @@ app.post('/api/system/install-chrome', async (_req, res) => {
 });
 
 app.post('/api/system/browse-folder', async (_req, res) => {
-  // PowerShell command to open a folder browser dialog and return the selected path
   const psCommand = `
-    Add-Type -AssemblyName System.Windows.Forms;
-    $f = New-Object System.Windows.Forms.SaveFileDialog;
-    $f.Title = '저장할 폴더로 이동하신 후 ''저장'' 버튼을 클릭하세요.';
-    $f.Filter = '폴더 선택|*';
-    $f.FileName = '여기에 저장';
-    $f.AddExtension = $false;
-    $f.CheckPathExists = $true;
-    $f.OverwritePrompt = $false;
-    if($f.ShowDialog() -eq 'OK') {
-      [System.IO.Path]::GetDirectoryName($f.FileName)
+    $shell = New-Object -ComObject Shell.Application;
+    $folder = $shell.BrowseForFolder(0, '???쐭筌띻낯?????館釉????묊몴??醫뤾문??뤾쉭??', 0x00000010 + 0x00000040, 0);
+    if ($folder) {
+      Write-Output $folder.Self.Path;
     }
   `;
   
@@ -981,7 +1024,7 @@ app.post('/api/system/browse-folder', async (_req, res) => {
     if (result) {
       res.json({ ok: true, path: result });
     } else {
-      res.json({ ok: false, message: '취소됨' });
+      res.json({ ok: false, message: 'Canceled' });
     }
   });
 });
@@ -1040,11 +1083,11 @@ app.post('/api/login', async (req, res) => {
     if (successful) {
       res.json({ success: true });
     } else {
-      res.json({ success: false, message: '사원번호 또는 비밀번호가 올바르지 않습니다.' });
+      res.json({ success: false, message: '???앲린?딆깈 ?癒?뮉 ??쑬?甕곕뜇?뉐첎? ??而?몴?? ??녿뮸??덈뼄.' });
     }
   } catch (err) {
     console.error('Login Proxy Error:', err);
-    res.status(500).json({ success: false, message: '로그인 서버에 접속할 수 없습니다.' });
+    res.status(500).json({ success: false, message: '嚥≪뮄?????뺤쒔???臾믩꺗??????곷뮸??덈뼄.' });
   }
 });
 
@@ -1118,15 +1161,15 @@ app.get('/api/render-jobs/:id/log', (req, res) => {
 });
 
 app.get('*', (_req, res) => {
-  const index = path.join(ROOT, 'dist', 'index.html');
+  const index = path.join(APP_PATH, 'dist', 'index.html');
   if (fs.existsSync(index)) res.sendFile(index);
   else res.status(404).send('Vite dev server or build missing');
 });
 
 app.listen(APP_PORT, async () => {
   ensureDirs();
-  // await ensureSystemBins(); // Commented for testing interactive UI setup
-  console.log(`🚀 Server running on http://localhost:${APP_PORT}`);
-  console.log(`🏠 Network access: http://${getInternalIP()}:${APP_PORT}`);
-  console.log(`📂 AE render root: ${AE_RENDER_ROOT}`);
+  await ensureSystemBins(); // Run installation logic on startup
+  console.log(`?? Server running on http://localhost:${APP_PORT}`);
+  console.log(`?猷?Network access: http://${getInternalIP()}:${APP_PORT}`);
+  console.log(`?諭?AE render root: ${AE_RENDER_ROOT}`);
 });

@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo, memo } from "react";
 import { createPortal } from "react-dom";
 import { WebGLRenderStage } from './rendering/WebGLRenderStage';
+
+const TEMP_DISABLE_LOGIN = false;
 // ── Interpolation ─────────────────────────────────────────────────────────────
 const smoothstep = p => p * p * (3 - 2 * p);
 const lerp = (kfs, time, fallback) => {
@@ -168,11 +170,15 @@ const getLottieTextAnchorPointInComp = (layer, data = null) => {
   const x = hasBox
     ? Number(pos?.[0] || 0) - Number(anc?.[0] || 0) * sx + Number(ps?.[0] || 0) * sx + Number(sz?.[0] || 0) * sx * textAlignToFactor(align)
     : Number(pos?.[0] || 0) - Number(anc?.[0] || 0) * sx;
-  // AE text layers use Position - AnchorPoint for visual placement.
-  // We subtract scaled anchor point from position to get the correct comp Y.
-  // This matches the demo template alignment where the template was previously "a bit higher".
-  const y = Number(pos?.[1] || 0) - Number(anc?.[1] || 0) * sy;
-  return { x, y, align };
+  let y = Number(pos?.[1] || 0) - Number(anc?.[1] || 0) * sy;
+  if (hasBox) {
+    // For Paragraph Text, AE draws text within a bounding box at 'ps'.
+    // The top of the box is y + ps[1]. The first line's baseline is at top + ascent.
+    // We approximate the font ascent as ~80% of the scaled font size.
+    const fontSize = Number(doc.s || 72) * sy;
+    y = y + Number(ps?.[1] || 0) * sy + fontSize * 0.8;
+  }
+  return { x, y, align, hasBox, ps, sz };
 };
 
 const measureTextLineWidth = (text, textDoc, charMap) => {
@@ -764,7 +770,7 @@ const extractMultiPngTitleModel = data => {
       imageZ: Math.max(1, ((data?.layers || []).length - (data?.layers || []).indexOf(nearestImage.imgLayer)) * 10 + 1),
       paddingX,
       baseText: String(doc.t || '').replace(/\r/g, ''),
-      strokeWidth: Number(doc.sw || 0) * txtSx,
+      strokeWidth: (Number(doc.sw || 0) <= 1 ? 0 : Number(doc.sw || 0)) * txtSx,
       color: lottieColorToHex(doc.fc || [1, 1, 1]),
       strokeColor: lottieColorToHex(doc.sc || [0, 0, 0]),
     };
@@ -838,6 +844,51 @@ const computeLottieVisibleBounds = data => {
   const maxY = Math.min(sourceH, Math.max(...boxes.map(box => box.y + box.h)));
   return { x: minX, y: minY, w: Math.max(1, maxX - minX), h: Math.max(1, maxY - minY), sourceW, sourceH };
 };
+const getLottieFillEffectColor = (layer) => {
+  const fillEffect = (layer?.ef || []).find(e => e?.mn === "ADBE Fill");
+  if (!fillEffect) return null;
+  const colorParam = (fillEffect.ef || []).find(p => p?.mn === "ADBE Fill-0002" || p?.nm === "Color");
+  const val = colorParam?.v?.k;
+  if (!val) return null;
+  if (Array.isArray(val)) {
+    if (typeof val[0] === "number") {
+      return val.slice(0, 3);
+    } else if (val[0] && typeof val[0] === "object" && Array.isArray(val[0].s)) {
+      return val[0].s.slice(0, 3);
+    }
+  }
+  return null;
+};
+
+const setLottieFillEffectColor = (layer, colorHex) => {
+  const fillEffect = (layer?.ef || []).find(e => e?.mn === "ADBE Fill");
+  if (!fillEffect) return;
+  const colorParam = (fillEffect.ef || []).find(p => p?.mn === "ADBE Fill-0002" || p?.nm === "Color");
+  if (!colorParam?.v) return;
+  const rgb = hexToLottieColor(colorHex);
+  const val = colorParam.v.k;
+  if (Array.isArray(val)) {
+    if (typeof val[0] === "number") {
+      const alpha = val[3] !== undefined ? val[3] : 1;
+      colorParam.v.k = [rgb[0], rgb[1], rgb[2], alpha];
+    } else {
+      colorParam.v.k = val.map(kf => {
+        if (kf && typeof kf === "object") {
+          if (Array.isArray(kf.s)) {
+            const alpha = kf.s[3] !== undefined ? kf.s[3] : 1;
+            kf.s = [rgb[0], rgb[1], rgb[2], alpha];
+          }
+          if (Array.isArray(kf.e)) {
+            const alpha = kf.e[3] !== undefined ? kf.e[3] : 1;
+            kf.e = [rgb[0], rgb[1], rgb[2], alpha];
+          }
+        }
+        return kf;
+      });
+    }
+  }
+};
+
 const extractLottieTextFields = (data, metaFields = null) => {
   const detected = [];
   const sourceW = Math.max(1, Number(data?.w || 1));
@@ -851,9 +902,12 @@ const extractLottieTextFields = (data, metaFields = null) => {
       if (layer?.ty !== 5 || !layer?.t?.d?.k) return;
       const layerName = layer.nm || `Text ${detected.length + 1}`;
       const doc = getLottieTextDoc(layer) || {};
+      const fillEffColor = getLottieFillEffectColor(layer);
       const box = estimateTextLayerBounds(layer, data, charMap);
       const fontMeta = fontMap.get(doc.f || "") || {};
         const layoutScl = getLayerScalePairForLayout(layer, data);
+        const sx = Number(layoutScl?.[0] || 100) / 100;
+        const sy = Number(layoutScl?.[1] || 100) / 100;
         detected.push({
           id: uid(),
           label: layerName,
@@ -864,15 +918,15 @@ const extractLottieTextFields = (data, metaFields = null) => {
           fontMode: "internal",
           fontKey: doc.f || "",
           fontFamily: fontMeta.fFamily ? `'${fontMeta.fFamily}', 'Noto Sans KR', sans-serif` : "Pretendard, 'Noto Sans KR', sans-serif",
-          sourceScaleX: 1,
-          sourceScaleY: 1,
-          fontSize: Number(doc.s || 72),
-          color: lottieColorToHex(doc.fc || [1, 1, 1]),
+          sourceScaleX: sx,
+          sourceScaleY: sy,
+          fontSize: Math.round(Number(doc.s || 72) * sx),
+          color: lottieColorToHex(fillEffColor || doc.fc || [1, 1, 1]),
           strokeColor: lottieColorToHex(doc.sc || [0, 0, 0]),
-          strokeWidth: Number(doc.sw || 0),
+          strokeWidth: Number(doc.sw || 0) <= 1 ? 0 : Number(doc.sw || 0),
           textAlign: lottieJustifyToAlign(doc.j),
           strokeMode: doc.of ? "center" : "outside",
-          lineHeight: Number(doc.lh || doc.s || 72),
+          lineHeight: Math.round(Number(doc.lh || doc.s || 72) * sy),
           animOpacity: getLayerOpacityKeyframesSec(layer, data),
           x: (Number(readTransformValueForLayout(layer?.ks?.p, [0, 0, 0], data)?.[0] || 0) / sourceW) * 100,
           // Y uses raw position percentage - the overlay places text at this % with dominantBaseline="middle"
@@ -952,7 +1006,10 @@ const applyLottieTextFields = (sourceData, fields = []) => {
             kf.s.t = field.value ?? "";
             if (field.fontKey) kf.s.f = field.fontKey;
             if (field.fontSize) kf.s.s = Number(field.fontSize) / Math.max(0.0001, Number(field.sourceScaleX || 1));
-            if (field.color) kf.s.fc = hexToLottieColor(field.color);
+            if (field.color) {
+              kf.s.fc = hexToLottieColor(field.color);
+              setLottieFillEffectColor(layer, field.color);
+            }
             if (field.strokeColor) kf.s.sc = hexToLottieColor(field.strokeColor);
             if (typeof field.strokeWidth !== "undefined") kf.s.sw = Number(field.strokeWidth || 0) / Math.max(0.0001, Number(field.sourceScaleX || 1));
             if (field.textAlign) kf.s.j = alignToLottieJustify(field.textAlign);
@@ -985,6 +1042,41 @@ const applyLottieTextFields = (sourceData, fields = []) => {
   if (customHide?.imageLayerIndices?.length) customHide.imageLayerIndices.forEach(hideNativeLayer);
   if (customHide?.textLayerIndices?.length) customHide.textLayerIndices.forEach(hideNativeLayer);
   autoFitLottieBackground(cloned, sourceData, fields);
+
+  // After applying text, check if any text layer contains characters not in chars.
+  // If so, delete chars entirely so lottie-web uses consistent browser font rendering
+  // instead of mixed glyph+fallback rendering which causes baseline misalignment.
+  if (cloned.chars && cloned.chars.length > 0) {
+    const charSet = new Set(cloned.chars.map(c => c.ch).filter(Boolean));
+    let needsCharsDeletion = false;
+    const checkLayers = (layers) => {
+      if (!Array.isArray(layers) || needsCharsDeletion) return;
+      layers.forEach(layer => {
+        if (needsCharsDeletion) return;
+        if (layer?.ty === 5 && Array.isArray(layer?.t?.d?.k)) {
+          layer.t.d.k.forEach(kf => {
+            if (needsCharsDeletion) return;
+            const text = kf?.s?.t || "";
+            for (const ch of text) {
+              if (ch === "\n" || ch === "\r" || ch === " ") continue;
+              if (!charSet.has(ch)) {
+                needsCharsDeletion = true;
+                return;
+              }
+            }
+          });
+        }
+      });
+    };
+    checkLayers(cloned.layers);
+    if (!needsCharsDeletion) {
+      (cloned.assets || []).forEach(asset => checkLayers(asset?.layers));
+    }
+    if (needsCharsDeletion) {
+      delete cloned.chars;
+    }
+  }
+
   return cloned;
 };
 
@@ -1016,6 +1108,22 @@ function AETemplateSVG({ compName, fields = [], fontFamily = "sans-serif", webDe
   );
 }
 
+const renderHighlightedText = (text, highlightText, highlightColor) => {
+  if (!text) return ' ';
+  if (!highlightText || !text.includes(highlightText)) return text;
+  const parts = text.split(highlightText);
+  return (
+    <>
+      {parts.map((part, i) => (
+        <React.Fragment key={i}>
+          {i > 0 && <tspan fill={highlightColor}>{highlightText}</tspan>}
+          {part && <tspan>{part}</tspan>}
+        </React.Fragment>
+      ))}
+    </>
+  );
+};
+
 function VectorSubtitleTemplate({ model, fields = [], time = 999, selected = false }) {
   const field = fields?.[0] || {};
   const { text, fontFamily, fontSize, barWidth, barHeight, paddingX } = computeVectorSubtitleMetrics(model, field);
@@ -1025,7 +1133,9 @@ function VectorSubtitleTemplate({ model, fields = [], time = 999, selected = fal
   const reveal = model?.barAnimEnd > model?.barAnimStart ? clamp((time - model.barAnimStart) / Math.max(0.001, model.barAnimEnd - model.barAnimStart), 0, 1) : 1;
   const textOpacity = model?.textAnimEnd > model?.textAnimStart ? clamp((time - model.textAnimStart) / Math.max(0.001, model.textAnimEnd - model.textAnimStart), 0, 1) : 1;
   const textX = textAlign === 'left' ? paddingX : textAlign === 'right' ? barWidth - paddingX : barWidth / 2;
-  const textY = Number(model?.textY || (barHeight / 2));
+  const hasAeCoords = model?.textY !== undefined;
+  const textY = hasAeCoords ? Number(model.textY) : barHeight / 2;
+  const dominantBaseline = hasAeCoords ? 'alphabetic' : 'middle';
 
   const [imgMeta, setImgMeta] = useState(null);
   useEffect(() => {
@@ -1065,12 +1175,14 @@ function VectorSubtitleTemplate({ model, fields = [], time = 999, selected = fal
   return (
     <svg viewBox={`0 0 ${barWidth} ${barHeight}`} style={{ width: '100%', height: '100%', overflow: 'visible' }} preserveAspectRatio="none">
       {bgEls}
-      <text x={textX} y={textY} textAnchor={textAnchor} dominantBaseline="middle" fill={field?.color || '#ffffff'} stroke={field?.strokeColor || '#0a4a4d'} strokeWidth={strokeWidth} paintOrder="stroke fill" fontSize={fontSize} fontWeight={field?.fontWeight || '700'} fontFamily={fontFamily} opacity={textOpacity}>{text || ' '}</text>
+      <text x={textX} y={textY} textAnchor={textAnchor} dominantBaseline={dominantBaseline} fill={field?.color || '#ffffff'} stroke={field?.strokeColor || '#0a4a4d'} strokeWidth={strokeWidth} paintOrder="stroke fill" fontSize={fontSize} fontWeight={field?.fontWeight || '700'} fontFamily={fontFamily} opacity={textOpacity}>
+        {renderHighlightedText(text, field?.highlightText, field?.highlightColor || '#ffea00')}
+      </text>
     </svg>
   );
 }
 
-function MultiPngTitlePair({ pair, field, model, time = 0 }) {
+function MultiPngTitlePair({ pair, field, model, time = 0, drawBackground = true }) {
   const fontFamily = field?.fontFamily || pair.fontFamily || "Pretendard, 'Noto Sans KR', sans-serif";
   const fontSize = Number(field?.fontSize || pair.fontSize || 48);
   const text = String(field?.value ?? pair.baseText ?? '');
@@ -1082,7 +1194,9 @@ function MultiPngTitlePair({ pair, field, model, time = 0 }) {
   const baseLeft = Number(pair.left ?? (Number(pair.centerX || model.w / 2) - baseWidth / 2));
   const baseTop = Number(pair.top ?? (Number(pair.centerY || model.h / 2) - barHeight / 2));
   const baseTextX = Number(pair.textXInBar ?? baseWidth / 2);
-  const textY = barHeight / 2;
+  const hasAeCoords = pair.textYInBar !== undefined;
+  const textY = hasAeCoords ? Number(pair.textYInBar) : barHeight / 2;
+  const dominantBaseline = hasAeCoords ? 'alphabetic' : 'middle';
   const paddingX = Math.max(1, Number(field?.paddingX ?? pair.paddingX ?? 32));
   const textLeft = textAlign === 'right' ? baseTextX - textWidth : textAlign === 'center' ? baseTextX - textWidth / 2 : baseTextX;
   const textRight = textAlign === 'right' ? baseTextX : textAlign === 'center' ? baseTextX + textWidth / 2 : baseTextX + textWidth;
@@ -1155,15 +1269,17 @@ function MultiPngTitlePair({ pair, field, model, time = 0 }) {
   return (
     <div style={{ position: 'absolute', left: `${left}%`, top: `${top}%`, width: `${widthPct}%`, height: `${heightPct}%`, overflow: 'visible', pointerEvents: 'none', zIndex: Number(pair.textZ || pair.imageZ || 1) }}>
       <svg viewBox={`0 0 ${barWidth} ${barHeight}`} style={{ position: 'absolute', inset: 0, overflow: 'visible' }} preserveAspectRatio='none'>
-        {imageTintMatrix && (
+        {drawBackground && imageTintMatrix && (
           <defs>
             <filter id={tintFilterId} colorInterpolationFilters='sRGB'>
               <feColorMatrix type='matrix' values={imageTintMatrix} />
             </filter>
           </defs>
         )}
-        {bgEls}
-        <text x={textX} y={textY} textAnchor={textAnchor} dominantBaseline='middle' fill={textFill} stroke={textStroke} strokeWidth={Math.max(0, Number(field?.strokeWidth ?? pair.strokeWidth ?? 0))} paintOrder='stroke fill' fontSize={fontSize} fontWeight={field?.fontWeight || '700'} fontFamily={fontFamily} opacity={textOpacity}>{text || ' '}</text>
+        {drawBackground && bgEls}
+        <text x={textX} y={textY} textAnchor={textAnchor} dominantBaseline={dominantBaseline} fill={textFill} stroke={textStroke} strokeWidth={Math.max(0, Number(field?.strokeWidth ?? pair.strokeWidth ?? 0))} paintOrder='stroke fill' fontSize={fontSize} fontWeight={field?.fontWeight || '700'} fontFamily={fontFamily} opacity={textOpacity}>
+          {renderHighlightedText(text, field?.highlightText || pair.highlightText, applyTintToHex(field?.highlightColor || pair.highlightColor || '#ffea00', pair.textTint, time))}
+        </text>
       </svg>
     </div>
   );
@@ -1171,9 +1287,14 @@ function MultiPngTitlePair({ pair, field, model, time = 0 }) {
 
 function MultiPngTitleTemplate({ model, fields = [], time = 0 }) {
   const fieldMap = new Map((fields || []).map(f => [f.bindingKey, f]));
+  const seenImages = new Set();
   return (
     <div style={{ position: 'absolute', inset: 0, overflow: 'visible', pointerEvents: 'none' }}>
-      {(model?.pairs || []).map(pair => <MultiPngTitlePair key={pair.bindingKey} pair={pair} field={fieldMap.get(pair.bindingKey)} model={model} time={time} />)}
+      {(model?.pairs || []).map(pair => {
+        const drawBackground = !seenImages.has(pair.imageLayerIndex);
+        seenImages.add(pair.imageLayerIndex);
+        return <MultiPngTitlePair key={pair.bindingKey} pair={pair} field={fieldMap.get(pair.bindingKey)} model={model} time={time} drawBackground={drawBackground} />;
+      })}
     </div>
   );
 }
@@ -1190,12 +1311,15 @@ function LottieTemplatePlayer({ animationData, progress = 0, mode = "scrub" }) {
       const mod = await import("lottie-web");
       const lottie = mod.default || mod;
       if (disposed || !hostRef.current) return;
+
+      const clonedData = JSON.parse(JSON.stringify(animationData));
+
       localAnim = lottie.loadAnimation({
         container: hostRef.current,
         renderer: "svg",
         loop: mode === "loop",
         autoplay: mode === "loop",
-        animationData,
+        animationData: clonedData,
         rendererSettings: {
           preserveAspectRatio: "xMidYMid meet",
           progressiveLoad: true,
@@ -1227,7 +1351,7 @@ function LottieTemplatePlayer({ animationData, progress = 0, mode = "scrub" }) {
     const frame = clamp(progress, 0, 1) * Math.max(0, totalFrames - 0.001);
     try { anim.goToAndStop(frame, true); } catch {}
   }, [progress, mode]);
-  return <div ref={hostRef} style={{ width: "100%", height: "100%", overflow: "hidden" }} />;
+  return <div ref={hostRef} style={{ width: "100%", height: "100%", overflow: "visible" }} />;
 }
 function TemplateTextOverlayField({ field, time = 999 }) {
   const clipId = useMemo(() => `txt-clip-${field.id}`, [field.id]);
@@ -1271,7 +1395,9 @@ function TemplateTextOverlayField({ field, time = 999 }) {
       {...extraProps}
     >
       {lines.map((line, idx) => (
-        <tspan key={idx} x={`${anchorX}%`} dy={idx === 0 ? 0 : fontSize * lineHeight}>{line || " "}</tspan>
+        <tspan key={idx} x={`${anchorX}%`} dy={idx === 0 ? 0 : fontSize * lineHeight}>
+          {renderHighlightedText(line, field?.highlightText, field?.highlightColor || '#ffea00')}
+        </tspan>
       ))}
     </text>
   );
@@ -1324,7 +1450,7 @@ function CroppedTemplateStage({ sourceW, sourceH, cropBounds, children }) {
   const leftPct = -(crop.x / crop.w) * 100;
   const topPct = -(crop.y / crop.h) * 100;
   return (
-    <div style={{ position: "relative", width: "100%", height: "100%", overflow: "hidden" }}>
+    <div style={{ position: "relative", width: "100%", height: "100%", overflow: "visible" }}>
       <div style={{ position: "absolute", left: `${leftPct}%`, top: `${topPct}%`, width: `${widthPct}%`, height: `${heightPct}%` }}>
         {children}
       </div>
@@ -1437,7 +1563,7 @@ function TemplateThumbnail({ template, fields = null, fontFamily = "Pretendard, 
 function GraphicEl({ g, time, renderZ = 1, selected, editing, onEdit, onEndEdit, onChange }) {
   const visible = time >= g.ts && time < g.ts + g.dur;
   if (!visible) return null;
-  const ct = time - g.ts;
+  const ct = time - g.ts + (g.startT || 0);
   const x = lerp(g.kf?.x, ct, g.x);
   const y = lerp(g.kf?.y, ct, g.y);
   const sc = lerp(g.kf?.scale, ct, g.scale);
@@ -1459,10 +1585,10 @@ function GraphicEl({ g, time, renderZ = 1, selected, editing, onEdit, onEndEdit,
   if (g.type === "ae_template") {
     const templateDur = Math.max(0.1, Number(g.templateDuration || g.dur || 5));
     const progress = clamp(ct / templateDur, 0, 1);
-    const normalizedFields = (g.fields || []).map(field => ({
+    const normalizedFields = useMemo(() => (g.fields || []).map(field => ({
       ...field,
       useOverlay: shouldUseOverlayForField(field, g.glyphChars || []),
-    }));
+    })), [g.fields, g.glyphChars]);
     const resolvedLottieData = useMemo(() => applyLottieTextFields(g.lottieData, normalizedFields), [g.lottieData, normalizedFields]);
     const overlayFields = normalizedFields.filter(field => field.useOverlay);
     return (
@@ -1521,7 +1647,7 @@ function GraphicEl({ g, time, renderZ = 1, selected, editing, onEdit, onEndEdit,
 // ── Transform Handles ─────────────────────────────────────────────────────────
 function TransformHandles({ g, time, stageRef, onBeginInteract }) {
   if (!g) return null;
-  const ct = time - g.ts;
+  const ct = time - g.ts + (g.startT || 0);
   const x = lerp(g.kf?.x, ct, g.x);
   const y = lerp(g.kf?.y, ct, g.y);
   const sc = lerp(g.kf?.scale, ct, g.scale);
@@ -1849,9 +1975,9 @@ function AnimPropRow({ label, value, min, max, step, unit = "", onChange, onComm
                 transition: "all 0.1s" 
               }}>
               {keyframed ? (
-                <><span>◆</span><span>키프레임</span></>
+                <><span>◆</span><span>애니메이션 키</span></>
               ) : (
-                <><span>◇</span><span>키프레임</span></>
+                <><span>◇</span><span>애니메이션 키</span></>
               )}
             </button>
             {onNextKeyframe && (
@@ -1993,6 +2119,11 @@ export default function HMStudio() {
   const [playing, setPlaying] = useState(false);
   const [selClipId, setSelClipId] = useState(null);
   const [selGfxId, setSelGfxId] = useState(null);
+  const [selectedTimelineItems, setSelectedTimelineItems] = useState<Set<string>>(new Set());
+  const [selectedKeyframes, setSelectedKeyframes] = useState<Set<string>>(new Set());
+  const [keyframeSelectBox, setKeyframeSelectBox] = useState<any>(null);
+  const suppressTimelineClickRef = useRef(false);
+  const [copiedItem, setCopiedItem] = useState<{ kind: 'clip' | 'graphic', data: any } | null>(null);
   const [editingGfxId, setEditingGfxId] = useState(null);
   const [tool, setTool] = useState("select"); // select | razor | text | rect | circle | ae
   const [zoom, setZoom] = useState(1);
@@ -2045,7 +2176,9 @@ export default function HMStudio() {
         const assetAlphaBounds = await computeLottieAssetAlphaBounds(lottieData);
         lottieData.__assetAlphaBounds = assetAlphaBounds;
         const vectorModel = extractVectorSubtitleModel(lottieData);
-        const multiTitleModel = !vectorModel ? extractMultiPngTitleModel(lottieData) : null;
+        const nameStr = (tmpl.name || "").toLowerCase();
+        const isLottieOverride = nameStr.includes("상단_04") || nameStr.includes("상단 04") || nameStr.includes("하단_04") || nameStr.includes("하단 04") || nameStr.includes("추가예정");
+        const multiTitleModel = (!vectorModel && !isLottieOverride) ? extractMultiPngTitleModel(lottieData) : null;
         if (multiTitleModel?.pairs?.length) lottieData.__customHide = {
           imageLayerIndices: [...new Set(multiTitleModel.pairs.flatMap(p => p.relatedImageLayerIndices?.length ? p.relatedImageLayerIndices : [p.imageLayerIndex]).filter(idx => Number.isFinite(idx)))],
           textLayerIndices: [...new Set(multiTitleModel.pairs.map(p => p.textLayerIndex).filter(idx => Number.isFinite(idx)))],
@@ -2104,11 +2237,52 @@ export default function HMStudio() {
   const [interact, setInteract] = useState(null);
   const [timelineDrag, setTimelineDrag] = useState(null);
   const [timelineResize, setTimelineResize] = useState(null);
+  const [markerDrag, setMarkerDrag] = useState(null); // 'in' | 'out' | null
+  const [playheadDrag, setPlayheadDrag] = useState(false);
+  const [timelineDragOffset, setTimelineDragOffset] = useState(0);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0, ts: 0, dur: 0, rowIndex: 0, kind: null });
   const [renderStatus, setRenderStatus] = useState("idle"); // idle | queued | rendering | done
   const [renderQueue, setRenderQueue] = useState([]);
   const savedJobsRef = useRef(new Set());
   const [isExportView, setIsExportView] = useState(false);
+  const exportStageRef = useRef(null);
+  const [exportStageWidth, setExportStageWidth] = useState(comp.w);
+
+  useEffect(() => {
+    if (!exportStageRef.current) return;
+    const observer = new ResizeObserver(entries => {
+      for (let entry of entries) {
+        setExportStageWidth(entry.contentRect.width);
+      }
+    });
+    observer.observe(exportStageRef.current);
+    return () => observer.disconnect();
+  }, [isExportView, comp.w]);
+
+  const [exportStageParentDim, setExportStageParentDim] = useState({ w: 800, h: 600 });
+  const exportStageContainerRefVal = useRef(null);
+
+  const exportStageContainerRef = useCallback((node: any) => {
+    if (exportStageContainerRefVal.current) {
+      if ((exportStageContainerRefVal.current as any).__observer) {
+        (exportStageContainerRefVal.current as any).__observer.disconnect();
+      }
+    }
+    exportStageContainerRefVal.current = node;
+    if (node) {
+      const observer = new ResizeObserver(entries => {
+        for (let entry of entries) {
+          setExportStageParentDim({
+            w: entry.contentRect.width,
+            h: entry.contentRect.height
+          });
+        }
+      });
+      observer.observe(node);
+      (node as any).__observer = observer;
+    }
+  }, []);
+
   const [exportSettings, setExportSettings] = useState({
     filename: "Untitled_Project",
     path: "C:\\Users\\user\\Desktop\\HMStudio_AE_Render_Server\\renders",
@@ -2132,7 +2306,7 @@ export default function HMStudio() {
     { id: "HD", type: "default", label: "1280×720 (HD)", w: 1280, h: 720, icon: "📄" },
     { id: "CUSTOM1", type: "custom", baseName: "사용자 설정 1", label: "3840×1080(사용자 설정 1)", w: 3840, h: 1080, icon: "⚙️" },
   ]);
-  const saveProject = () => {
+  const saveProject = async () => {
     const projectData = {
       version: "1.0",
       composition: comp,
@@ -2140,6 +2314,30 @@ export default function HMStudio() {
       graphics: graphics,
       exportSettings: exportSettings
     };
+
+    if ('showSaveFilePicker' in window) {
+      try {
+        const options = {
+          suggestedName: `${exportSettings.filename || "project"}.json`,
+          types: [{
+            description: 'HMStudio Project JSON file',
+            accept: {
+              'application/json': ['.json'],
+            },
+          }],
+        };
+        const handle = await (window as any).showSaveFilePicker(options);
+        const writable = await handle.createWritable();
+        await writable.write(JSON.stringify(projectData, null, 2));
+        await writable.close();
+        return;
+      } catch (err) {
+        if ((err as Error).name === 'AbortError') {
+          return;
+        }
+      }
+    }
+
     const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -2253,6 +2451,7 @@ export default function HMStudio() {
   }, []);
   const [previewPopout, setPreviewPopout] = useState(false);
   const [previewZoom, setPreviewZoom] = useState(1);
+  const [previewPan, setPreviewPan] = useState({ x: 0, y: 0 });
   const previewScrollNodeRef = useRef<HTMLDivElement | null>(null);
   const previewScrollRef = useCallback((node: HTMLDivElement | null) => {
     if (previewScrollNodeRef.current) {
@@ -2260,6 +2459,10 @@ export default function HMStudio() {
       if ((prevNode as any).__wheelHandler) {
         prevNode.removeEventListener('wheel', (prevNode as any).__wheelHandler);
         delete (prevNode as any).__wheelHandler;
+      }
+      if ((prevNode as any).__mouseDownHandler) {
+        prevNode.removeEventListener('mousedown', (prevNode as any).__mouseDownHandler);
+        delete (prevNode as any).__mouseDownHandler;
       }
     }
     previewScrollNodeRef.current = node;
@@ -2271,8 +2474,42 @@ export default function HMStudio() {
           return Math.max(0.1, Math.min(5, nextZoom));
         });
       };
+
+      const handleMouseDown = (e: MouseEvent) => {
+        if (e.button === 1) { // Middle click / wheel click
+          e.preventDefault(); // Stop default browser auto-scrolling
+          
+          let lastX = e.clientX;
+          let lastY = e.clientY;
+
+          const handleMouseMove = (mv: MouseEvent) => {
+            mv.preventDefault();
+            const dx = mv.clientX - lastX;
+            const dy = mv.clientY - lastY;
+            lastX = mv.clientX;
+            lastY = mv.clientY;
+            
+            setPreviewPan(p => ({ x: p.x + dx, y: p.y + dy }));
+          };
+
+          const targetWindow = node.ownerDocument.defaultView || window;
+          const handleMouseUp = (mu: MouseEvent) => {
+            if (mu.button === 1) {
+              targetWindow.removeEventListener('mousemove', handleMouseMove);
+              targetWindow.removeEventListener('mouseup', handleMouseUp);
+            }
+          };
+
+          targetWindow.addEventListener('mousemove', handleMouseMove);
+          targetWindow.addEventListener('mouseup', handleMouseUp);
+        }
+      };
+
       node.addEventListener('wheel', handleWheel, { passive: false });
       (node as any).__wheelHandler = handleWheel;
+
+      node.addEventListener('mousedown', handleMouseDown);
+      (node as any).__mouseDownHandler = handleMouseDown;
     }
   }, []);
   const fileRef = useRef(null);
@@ -2327,7 +2564,8 @@ export default function HMStudio() {
         document.body.style.margin = '0';
         document.body.style.background = '#000';
         setRenderJobLoaded(true);
-        document.documentElement.setAttribute('data-render-ready', '1');
+        // 렌더 준비 신호는 WebGLRenderStage가 실제 첫 프레임을 그린 뒤 onReady에서 보낸다.
+        // 여기서 먼저 ready=1을 보내면 서버가 검은 빈 화면을 캡처할 수 있다.
       } catch (err) {
         console.error(err);
         setRenderJobLoaded(true);
@@ -2337,7 +2575,84 @@ export default function HMStudio() {
     return () => { cancelled = true; };
   }, [isRenderMode, renderJobId, renderTsParam]);
 
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isElectronRendering, setIsElectronRendering] = useState(false);
+
+  // Electron High-Speed Raw Pixel Capture Render Loop
+  useEffect(() => {
+    if (!(window as any).electron) return;
+
+    const unlisten = (window as any).electron.ipcRenderer.on('start-client-render', async (event: any, payload: any) => {
+      const { jobId, fps, totalFrames } = payload;
+      console.log(`[ClientRender] Received start render for job ${jobId}`, payload);
+
+      // Transition the editor into bare full-resolution canvas mode
+      setIsElectronRendering(true);
+      setRenderJobLoaded(true);
+
+      let frame = 0;
+      const originalTime = time;
+
+      const onFrameReady = async (canvas: HTMLCanvasElement) => {
+        if (frame >= totalFrames) return;
+
+        try {
+          const width = canvas.width;
+          const height = canvas.height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) throw new Error("Could not get 2D context from canvas");
+
+          const imgData = ctx.getImageData(0, 0, width, height);
+          
+          // Send raw Uint8ClampedArray pixel buffer directly to Electron Main
+          (window as any).electron.ipcRenderer.send('render-frame-chunk', {
+            jobId,
+            frame,
+            width,
+            height,
+            buffer: imgData.data.buffer
+          });
+
+          // Report progress back to Main IPC API responder
+          const progress = Math.min(100, Math.floor((frame / totalFrames) * 100));
+          await fetch(`/api/render-jobs/${jobId}/progress`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ progress, currentFrame: frame, totalFrames })
+          });
+
+          frame++;
+          if (frame < totalFrames) {
+            // Seek to the next frame time
+            setTime(frame / fps);
+          } else {
+            // Completed! Notify Electron Main to finalize video encoding
+            (window as any).electron.ipcRenderer.send('render-frame-complete', { jobId });
+            setIsElectronRendering(false);
+            setRenderJobLoaded(false);
+            setTime(originalTime);
+          }
+        } catch (err: any) {
+          console.error("[ClientRender] Capture error:", err);
+          (window as any).electron.ipcRenderer.send('render-frame-error', { jobId, error: err.message });
+          setIsElectronRendering(false);
+          setRenderJobLoaded(false);
+          setTime(originalTime);
+        }
+      };
+
+      // Set the global hook for WebGLRenderStage onReady
+      (window as any).__onElectronFrameReady = onFrameReady;
+
+      // Start the frame loop from frame 0
+      setTime(0);
+    });
+
+    return () => {
+      unlisten();
+    };
+  }, [time, setTime]);
+
+  const [isLoggedIn, setIsLoggedIn] = useState(TEMP_DISABLE_LOGIN);
   const [isEditingTime, setIsEditingTime] = useState(false);
   const [timeInput, setTimeInput] = useState("");
 
@@ -2360,9 +2675,11 @@ export default function HMStudio() {
 
 
   useEffect(() => {
+    fetchSystemStatus();
+  }, [fetchSystemStatus]);
+
+  useEffect(() => {
     if (isLoggedIn) {
-      fetchSystemStatus();
-      
       // Also fetch server root folder to set default export path
       fetch('/api/render-server/status')
         .then(r => r.json())
@@ -2444,6 +2761,9 @@ export default function HMStudio() {
         const expiry = Date.now() + (24 * 60 * 60 * 1000);
         localStorage.setItem('hmstudio_auth', JSON.stringify({ userId: loginId, expiry }));
         setIsLoggedIn(true);
+        if ((window as any).electron) {
+          (window as any).electron.ipcRenderer.send('login-success');
+        }
         // Open the persistent preview window immediately on login gesture
         openPreviewPopout({ hasUserGesture: true });
       } else {
@@ -2606,7 +2926,7 @@ export default function HMStudio() {
 
       console.log(`[Preview] Final: left=${targetLeft} top=${targetTop} ${targetWidth}x${targetHeight}`);
 
-      const features = `popup=yes,width=${targetWidth},height=${targetHeight},left=${targetLeft},top=${targetTop},screenX=${targetLeft},screenY=${targetTop}`;
+      const features = `popup=yes,fullscreen=yes,width=${targetWidth},height=${targetHeight},left=${targetLeft},top=${targetTop},screenX=${targetLeft},screenY=${targetTop}`;
       win = window.open('about:blank', 'hmstudio-preview-monitor', features);
       if (!win) {
         alert("팝업이 차단되었습니다. 주소창 오른쪽의 '팝업 차단됨' 아이콘을 클릭하여 '항상 허용'으로 설정해주세요.");
@@ -2681,8 +3001,16 @@ export default function HMStudio() {
             goFS();
           }
         });
+        window.addEventListener('click', goFS);
+        window.addEventListener('focus', goFS);
+        setTimeout(goFS, 50);
+        setTimeout(goFS, 300);
       `;
       win.document.head.appendChild(script);
+      try {
+        const req = win.document.documentElement.requestFullscreen || (win.document.documentElement as any).webkitRequestFullscreen || (win.document.documentElement as any).mozRequestFullScreen || (win.document.documentElement as any).msRequestFullscreen;
+        req?.call(win.document.documentElement)?.catch?.(() => {});
+      } catch (_) {}
 
       previewWinRef.current = win;
       previewHostRef.current = host;
@@ -2695,29 +3023,52 @@ export default function HMStudio() {
     }
     return win;
   }, []);
+  const requestPreviewFullscreenNow = useCallback(() => {
+    try {
+      const win = previewWinRef.current;
+      if (!win || win.closed) return;
+      win.focus();
+      const el = win.document.documentElement;
+      const req = el.requestFullscreen || (el as any).webkitRequestFullscreen || (el as any).mozRequestFullScreen || (el as any).msRequestFullscreen;
+      req?.call(el)?.catch?.(() => {});
+    } catch (_) {}
+  }, []);
   // ── Media Sync (Video & Audio) ─────────────────────────────────────────
   useEffect(() => {
     const visibleClips = clips.filter(c => time >= c.ts && time < c.ts + c.dur);
-    Object.entries(videoRefs.current || {}).forEach(([id, el]) => {
+    Object.entries(videoRefs.current || {}).forEach(([refId, el]) => {
       if (!el) return;
-      const clip = visibleClips.find(c => c.id === id);
+      const isExportRef = refId.startsWith("export-");
+      const clipId = isExportRef ? refId.slice(7) : refId;
+      
+      const clip = visibleClips.find(c => c.id === clipId);
       if (!clip) {
         try { el.pause(); } catch {}
         return;
       }
       const ct = Math.max(0, time - clip.ts + clip.startT);
       
-      // Only mute if we are in render mode (headless capture)
-      el.muted = isRenderMode; 
+      if (isExportRef) {
+        el.muted = isRenderMode;
+      } else {
+        el.muted = isRenderMode || isExportView;
+      }
       el.playsInline = true;
       
-      if (el.getAttribute("data-cid") !== clip.id) {
-        el.src = clip.url;
-        el.setAttribute("data-cid", clip.id);
+      const targetSrc = clip.serverUrl || clip.url;
+      if (el.getAttribute("data-cid") !== refId) {
+        el.src = targetSrc;
+        el.setAttribute("data-cid", refId);
         el.load();
         const applyTime = () => {
           try { el.currentTime = ct; } catch {}
-          if (playing) el.play().catch(() => {});
+          if (playing) {
+            if (isExportRef) {
+              el.play().catch(() => {});
+            } else if (!isExportView) {
+              el.play().catch(() => {});
+            }
+          }
         };
         if (el.readyState >= 1) applyTime();
         else (el as any).onloadedmetadata = applyTime;
@@ -2733,10 +3084,21 @@ export default function HMStudio() {
         }
       }
       
-      if (playing && el.paused) el.play().catch(() => {});
-      else if (!playing && !el.paused) el.pause();
+      if (playing) {
+        if (isExportRef) {
+          if (el.paused) el.play().catch(() => {});
+        } else {
+          if (isExportView) {
+            if (!el.paused) el.pause();
+          } else {
+            if (el.paused) el.play().catch(() => {});
+          }
+        }
+      } else {
+        if (!el.paused) el.pause();
+      }
     });
-  }, [time, clips, playing, isRenderMode]);
+  }, [time, clips, playing, isRenderMode, isExportView]);
   // ── Playback RAF ────────────────────────────────────────────────────────
   useEffect(() => {
     if (!playing) { cancelAnimationFrame(rafRef.current); return; }
@@ -2757,15 +3119,62 @@ export default function HMStudio() {
       const tag = (e.target && e.target.tagName) ? String(e.target.tagName).toUpperCase() : "";
       if (["INPUT", "TEXTAREA", "SELECT", "OPTION"].includes(tag) || e.target?.isContentEditable) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); e.shiftKey ? redoFn() : undoFn(); return; }
-      if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); deleteSelected(); return; }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c") {
+        e.preventDefault();
+        if (selClipId) {
+          const clip = clips.find(c => c.id === selClipId);
+          if (clip) setCopiedItem({ kind: 'clip', data: { ...clip } });
+        } else if (selGfxId) {
+          const gfx = graphics.find(g => g.id === selGfxId);
+          if (gfx) {
+            setCopiedItem({
+              kind: 'graphic',
+              data: {
+                ...gfx,
+                fields: gfx.fields ? gfx.fields.map(f => ({ ...f })) : undefined,
+                kf: gfx.kf ? JSON.parse(JSON.stringify(gfx.kf)) : undefined
+              }
+            });
+          }
+        }
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v") {
+        e.preventDefault();
+        if (!copiedItem) return;
+        snap();
+        const nid = uid();
+        if (copiedItem.kind === 'clip') {
+          const c = { ...copiedItem.data, id: nid, ts: time, layerOrder: Date.now() };
+          setClips(prev => [...prev, c]);
+          setSelClipId(nid);
+          setSelGfxId(null);
+        } else if (copiedItem.kind === 'graphic') {
+          const g = { ...copiedItem.data, id: nid, ts: time, layerOrder: Date.now() };
+          setGraphics(prev => [...prev, g]);
+          setSelGfxId(nid);
+          setSelClipId(null);
+        }
+        return;
+      }
+      if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); if (!deleteSelectedKeyframes()) deleteSelected(); return; }
       if (e.key === " ") { e.preventDefault(); setPlaying(p => !p); }
       if (e.key === "v" || e.key === "V") setTool("select");
       if (e.key === "c" || e.key === "C") setTool("razor");
       if (e.key === "t" || e.key === "T") setTool("text");
     };
     document.addEventListener("keydown", onKey, true);
-    return () => document.removeEventListener("keydown", onKey, true);
-  }, [selGfxId, selClipId, clips, graphics]);
+    const popupWin = previewWinRef.current;
+    if (popupWin && !popupWin.closed) {
+      try { popupWin.document.addEventListener("keydown", onKey, true); } catch (_) {}
+    }
+    return () => {
+      document.removeEventListener("keydown", onKey, true);
+      if (popupWin && !popupWin.closed) {
+        try { popupWin.document.removeEventListener("keydown", onKey, true); } catch (_) {}
+      }
+    };
+  }, [selGfxId, selClipId, clips, graphics, copiedItem, time, previewPopout, selectedKeyframes]);
   // ── Canvas Interaction Mouse ────────────────────────────────────────────
   useEffect(() => {
     if (!interact) return;
@@ -2777,8 +3186,8 @@ export default function HMStudio() {
       if (interact.mode === "move") {
         const dx = ((e.clientX - interact.px) / rect.width) * 100;
         const dy = ((e.clientY - interact.py) / rect.height) * 100;
-        if (interact.kind === "clip") updateClip(interact.gid, { x: clamp(interact.sx + dx, 0, 100), y: clamp(interact.sy + dy, 0, 100) });
-        else updateGfx(interact.gid, { x: clamp(interact.sx + dx, 0, 100), y: clamp(interact.sy + dy, 0, 100) });
+        if (interact.kind === "clip") updateClip(interact.gid, { x: interact.sx + dx, y: interact.sy + dy });
+        else updateGfx(interact.gid, { x: interact.sx + dx, y: interact.sy + dy });
       } else if (interact.mode === "scale") {
         const cx = rect.left + rect.width * (interact.sx / 100);
         const cy = rect.top + rect.height * (interact.sy / 100);
@@ -2817,12 +3226,24 @@ export default function HMStudio() {
   }, [interact, graphics, clips, previewPopout, getStageEl]);
   // ── Timeline Drag/Resize Mouse ──────────────────────────────────────────
   useEffect(() => {
-    if (!timelineDrag && !timelineResize && !keyframeDrag) return;
-    const rowH = 44;
+    if (!timelineDrag && !timelineResize && !keyframeDrag && !markerDrag && !playheadDrag && !keyframeSelectBox) return;
+    const rowH = 72;
     const onMove = e => {
       const dx = (e.clientX - dragStart.x) / (20 * zoom);
       
-      if (keyframeDrag) {
+      if (keyframeSelectBox) {
+        setKeyframeSelectBox(box => box ? { ...box, x2: e.clientX - box.rect.left, y2: e.clientY - box.rect.top } : null);
+      } else if (markerDrag === 'in') {
+        const nextIn = Math.max(0, dragStart.ts + dx);
+        setRenderIn(nextIn);
+        setRenderOut(prev => prev != null && prev < nextIn ? nextIn : prev);
+      } else if (markerDrag === 'out') {
+        const nextOut = Math.max(0, dragStart.ts + dx);
+        setRenderOut(nextOut);
+        setRenderIn(prev => prev > nextOut ? nextOut : prev);
+      } else if (playheadDrag) {
+        setTime(clamp(dragStart.ts + dx, 0, totalDur || 1));
+      } else if (keyframeDrag) {
         const { layerId, kind, prop, initialT, currentT } = keyframeDrag;
         const targetTime = Math.max(0, initialT + dx);
         if (Math.abs(targetTime - currentT) > 0.001) {
@@ -2846,6 +3267,10 @@ export default function HMStudio() {
         const ns = Math.max(0, dragStart.ts + dx);
         setClips(cs => cs.map(c => c.id === timelineDrag && dragStart.kind === 'clip' ? { ...c, ts: ns } : c));
         setGraphics(gs => gs.map(g => g.id === timelineDrag && dragStart.kind === 'graphic' ? { ...g, ts: ns } : g));
+        
+        const dy = e.clientY - dragStart.y;
+        const targetIndex = Math.max(0, Math.min(getCurrentTimelineLayers().length - 1, dragStart.rowIndex + Math.round(dy / rowH)));
+        setTimelineDragOffset(dy - (targetIndex - dragStart.rowIndex) * rowH);
       } else if (timelineResize) {
         const { id, side, kind } = timelineResize;
         setClips(cs => cs.map(c => {
@@ -2865,6 +3290,38 @@ export default function HMStudio() {
       }
     };
     const onUp = e => {
+      if (keyframeSelectBox) {
+        const box = keyframeSelectBox;
+        const x1 = Math.min(box.x1, box.x2);
+        const x2 = Math.max(box.x1, box.x2);
+        const y1 = Math.min(box.y1, box.y2);
+        const y2 = Math.max(box.y1, box.y2);
+        let rowTop = 52;
+        const next = new Set<string>();
+        getCurrentTimelineLayers().forEach(layer => {
+          const isExpanded = expandedLayers.has(layer.id);
+          const rowHeight = isExpanded ? 72 + 8 + (24 * 5) : 72;
+          collectAllKeyframes(layer).forEach(kf => {
+            const displayKt = kf.t - (layer.startT || 0);
+            if (displayKt < -0.001 || displayKt > layer.dur + 0.001) return;
+            const propConf = KF_PROP_CONFIG[kf.prop];
+            if (!propConf) return;
+            const kx = (layer.ts + displayKt) * 20 * zoom;
+            const ky = rowTop + (isExpanded ? 72 + 8 + propConf.index * 24 + 12 : rowHeight - 12);
+            if (kx >= x1 && kx <= x2 && ky >= y1 && ky <= y2) next.add(`${layer.__kind}:${layer.id}:${kf.prop}:${Number(kf.t).toFixed(3)}`);
+          });
+          rowTop += rowHeight;
+        });
+        setSelectedKeyframes(next);
+        setKeyframeSelectBox(null);
+        suppressTimelineClickRef.current = true;
+        setTimeout(() => { suppressTimelineClickRef.current = false; }, 0);
+        return;
+      }
+      if (markerDrag) {
+        suppressTimelineClickRef.current = true;
+        setTimeout(() => { suppressTimelineClickRef.current = false; }, 0);
+      }
       if (timelineDrag) {
         const dy = e.clientY - dragStart.y;
         const shift = Math.round(dy / rowH);
@@ -2883,7 +3340,8 @@ export default function HMStudio() {
         }
       }
       snap();
-      setTimelineDrag(null); setTimelineResize(null); setKeyframeDrag(null);
+      setTimelineDrag(null); setTimelineResize(null); setKeyframeDrag(null); setMarkerDrag(null); setPlayheadDrag(false);
+      setTimelineDragOffset(0);
       const allItems = [...clips, ...graphics];
       const newTotal = Math.max(0, ...allItems.map(i => i.ts + i.dur));
       setTotalDur(newTotal);
@@ -2891,7 +3349,7 @@ export default function HMStudio() {
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
     return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
-  }, [timelineDrag, timelineResize, keyframeDrag, dragStart, zoom, clips, graphics, getCurrentTimelineLayers, applyLayerOrder, snap]);
+  }, [timelineDrag, timelineResize, keyframeDrag, markerDrag, playheadDrag, keyframeSelectBox, dragStart, zoom, clips, graphics, totalDur, expandedLayers, getCurrentTimelineLayers, applyLayerOrder, snap]);
 
   useEffect(() => {
     if (!isResizingPanel) return;
@@ -2915,7 +3373,7 @@ export default function HMStudio() {
     e.stopPropagation();
     const rect = getStageEl()?.getBoundingClientRect();
     if (!rect) return;
-    const ct = time - g.ts;
+    const ct = time - g.ts + (g.startT || 0);
     const sx = lerp(g.kf?.x, ct, g.x);
     const sy = lerp(g.kf?.y, ct, g.y);
     const ss = lerp(g.kf?.scale, ct, g.scale);
@@ -2937,7 +3395,7 @@ export default function HMStudio() {
     // hit-test graphics in preview stack order (top-most first)
     const hit = getCurrentTimelineLayers().filter(l => l.__kind === 'graphic').find(g => {
       if (time < g.ts || time >= g.ts + g.dur) return false;
-      const ct = time - g.ts;
+      const ct = time - g.ts + (g.startT || 0);
       const gx = lerp(g.kf?.x, ct, g.x);
       const gy = lerp(g.kf?.y, ct, g.y);
       const gs = lerp(g.kf?.scale, ct, g.scale) / 100;
@@ -2997,12 +3455,15 @@ export default function HMStudio() {
   const ingestFiles = useCallback(async (files) => {
     if (!files?.length) return;
     const isAnyAudio = Array.from(files).some((f: any) => f.type.startsWith('audio/') || /\.(mp3|wav|m4a|aac|ogg)$/i.test(f.name));
+    requestPreviewFullscreenNow();
     
     // Preview popout is mainly for video, but we keep it active if needed
     if (!isAnyAudio) {
-      preparePreviewPopout().then(win => {
+      preparePreviewPopout(true).then(win => {
         setPreviewPopout(true);
-        setTimeout(() => { try { win?.focus(); win?.document.documentElement.requestFullscreen?.(); } catch {} }, 120);
+        requestPreviewFullscreenNow();
+        setTimeout(() => { try { win?.focus(); win?.document.documentElement.requestFullscreen?.(); } catch {} }, 60);
+        setTimeout(() => { try { win?.focus(); win?.document.documentElement.requestFullscreen?.(); } catch {} }, 300);
       });
     }
 
@@ -3011,7 +3472,8 @@ export default function HMStudio() {
     let firstVisualMeta: { w: number; h: number } | null = null;
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      const url = URL.createObjectURL(file);
+      const isElectron = !!(window as any).electron && typeof (file as any).path === 'string';
+      const url = isElectron ? `local-file://${(file as any).path.replace(/\\/g, '/')}` : URL.createObjectURL(file);
       const isAudio = file.type.startsWith('audio/') || /\.(mp3|wav|m4a|aac|ogg)$/i.test(file.name);
       const isImage = file.type.startsWith('image/') || /\.(jpg|jpeg|png|webp|gif)$/i.test(file.name);
       
@@ -3052,18 +3514,20 @@ export default function HMStudio() {
         firstVisualMeta = { w: meta.w, h: meta.h };
       }
 
-      let storedPath = null;
-      let serverUrl = null;
-      try {
-        const fd = new FormData();
-        fd.append('file', file);
-        const res = await fetch('/api/uploads/video', { method: 'POST', body: fd });
-        if (res.ok) {
-          const uploaded = await res.json();
-          storedPath = uploaded.storedPath || null;
-          serverUrl = uploaded.url || null;
-        }
-      } catch {}
+      let storedPath = isElectron ? (file as any).path : null;
+      let serverUrl = isElectron ? url : null;
+      if (!isElectron) {
+        try {
+          const fd = new FormData();
+          fd.append('file', file);
+          const res = await fetch('/api/uploads/video', { method: 'POST', body: fd });
+          if (res.ok) {
+            const uploaded = await res.json();
+            storedPath = uploaded.storedPath || null;
+            serverUrl = uploaded.url || null;
+          }
+        } catch {}
+      }
       
       const dur = meta.dur;
       const clip = { 
@@ -3097,7 +3561,19 @@ export default function HMStudio() {
     setRenderIn(minNewTs);
     setRenderOut(maxNewEnd);
     setTime(minNewTs);
-  }, [clips.length, preparePreviewPopout, snap, time, totalDur]);
+
+    // Automatically trigger fullscreen on the preview popup window
+    try {
+      const win = previewWinRef.current;
+      if (win && !win.closed) {
+        const el = win.document.documentElement;
+        const req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
+        if (req) {
+          req.call(el).catch(() => {});
+        }
+      }
+    } catch (_) {}
+  }, [clips.length, preparePreviewPopout, requestPreviewFullscreenNow, snap, time, totalDur]);
   const handleFileUpload = async e => {
     const files = Array.from(e.target.files ?? []);
     if (fileRef.current) fileRef.current.value = '';
@@ -3149,7 +3625,9 @@ export default function HMStudio() {
           const assetAlphaBounds = await computeLottieAssetAlphaBounds(lottieData);
           lottieData.__assetAlphaBounds = assetAlphaBounds;
           const vectorModel = extractVectorSubtitleModel(lottieData);
-          const multiTitleModel = !vectorModel ? extractMultiPngTitleModel(lottieData) : null;
+          const nameStr = (meta?.name || base || "").toLowerCase();
+          const isLottieOverride = nameStr.includes("상단_04") || nameStr.includes("상단 04") || nameStr.includes("하단_04") || nameStr.includes("하단 04") || nameStr.includes("추가예정");
+          const multiTitleModel = (!vectorModel && !isLottieOverride) ? extractMultiPngTitleModel(lottieData) : null;
           if (multiTitleModel?.pairs?.length) lottieData.__customHide = {
             imageLayerIndices: [...new Set(multiTitleModel.pairs.flatMap(p => p.relatedImageLayerIndices?.length ? p.relatedImageLayerIndices : [p.imageLayerIndex]).filter(idx => Number.isFinite(idx)))],
             textLayerIndices: [...new Set(multiTitleModel.pairs.map(p => p.textLayerIndex).filter(idx => Number.isFinite(idx)))],
@@ -3213,20 +3691,37 @@ export default function HMStudio() {
   const addTemplateFieldDef = templateId => setImportedAE(list => list.map(t => t.id !== templateId ? t : { ...t, fields: [...(t.fields || []), createDefaultTemplateField((t.fields || []).length + 1)] }));
   const removeTemplateFieldDef = (templateId, fieldId) => setImportedAE(list => list.map(t => t.id !== templateId ? t : { ...t, fields: (t.fields || []).filter(f => f.id !== fieldId) }));
   const addAETemplate = (template) => {
+    requestPreviewFullscreenNow();
+    setTimeout(requestPreviewFullscreenNow, 80);
+    setTimeout(requestPreviewFullscreenNow, 300);
     snap();
     const naturalW = Math.max(1, Number(template.templateKind === "vector_subtitle" ? (template.vectorModel?.baseBarWidth || template.templateW || 1000) : (template.templateW || 1000)));
     const naturalH = Math.max(1, Number(template.templateKind === "vector_subtitle" ? (template.vectorModel?.baseBarHeight || template.templateH || 170) : (template.templateH || 170)));
     const cropBounds = template.cropBounds || { x: 0, y: 0, w: naturalW, h: naturalH };
     const visibleW = Math.max(1, Number(cropBounds.w || naturalW));
     const visibleH = Math.max(1, Number(cropBounds.h || naturalH));
-    const fitScale = template.templateKind === "vector_subtitle" ? (800 / visibleW) : Math.min(1, 800 / visibleW);
+
+    let fitScale = 1;
+    let defaultX = 50;
+    let defaultY = 74;
+
+    if (template.templateKind === "vector_subtitle") {
+      fitScale = (comp.w * 0.4) / visibleW;
+    } else if (visibleW >= 1920) {
+      fitScale = comp.w / visibleW;
+      defaultX = 50;
+      defaultY = 50; // Full-frame centered overlay
+    } else {
+      fitScale = (comp.w * 0.5) / visibleW;
+    }
+
     const g = {
       id: uid(), type: "ae_template", content: "",
       compName: template.compName, fields: (template.fields || []).map(f => ({ ...f })),
       templateId: template.id, sourceName: template.name,
       ts: time,
       dur: Math.max(5, Number(template.templateDuration || 5)),
-      x: 50, y: 74,
+      x: defaultX, y: defaultY,
       width: Math.round(visibleW * fitScale),
       height: Math.round(visibleH * fitScale),
       templatePixelRatio: fitScale,
@@ -3272,7 +3767,7 @@ export default function HMStudio() {
     if (updates.kf !== undefined) return { ...g, ...updates };
     let newKf = g.kf || {};
     let hasKfUpdates = false;
-    const localTime = clamp(time - g.ts, 0, g.dur);
+    const localTime = clamp(time - g.ts + (g.startT || 0), 0, (g.startT || 0) + g.dur);
     Object.keys(updates).forEach(key => {
       if (KEYFRAME_PROPS.includes(key) && newKf[key] && newKf[key].length > 0) {
         newKf = upsertKeyframe({ kf: newKf }, key, localTime, updates[key]);
@@ -3295,6 +3790,70 @@ export default function HMStudio() {
     });
     return { ...c, ...updates, kf: hasKfUpdates ? newKf : c.kf };
   }));
+  const handleAlign = (direction: 'horizontal' | 'vertical', alignment: 'left' | 'center' | 'right' | 'top' | 'bottom') => {
+    snap();
+    if (selClipId) {
+      const clip = clips.find(c => c.id === selClipId);
+      if (!clip) return;
+      const assetW = Number(clip.sourceW || comp.w);
+      const assetH = Number(clip.sourceH || comp.h);
+      const clipScale = Number(clip.scale || 100) / 100;
+      
+      if (direction === 'horizontal') {
+        const scaledWPct = (assetW * clipScale / comp.w) * 100;
+        let newX = 50;
+        if (alignment === 'left') {
+          newX = scaledWPct / 2;
+        } else if (alignment === 'center') {
+          newX = 50;
+        } else if (alignment === 'right') {
+          newX = 100 - (scaledWPct / 2);
+        }
+        updateClip(clip.id, { x: newX });
+      } else {
+        const scaledHPct = (assetH * clipScale / comp.h) * 100;
+        let newY = 50;
+        if (alignment === 'top') {
+          newY = scaledHPct / 2;
+        } else if (alignment === 'center') {
+          newY = 50;
+        } else if (alignment === 'bottom') {
+          newY = 100 - (scaledHPct / 2);
+        }
+        updateClip(clip.id, { y: newY });
+      }
+    } else if (selGfxId) {
+      const gfx = graphics.find(g => g.id === selGfxId);
+      if (!gfx) return;
+      const assetW = Number(gfx.width || 200);
+      const assetH = Number(gfx.height || 200);
+      const gfxScale = Number(gfx.scale || 100) / 100;
+      
+      if (direction === 'horizontal') {
+        const scaledWPct = (assetW * gfxScale / comp.w) * 100;
+        let newX = 50;
+        if (alignment === 'left') {
+          newX = scaledWPct / 2;
+        } else if (alignment === 'center') {
+          newX = 50;
+        } else if (alignment === 'right') {
+          newX = 100 - (scaledWPct / 2);
+        }
+        updateGfx(gfx.id, { x: newX });
+      } else {
+        const scaledHPct = (assetH * gfxScale / comp.h) * 100;
+        let newY = 50;
+        if (alignment === 'top') {
+          newY = scaledHPct / 2;
+        } else if (alignment === 'center') {
+          newY = 50;
+        } else if (alignment === 'bottom') {
+          newY = 100 - (scaledHPct / 2);
+        }
+        updateGfx(gfx.id, { y: newY });
+      }
+    }
+  };
   const hasEasingAtTime = (layer, localTime) => {
     let has = false;
     KEYFRAME_PROPS.forEach(prop => {
@@ -3326,6 +3885,27 @@ export default function HMStudio() {
     else updateGfx(layer.id, { kf: newKf });
     snap();
   };
+  const deleteSelectedKeyframes = () => {
+    if (selectedKeyframes.size === 0) return false;
+    snap();
+    setClips(cs => cs.map(c => {
+      const nextKf = { ...(c.kf || {}) };
+      KEYFRAME_PROPS.forEach(prop => {
+        nextKf[prop] = [...(nextKf[prop] || [])].filter(k => !selectedKeyframes.has(`clip:${c.id}:${prop}:${Number(k.t).toFixed(3)}`));
+      });
+      return { ...c, kf: nextKf };
+    }));
+    setGraphics(gs => gs.map(g => {
+      const nextKf = { ...(g.kf || {}) };
+      KEYFRAME_PROPS.forEach(prop => {
+        nextKf[prop] = [...(nextKf[prop] || [])].filter(k => !selectedKeyframes.has(`graphic:${g.id}:${prop}:${Number(k.t).toFixed(3)}`));
+      });
+      return { ...g, kf: nextKf };
+    }));
+    setSelectedKeyframes(new Set());
+    setActiveKeyframePopup(null);
+    return true;
+  };
   const toggleLayerVisible = (kind: string, id: string) => {
     if (kind === "clip") setClips(cs => cs.map(c => c.id === id ? { ...c, visible: c.visible === false ? true : false } : c));
     else setGraphics(gs => gs.map(g => g.id === id ? { ...g, visible: g.visible === false ? true : false } : g));
@@ -3333,7 +3913,7 @@ export default function HMStudio() {
   const updateField = (gid, fid, val) => setGraphics(gs => gs.map(g => g.id === gid ? resizeVectorGraphic({ ...g, fields: (g.fields || []).map(f => f.id === fid ? { ...f, value: val } : f) }) : g));
   const updateFieldProps = (gid, fid, updates) => setGraphics(gs => gs.map(g => g.id === gid ? resizeVectorGraphic({ ...g, fields: (g.fields || []).map(f => f.id === fid ? { ...f, ...updates } : f) }) : g));
   const toggleGraphicKeyframe = (graphic, prop) => {
-    const localTime = clamp(time - graphic.ts, 0, graphic.dur);
+    const localTime = clamp(time - graphic.ts + (graphic.startT || 0), 0, (graphic.startT || 0) + graphic.dur);
     const currentValue = prop === "opacity" ? graphic.opacity : prop === "rotation" ? (graphic.rotation || 0) : graphic[prop];
     const isAdding = !hasKeyframeAt(graphic, prop, localTime);
     const nextKf = isAdding ? upsertKeyframe(graphic, prop, localTime, currentValue) : removeKeyframe(graphic, prop, localTime);
@@ -3351,21 +3931,21 @@ export default function HMStudio() {
     snap();
   };
   const jumpToKeyframe = (item, prop, direction) => {
-    const localTime = clamp(time - item.ts, 0, item.dur);
+    const localTime = clamp(time - item.ts + (item.startT || 0), 0, (item.startT || 0) + item.dur);
     const times = (item.kf?.[prop] || []).map(k => k.t).sort((a, b) => a - b);
     if (!times.length) return;
     if (direction === "prev") {
       const prevs = times.filter(t => t < localTime - 0.001);
       if (prevs.length) {
         const target = Math.max(...prevs);
-        setTime(item.ts + target);
+        setTime(item.ts + target - (item.startT || 0));
         setActiveKeyframePopup({ layerId: item.id, time: target, prop });
       }
     } else {
       const nexts = times.filter(t => t > localTime + 0.001);
       if (nexts.length) {
         const target = Math.min(...nexts);
-        setTime(item.ts + target);
+        setTime(item.ts + target - (item.startT || 0));
         setActiveKeyframePopup({ layerId: item.id, time: target, prop });
       }
     }
@@ -3420,6 +4000,7 @@ export default function HMStudio() {
           // Use {screen} option from Window Management API if available
           const fsOpts = targetScreen ? { screen: targetScreen } : undefined;
           requestMethod.call(docEl, fsOpts)?.catch?.((e: any) => console.warn("FS failed:", e));
+          requestMethod.call(docEl)?.catch?.(() => {});
         }
       } catch (err) {
         console.warn("Fullscreen request failed:", err);
@@ -3428,6 +4009,7 @@ export default function HMStudio() {
 
     // Step 1: Immediately position
     ensurePosition();
+    tryFullscreen();
     // Step 2: Re-position after short delay (browser may ignore first moveTo)
     setTimeout(ensurePosition, 200);
     // Step 3: Re-position again
@@ -3447,17 +4029,47 @@ export default function HMStudio() {
   };
   useEffect(() => () => { try { previewWinRef.current?.close(); } catch {} }, []);
 
-  // Auto-open preview window on page load (same monitor, not fullscreen)
+  // Auto-open preview window on page load
   useEffect(() => {
     if (isLoggedIn && !isRenderMode) {
       const timer = setTimeout(() => {
         if (!previewWinRef.current || previewWinRef.current.closed) {
-          openPreviewPopout({ fullscreen: false, focusWindow: false, hasUserGesture: false });
+          openPreviewPopout({ fullscreen: true, focusWindow: true, hasUserGesture: false });
         }
       }, 500);
       return () => clearTimeout(timer);
     }
   }, [isLoggedIn, isRenderMode, openPreviewPopout]);
+
+  // Auto-fit preview zoom to the window dimensions when the popout is opened or composition size changes
+  useEffect(() => {
+    if (previewPopout && previewWinRef.current) {
+      const win = previewWinRef.current;
+      const fitZoom = () => {
+        const w = win.innerWidth || 1280;
+        const h = win.innerHeight || 720;
+        const scaleX = w / Math.max(1, comp.w);
+        const scaleY = h / Math.max(1, comp.h);
+        const scale = Math.min(scaleX, scaleY) * 0.95; // 95% of window size for a beautiful fit with margins
+        setPreviewZoom(Math.max(0.1, Math.min(5, scale)));
+        setPreviewPan({ x: 0, y: 0 });
+      };
+
+      // Run immediately
+      fitZoom();
+
+      // Run again with a slight delay to ensure window geometry is fully loaded/settled
+      const timer = setTimeout(fitZoom, 300);
+      const timer2 = setTimeout(fitZoom, 1000);
+
+      win.addEventListener('resize', fitZoom);
+      return () => {
+        clearTimeout(timer);
+        clearTimeout(timer2);
+        win.removeEventListener('resize', fitZoom);
+      };
+    }
+  }, [previewPopout, comp.w, comp.h]);
 
   // On first user click: request Window Management permission and move popup to other monitor
   useEffect(() => {
@@ -3593,6 +4205,7 @@ export default function HMStudio() {
       renderRange: { in: Number(renderIn || 0), out: Number(outPoint || 0) },
       clips: clips.map(c => ({
         id: c.id, name: c.name, url: c.url, serverUrl: c.serverUrl || null, storedPath: c.storedPath || null, ts: c.ts, dur: c.dur, startT: c.startT || 0, endT: c.endT || c.dur,
+        type: c.type || 'video',
         x: c.x, y: c.y, scale: c.scale, rotation: c.rotation || 0, opacity: c.opacity, sourceW: c.sourceW, sourceH: c.sourceH,
         visible: c.visible !== false, layerOrder: c.layerOrder ?? 0, kf: c.kf || null,
       })),
@@ -3793,7 +4406,7 @@ export default function HMStudio() {
   };
   // ── Timeline click ─────────────────────────────────────────────────────
   const handleTimelineClick = e => {
-    if (timelineDrag || timelineResize) return;
+    if (timelineDrag || timelineResize || playheadDrag || suppressTimelineClickRef.current) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const t = (e.clientX - rect.left) / (20 * zoom);
     setTime(clamp(t, 0, totalDur || 1));
@@ -3809,13 +4422,77 @@ export default function HMStudio() {
     const b = { ...clip, id: uid(), dur: clip.dur - sp, ts: time, startT: clip.startT + sp };
     setClips(cs => { const nc = [...cs]; nc.splice(idx, 1, a, b); return nc; });
   };
+  const handleGraphicSplit = (graphicId) => {
+    const idx = graphics.findIndex(g => g.id === graphicId); if (idx === -1) return;
+    const graphic = graphics[idx];
+    const sp = time - graphic.ts;
+    if (sp <= 0 || sp >= graphic.dur) return;
+    snap();
+    const startT = graphic.startT || 0;
+    const a = { ...graphic, id: uid(), dur: sp };
+    const b = { ...graphic, id: uid(), dur: graphic.dur - sp, ts: time, startT: startT + sp };
+    setGraphics(gs => { const ng = [...gs]; ng.splice(idx, 1, a, b); return ng; });
+  };
   // ── Colors ─────────────────────────────────────────────────────────────
   const BG = "#0a0a0a", PANEL = "#111111", BORDER = "#27272a", ACCENT = "#f97316", ACCENT2 = "#22c55e";
   const txt = c => ({ color: c || "#a1a1aa" });
   const panel = (extra = {}) => ({ background: PANEL, border: `1px solid ${BORDER}`, ...extra });
   const previewStageNode = (popup = false) => (
-    <div style={{ position: 'relative', background: '#050505', borderBottom: popup ? 'none' : `1px solid ${BORDER}`, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: popup ? 'visible' : 'hidden', minHeight: 0, height: popup ? 'auto' : '56vh' }} onMouseDown={handleCanvasDown}>
-      <div ref={popup ? popupStageRef : stageRef} style={{ position: 'relative', background: comp.bg, ...(popup ? { width: comp.w, height: comp.h } : { aspectRatio: `${comp.w}/${comp.h}`, maxWidth: '100%', maxHeight: '56vh', width: '100%' }), boxShadow: 'inset 0 0 0 2px rgba(56,189,248,0.75)', '--stage-scale': (popup ? 1 : (stageRef.current?.clientWidth || comp.w) / comp.w) } as any}><div style={{ position: 'absolute', right: 8, bottom: 8, zIndex: 120, background: 'rgba(0,0,0,0.55)', color: '#38bdf8', fontSize: 11, fontWeight: 700, padding: '3px 8px', borderRadius: 4, pointerEvents: 'none' }}>{comp.w} × {comp.h}</div>
+    <div style={{
+      display: 'flex',
+      flexDirection: 'column',
+      width: popup ? 'auto' : '100%',
+      height: popup ? 'auto' : '56vh',
+      borderBottom: popup ? 'none' : `1px solid ${BORDER}`,
+      background: popup ? 'transparent' : '#0c0c0e',
+      overflow: popup ? 'visible' : 'hidden'
+    }}>
+      {/* Modern Preview Header Bar */}
+      {!popup && (
+        <div style={{
+          height: 38,
+          background: '#121214',
+          borderBottom: `1px solid ${BORDER}`,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: '0 16px',
+          fontSize: 12,
+          fontWeight: 600,
+          color: '#a1a1aa',
+          userSelect: 'none',
+          width: '100%',
+          boxSizing: 'border-box',
+          flexShrink: 0
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ color: ACCENT, fontSize: 14 }}>🎬</span>
+            <span style={{ color: '#e4e4e7', fontWeight: 800, fontSize: 13 }}>
+              {selClip ? `선택된 클립: ${selClip.name}` : selGfx ? `선택된 그래픽: ${selGfx.name || '자막/도형'}` : '모니터 프리뷰'}
+            </span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ color: '#38bdf8', fontSize: 13, fontWeight: 800, background: 'rgba(56,189,248,0.1)', padding: '4px 10px', borderRadius: 6, border: '1px solid rgba(56,189,248,0.2)', letterSpacing: '0.02em' }}>
+              🖥️ {comp.w} × {comp.h} ({comp.w === 3840 ? '4K UHD' : comp.w === 1920 ? 'FHD' : 'HD'})
+            </span>
+          </div>
+        </div>
+      )}
+      <div style={{ 
+        flex: 1,
+        position: 'relative', 
+        background: 'linear-gradient(rgba(0,0,0,0.55), rgba(0,0,0,0.55)), repeating-conic-gradient(#2d3038 0 25%, #424653 0 50%) 0 0 / 16px 16px',
+        display: 'flex', 
+        alignItems: 'center', 
+        justifyContent: 'center', 
+        overflow: 'visible', 
+        minHeight: 0
+      }} onMouseDown={handleCanvasDown}>
+        <div ref={popup ? popupStageRef : stageRef} style={{ position: 'relative', overflow: 'visible', background: comp.bg, ...(popup ? { width: comp.w, height: comp.h } : { aspectRatio: `${comp.w}/${comp.h}`, maxWidth: '100%', maxHeight: '100%', width: '100%' }), '--stage-scale': (popup ? 1 : (stageRef.current?.clientWidth || comp.w) / comp.w) } as any}>
+          {/* Canvas Bounds Overlay (Always on top) */}
+          <div style={{ position: 'absolute', inset: 0, zIndex: 9999, pointerEvents: 'none', boxShadow: 'inset 0 0 0 2px rgba(56,189,248,0.75)' }} />
+          {/* Off-Canvas Dimming Mask (Dim everything outside the canvas with a 75% dark overlay) */}
+          <div style={{ position: 'absolute', inset: 0, zIndex: 9998, pointerEvents: 'none', boxShadow: '0 0 0 9999px rgba(0,0,0,0.75)' }} />
         {previewLayers.length ? (
           <>
             {previewLayers.map(layer => {
@@ -3848,7 +4525,7 @@ export default function HMStudio() {
                       style={{ width: '100%', height: '100%', objectFit: 'fill', opacity: clipOpacity, pointerEvents: 'none', display: 'block' }} 
                     />
                     )}
-                    <div onMouseDown={ev => { ev.stopPropagation(); if (tool === 'text' || tool === 'rect' || tool === 'circle') { createGraphicAtPoint(tool, ev.clientX, ev.clientY); return; } setSelClipId(clip.id); setSelGfxId(null); if (tool === 'select') beginInteract(ev, clip, 'move', 'clip'); }} style={{ position: 'absolute', inset: 0, cursor: tool === 'select' ? 'move' : 'crosshair', background: 'transparent' }} />
+                    <div onMouseDown={ev => { if (ev.button === 1) return; ev.stopPropagation(); if (tool === 'text' || tool === 'rect' || tool === 'circle') { createGraphicAtPoint(tool, ev.clientX, ev.clientY); return; } setSelClipId(clip.id); setSelGfxId(null); if (tool === 'select') beginInteract(ev, clip, 'move', 'clip'); }} style={{ position: 'absolute', inset: 0, cursor: tool === 'select' ? 'move' : 'crosshair', background: 'transparent' }} />
                   </div>
                 );
               }
@@ -3874,12 +4551,13 @@ export default function HMStudio() {
               const assetH = (selClip.sourceH || comp.h);
               const assetWPct = (assetW / comp.w) * 100;
               const assetHPct = (assetH / comp.h) * 100;
-              return <div style={{ position: 'absolute', left: `${clipLeft}%`, top: `${clipTop}%`, width: `${assetWPct}%`, height: `${assetHPct}%`, transform: `translate(-50%,-50%) scale(${clipScale}) rotate(${clipRot}deg)`, transformOrigin: 'center center', pointerEvents: 'none', zIndex: 90, boxSizing: 'border-box', outline: `1px solid ${ACCENT}` }}><div style={{ position: 'absolute', top: 6, left: 6, background: 'rgba(249,115,22,0.85)', color: '#000', fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 4 }}>{selClip.name}</div></div>;
+              return <div style={{ position: 'absolute', left: `${clipLeft}%`, top: `${clipTop}%`, width: `${assetWPct}%`, height: `${assetHPct}%`, transform: `translate(-50%,-50%) scale(${clipScale}) rotate(${clipRot}deg)`, transformOrigin: 'center center', pointerEvents: 'none', zIndex: 90, boxSizing: 'border-box', outline: `1px solid ${ACCENT}` }} />;
             })()}
             {selGfx && selGfx.visible !== false && !editingGfxId && <TransformHandles g={selGfx} time={time} stageRef={previewPopout ? popupStageRef : stageRef} onBeginInteract={beginInteract} />}
           </>
         ) : <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#27272a' }}><div style={{ fontSize: 40, marginBottom: 8 }}>🎬</div><div style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.1em' }}>영상을 드래그하거나 추가하세요</div></div>}
 
+        </div>
       </div>
     </div>
   );
@@ -3893,10 +4571,12 @@ export default function HMStudio() {
       </button>
       <button onClick={() => setTime(t => Math.min(totalDur, t + 5))} style={{ background: 'none', border: 'none', color: '#71717a', fontSize: 14, cursor: 'pointer' }}>▷▷</button>
       <button onClick={() => { setTime(totalDur); setPlaying(false); }} style={{ background: 'none', border: 'none', color: '#71717a', fontSize: 16, cursor: 'pointer' }}>⏭</button>
-      <div style={{ display: 'flex', gap: 4 }}>
-        <button onClick={undoFn} title='Undo (Ctrl+Z)' style={{ background: 'none', border: `1px solid ${BORDER}`, color: '#71717a', fontSize: 12, cursor: 'pointer', borderRadius: 4, padding: '2px 8px' }}>↩</button>
-        <button onClick={redoFn} title='Redo (Ctrl+Shift+Z)' style={{ background: 'none', border: `1px solid ${BORDER}`, color: '#71717a', fontSize: 12, cursor: 'pointer', borderRadius: 4, padding: '2px 8px' }}>↪</button>
-      </div>
+      {!popup && (
+        <div style={{ display: 'flex', gap: 4 }}>
+          <button onClick={undoFn} title='Undo (Ctrl+Z)' style={{ background: 'none', border: `1px solid ${BORDER}`, color: '#71717a', fontSize: 12, cursor: 'pointer', borderRadius: 4, padding: '2px 8px' }}>↩</button>
+          <button onClick={redoFn} title='Redo (Ctrl+Shift+Z)' style={{ background: 'none', border: `1px solid ${BORDER}`, color: '#71717a', fontSize: 12, cursor: 'pointer', borderRadius: 4, padding: '2px 8px' }}>↪</button>
+        </div>
+      )}
 
       {!popup && (
         <button 
@@ -3927,12 +4607,19 @@ export default function HMStudio() {
   );
   const previewPortal = previewPopout && previewHostRef.current ? createPortal(
     <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: '#000', display: 'flex', flexDirection: 'column', position: 'relative' }}>
-      <div ref={previewScrollRef} style={{ flex: 1, minHeight: 0, overflow: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        <div style={{ transform: `scale(${previewZoom})`, transformOrigin: 'center center', flexShrink: 0 }}>
-          {previewStageNode(true)}
+      <div ref={previewScrollRef} style={{ flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'repeating-conic-gradient(#373a45 0 25%, #4b4f5d 0 50%) 0 0 / 24px 24px' }}>
+        <div style={{ transform: `translate(${previewPan.x}px, ${previewPan.y}px) scale(${previewZoom})`, transformOrigin: 'center center', flexShrink: 0 }}>
+          {isExportView ? (
+            <div style={{ width: comp.w, height: comp.h, background: '#000', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#71717a', gap: 12 }}>
+              <div style={{ fontSize: 40 }}>🎬</div>
+              <div style={{ fontSize: 14, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>대기열 프리뷰 재생 중</div>
+            </div>
+          ) : (
+            previewStageNode(true)
+          )}
         </div>
       </div>
-      {renderTransportControls(true)}
+      {!isExportView && renderTransportControls(true)}
     </div>,
     previewHostRef.current
   ) : null;
@@ -3961,9 +4648,12 @@ export default function HMStudio() {
             clips={clips}
             graphics={processedGraphicsForWebGL}
             time={time}
-            onReady={() => {
+            onReady={(canvas) => {
               document.documentElement.setAttribute('data-render-ready', '1');
               document.body.setAttribute('data-render-ready', '1');
+              if ((window as any).electron && (window as any).__onElectronFrameReady) {
+                (window as any).__onElectronFrameReady(canvas);
+              }
               // @ts-ignore
               if (renderReadyResolverRef.current) {
                 // @ts-ignore
@@ -3974,7 +4664,21 @@ export default function HMStudio() {
               }
             }}
           />
-          {/* REMOVED: GraphicEl overlay here, as WebGLRenderStage now handles templates natively */}
+          {graphics
+            .filter(g => (g.templateKind === 'vector_subtitle' || g.templateKind === 'multi_png_title') && g.visible !== false && time >= Number(g.ts || 0) && time < Number(g.ts || 0) + Number(g.dur || 0))
+            .map(g => (
+              <GraphicEl
+                key={g.id}
+                g={g}
+                time={time}
+                renderZ={layerZMap.get(layerKey(g)) || 1}
+                selected={false}
+                editing={false}
+                onEdit={() => {}}
+                onEndEdit={() => {}}
+                onChange={() => {}}
+              />
+            ))}
         </div>
       )}
     </div>
@@ -3984,110 +4688,7 @@ export default function HMStudio() {
     background: active ? `${color}18` : "transparent", color: active ? color : "#71717a",
     border: `1px solid ${active ? color + "55" : BORDER}`, borderRadius: 6, padding: "5px 10px", fontSize: 11, cursor: "pointer", fontWeight: 600, transition: "all 0.15s"
   });
-  const LoginScreen = (
-    <div style={{
-      width: '100vw', height: '100vh', background: 'linear-gradient(135deg, #2d4d44 0%, #0f1a18 100%)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#e4e4e7', fontFamily: "'Inter', sans-serif"
-    }}>
-      <div style={{
-        width: 1000, height: 600, background: '#121616', borderRadius: 12, display: 'flex', overflow: 'hidden',
-        boxShadow: '0 24px 48px rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.05)'
-      }}>
-        {/* Left Side */}
-        <div style={{ flex: 1, padding: '60px', display: 'flex', flexDirection: 'column', justifyContent: 'space-between', borderRight: '1px solid rgba(255,255,255,0.05)' }}>
-          <div>
-            <h1 style={{ fontSize: 72, fontWeight: 900, lineHeight: 1, margin: 0, letterSpacing: '-0.02em', color: '#fff' }}>
-              HANMAC<br />STUDIO
-            </h1>
-            <p style={{ marginTop: 40, fontSize: 18, color: '#a1a1aa', lineHeight: 1.6, maxWidth: 480 }}>
-              한맥가족 임직원들을 위한 쉽고 간편한 영상 편집 솔루션.<br />
-              한맥가족만의 전용 디자인 템플릿으로 누구나 전문가처럼<br />
-              영상을 완성할 수 있습니다.
-            </p>
-          </div>
-          <div>
-            <div style={{ fontSize: 12, color: '#52525b', fontWeight: 600, marginBottom: 4 }}>VERSION</div>
-            <div style={{ fontSize: 14, color: '#71717a' }}>v2.4.0-STABLE</div>
-            
-            <div style={{ marginTop: 60 }}>
-              <div style={{ fontSize: 13, color: '#a1a1aa', fontWeight: 600, marginBottom: 16 }}>한맥가족사</div>
-              <div style={{ display: 'flex', gap: 24, flexWrap: 'nowrap', opacity: 0.6 }}>
-                {['HANMAC', 'SAMAN', 'JANGHEON', 'PTC', 'HALLA', 'BARON'].map(id => (
-                  <span key={id} style={{ fontSize: 12, fontWeight: 800 }}>{id}</span>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Right Side - Login Form */}
-        <div style={{ width: 420, padding: '60px', display: 'flex', flexDirection: 'column', justifyContent: 'center', background: '#161b1b' }}>
-          <h2 style={{ fontSize: 32, fontWeight: 800, margin: 0, marginBottom: 8 }}>LOG-IN</h2>
-          <p style={{ fontSize: 14, color: '#71717a', marginBottom: 40 }}>시스템에 접속하려면 사번과 비밀번호를 입력하십시오.</p>
-          
-          <form onSubmit={handleLoginSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
-            <div>
-              <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#52525b', marginBottom: 8, letterSpacing: '0.05em' }}>
-                사번 (EMPLOYEE ID)
-              </label>
-              <input 
-                type="text" 
-                placeholder="ID Number"
-                value={loginId}
-                onChange={e => setLoginId(e.target.value)}
-                style={{
-                  width: '100%', height: 48, background: '#0d1111', border: '1px solid #27272a',
-                  borderRadius: 6, padding: '0 16px', color: '#fff', fontSize: 14, outline: 'none'
-                }}
-              />
-            </div>
-            <div>
-              <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#52525b', marginBottom: 8, letterSpacing: '0.05em' }}>
-                비번 (PASSWORD)
-              </label>
-              <input 
-                type="password" 
-                placeholder="••••••••"
-                value={loginPw}
-                onChange={e => setLoginPw(e.target.value)}
-                style={{
-                  width: '100%', height: 48, background: '#0d1111', border: '1px solid #27272a',
-                  borderRadius: 6, padding: '0 16px', color: '#fff', fontSize: 14, outline: 'none'
-                }}
-              />
-            </div>
-            
-            {loginError && <div style={{ fontSize: 12, color: '#ef4444' }}>{loginError}</div>}
-
-            <button 
-              type="submit"
-              disabled={isLoggingIn}
-              style={{
-                width: '100%', height: 48, background: '#ff9000', color: '#000', border: 'none',
-                borderRadius: 6, fontSize: 15, fontWeight: 800, cursor: 'pointer', marginTop: 8,
-                transition: 'all 0.2s', opacity: isLoggingIn ? 0.7 : 1
-              }}
-            >
-              {isLoggingIn ? "인증 중..." : "로그인"}
-            </button>
-
-            <div style={{ textAlign: 'center', marginTop: 16 }}>
-              <button type="button" style={{ background: 'none', border: 'none', color: '#71717a', fontSize: 12, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, width: '100%' }}>
-                <span>📱</span> 휴대폰으로 로그인
-              </button>
-            </div>
-          </form>
-        </div>
-      </div>
-      <div style={{ position: 'absolute', bottom: 40, left: 40, fontSize: 12, color: 'rgba(255,255,255,0.2)', letterSpacing: '0.1em' }}>
-        © 2026 HANMAC STUDIO. ALL RIGHTS RESERVED.
-      </div>
-    </div>
-  );
-
   // ── RENDER ─────────────────────────────────────────────────────────────
-  if (!isLoggedIn && !isRenderMode) return LoginScreen;
-
   const SystemStatusModal = showSystemModal && (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.9)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(10px)' }}>
       <div style={{ width: 520, background: '#121212', borderRadius: 16, border: `1px solid ${BORDER}`, padding: 32, boxShadow: '0 25px 50px rgba(0,0,0,0.5)' }}>
@@ -4179,7 +4780,28 @@ export default function HMStudio() {
     </div>
   );
 
-  return isRenderMode ? renderOnlyStage : (
+  if (!isLoggedIn && !isRenderMode) {
+    if (showSystemModal) {
+      return (
+        <div style={{ display: "flex", flexDirection: "column", height: "100vh", width: "100vw", background: BG, color: "#e4e4e7", fontFamily: "'Inter', 'Noto Sans KR', sans-serif", fontSize: 14, overflow: "hidden", userSelect: "none" }}>
+          {SystemStatusModal}
+        </div>
+      );
+    }
+    return (
+      <LoginScreenComponent
+        loginId={loginId}
+        setLoginId={setLoginId}
+        loginPw={loginPw}
+        setLoginPw={setLoginPw}
+        isLoggingIn={isLoggingIn}
+        loginError={loginError}
+        handleLoginSubmit={handleLoginSubmit}
+      />
+    );
+  }
+
+  return (isRenderMode || isElectronRendering) ? renderOnlyStage : (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", width: "100vw", background: BG, color: "#e4e4e7", fontFamily: "'Inter', 'Noto Sans KR', sans-serif", fontSize: 14, overflow: "hidden", userSelect: "none" }}>
       {SystemStatusModal}
       {/* ── HEADER ── */}
@@ -4187,8 +4809,8 @@ export default function HMStudio() {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", height: 72, padding: "0 20px", borderBottom: `1px solid ${BORDER}`, background: "#0f0f0f", flexShrink: 0 }}>
         {/* LEFT: TOOLS */}
         <div style={{ display: "flex", alignItems: "center", gap: 16, flex: 1 }}>
-          <div style={{ display: "flex", flexDirection: "column" }}>
-            <span style={{ fontWeight: 900, fontSize: 18, color: ACCENT, letterSpacing: "-0.04em" }}>HM Studio</span>
+          <div style={{ display: "flex", alignItems: "center" }}>
+            <img src="/HMStudio_logo.png" alt="HMStudio Logo" style={{ height: 50, objectFit: 'contain', display: 'block' }} />
           </div>
           
           <div style={{ width: 1, height: 40, background: BORDER, margin: "0 8px" }} />
@@ -4250,6 +4872,40 @@ export default function HMStudio() {
                 />
               </div>
             ))}
+          </div>
+
+          {/* 총 길이 */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingLeft: 16, borderLeft: `1px solid ${BORDER}` }}>
+            <span style={{ fontSize: 13, color: '#71717a', fontWeight: 900 }}>총 길이</span>
+            <input
+              type="number"
+              value={Math.round(totalDur)}
+              min={1}
+              max={36000}
+              onChange={e => setTotalDur(Number(e.target.value) || 1)}
+              onBlur={e => {
+                const val = Number(e.target.value);
+                setTotalDur(Math.max(1, Math.min(36000, val || 1)));
+              }}
+              onFocus={e => e.target.select()}
+              style={{
+                width: 70,
+                background: '#000000',
+                border: `1px solid ${BORDER}`,
+                color: ACCENT,
+                fontSize: 16,
+                fontWeight: 800,
+                padding: '6px 8px',
+                borderRadius: 8,
+                outline: 'none',
+                textAlign: 'center',
+                fontFamily: 'monospace',
+                boxShadow: '0 4px 12px rgba(0,0,0,0.5)'
+              }}
+            />
+            <span style={{ fontSize: 13, color: '#a1a1aa', fontWeight: 800, fontFamily: 'monospace' }}>
+              초 <span style={{ color: '#52525b', fontWeight: 600 }}>({fmt(totalDur)})</span>
+            </span>
           </div>
 
           {/* Background Color */}
@@ -4319,7 +4975,7 @@ export default function HMStudio() {
         
         {/* ── ASSET PANEL (Lowest Priority) ── */}
         <div style={{ width: leftPanelWidth, borderRight: `1px solid ${BORDER}`, background: "#000000", display: "flex", flexDirection: "column", flexShrink: 0, overflow: "hidden" }}>
-          <div style={{ flex: 1, overflowY: "auto", padding: "20px 10px" }}>
+          <div className="no-scrollbar" style={{ flex: 1, overflowY: "auto", padding: "20px 10px" }}>
             {/* Video Assets */}
             <div style={{ marginBottom: 24 }}>
               <div style={{ fontSize: 16, color: ACCENT, fontWeight: 900, marginBottom: 12, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -4360,14 +5016,14 @@ export default function HMStudio() {
               <input ref={fileRef} type="file" accept="video/*,audio/*,image/*" multiple className="hidden" style={{ display: "none" }} onChange={handleFileUpload} />
             </div>
             <div style={{ height: 1, background: BORDER, margin: "8px 0" }} />
-            {/* AE Templates */}
-            <div style={{ marginBottom: 24 }}>
+            {/* AE Templates - 상단 자막 */}
+            <div style={{ marginBottom: 20 }}>
               <div style={{ fontSize: 16, color: ACCENT2, fontWeight: 900, marginBottom: 12 }}>
-                <span>🎨 자막 템플릿</span>
+                <span>🎨 상단 자막</span>
               </div>
-              <div style={{ maxHeight: 320, overflowY: "auto", marginBottom: 12, paddingRight: 4 }}>
+              <div style={{ maxHeight: 450, overflowY: "auto", marginBottom: 12, paddingRight: 4 }}>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 10 }}>
-                  {importedAE.map(t => (
+                  {importedAE.filter(t => (t.name || "").includes("상단")).map(t => (
                     <div key={t.id}
                       style={{ 
                         padding: 10, 
@@ -4392,15 +5048,52 @@ export default function HMStudio() {
                   ))}
                 </div>
               </div>
-              <button onClick={() => aeFileRef.current?.click()}
-                style={{ width: "100%", padding: "12px", borderRadius: 8, background: "transparent", border: `1px solid ${ACCENT2}88`, color: ACCENT2, fontSize: 13, fontWeight: 800, cursor: "pointer", marginTop: 8, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-                <span style={{ fontSize: 18 }}>+</span> 템플릿 불러오기
-              </button>
-              <input ref={aeFileRef} type="file" accept=".json,.aep,.png,.jpg,.jpeg,.webp" multiple style={{ display: "none" }} onChange={handleAEImport} />
             </div>
-            <div style={{ height: 1, background: BORDER, margin: "8px 0" }} />
-            {/* Render Queue moved to Export View */}
 
+            <div style={{ height: 1, background: BORDER, margin: "16px 0" }} />
+
+            {/* AE Templates - 하단 자막 */}
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ fontSize: 16, color: "#38bdf8", fontWeight: 900, marginBottom: 12 }}>
+                <span>🎨 하단 자막</span>
+              </div>
+              <div style={{ maxHeight: 450, overflowY: "auto", marginBottom: 12, paddingRight: 4 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+                  {importedAE.filter(t => !(t.name || "").includes("상단")).map(t => (
+                    <div key={t.id}
+                      style={{ 
+                        padding: 10, 
+                        borderRadius: 8, 
+                        background: "#0a121c", 
+                        border: `1px solid #38bdf855`,
+                        display: 'flex',
+                        flexDirection: 'column',
+                        minWidth: 0,
+                        width: '100%'
+                      }}>
+                      <div onClick={() => addAETemplate(t)} style={{ cursor: "pointer", display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                        <div style={{ width: "100%", aspectRatio: "16/9", background: "#000", borderRadius: 6, overflow: "hidden", marginBottom: 10, display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
+                          <TemplateThumbnail template={t} fontFamily="Pretendard, 'Noto Sans KR', sans-serif" />
+                        </div>
+                        <div style={{ fontSize: 11, color: "#fff", fontWeight: 400, width: '100%', marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'center' }}>{t.name}</div>
+                      </div>
+                      <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                        <button onClick={() => addAETemplate(t)} style={{ flex: 1, padding: "6px", background: "#38bdf8", color: "#000", border: "none", borderRadius: 6, fontSize: 11, fontWeight: 800, cursor: "pointer" }}>삽입</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* 템플릿 불러오기 버튼 - 맨 아래 고정 */}
+          <div style={{ padding: "10px 10px 20px 10px", borderTop: `1px solid ${BORDER}`, background: "#000000", flexShrink: 0, zIndex: 10 }}>
+            <button onClick={() => aeFileRef.current?.click()}
+              style={{ width: "100%", padding: "12px", borderRadius: 8, background: "transparent", border: "1px solid #3f3f46", color: "#a1a1aa", fontSize: 13, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+              <span style={{ fontSize: 18 }}>+</span> 템플릿 불러오기
+            </button>
+            <input ref={aeFileRef} type="file" accept=".json,.aep,.png,.jpg,.jpeg,.webp" multiple style={{ display: "none" }} onChange={handleAEImport} />
           </div>
         </div>
 
@@ -4466,10 +5159,9 @@ export default function HMStudio() {
                 )}
               </div>
 
-              {/* Render Range */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                <button onClick={markRenderIn} style={{ background: 'transparent', color: '#22c55e', border: `1px solid ${BORDER}`, borderRadius: 8, padding: '8px 16px', fontSize: 15, fontWeight: 700, cursor: 'pointer', transition: 'all 0.15s' }}>렌더 시작</button>
-                <button onClick={markRenderOut} style={{ background: 'transparent', color: '#f43f5e', border: `1px solid ${BORDER}`, borderRadius: 8, padding: '8px 16px', fontSize: 15, fontWeight: 700, cursor: 'pointer', transition: 'all 0.15s' }}>렌더 끝</button>
+                <button onClick={markRenderIn} style={{ background: 'transparent', color: '#22c55e', border: `1px solid ${BORDER}`, borderRadius: 8, padding: '8px 16px', fontSize: 15, fontWeight: 700, cursor: 'pointer', transition: 'all 0.15s' }}>렌더 범위(시작)</button>
+                <button onClick={markRenderOut} style={{ background: 'transparent', color: '#f43f5e', border: `1px solid ${BORDER}`, borderRadius: 8, padding: '8px 16px', fontSize: 15, fontWeight: 700, cursor: 'pointer', transition: 'all 0.15s' }}>렌더 범위(끝)</button>
                 <button onClick={clearRenderRange} style={{ background: 'transparent', color: '#71717a', border: `1px solid ${BORDER}`, borderRadius: 8, padding: '8px 16px', fontSize: 15, fontWeight: 700, cursor: 'pointer', transition: 'all 0.15s' }}>초기화</button>
               </div>
 
@@ -4489,9 +5181,14 @@ export default function HMStudio() {
           </div>
           {/* Timeline (Highest Priority) */}
           <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0, background: "#18181b" }}>
-            <div style={{ width: 220, background: "#18181b", borderRight: `1px solid ${BORDER}`, flexShrink: 0, paddingTop: 32 }}>
+            <div style={{ width: 220, background: "#18181b", borderRight: `1px solid ${BORDER}`, flexShrink: 0, paddingTop: 52, position: "relative" }}>
+              <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 52, borderBottom: `1px solid ${BORDER}`, display: "flex", flexDirection: "column", justifyContent: "center", padding: "0 8px", background: "#18181b", color: "#a1a1aa", fontSize: 10, fontWeight: 700, lineHeight: "1.4", zIndex: 20, letterSpacing: "-0.03em" }}>
+                <div style={{ whiteSpace: "nowrap" }}>타임라인을 클릭하면 재생 바가 이동합니다 →</div>
+                <div style={{ color: "#71717a", fontSize: 9.5, fontWeight: 500, whiteSpace: "nowrap" }}>(재생/정지 스페이스바)</div>
+              </div>
               {timelineLayers.map((layer, idx) => {
-                const labelColor = layer.__type === 'video' ? ACCENT : layer.__type === 'audio' ? '#38bdf8' : ACCENT2;
+                const isBottomSub = layer.__kind === 'graphic' && !(layer.sourceName || layer.compName || "").includes("상단");
+                const labelColor = layer.__kind === 'clip' ? ACCENT : (isBottomSub ? '#38bdf8' : ACCENT2);
                 const labelIcon = layer.__type === 'video' ? 'V' : layer.__type === 'audio' ? 'A' : 'G';
                 const isExpanded = expandedLayers.has(layer.id);
                 return (
@@ -4521,8 +5218,25 @@ export default function HMStudio() {
             <div style={{ flex: 1, overflowX: "auto", overflowY: "auto", position: "relative", background: "#18181b" }}>
               <div
                 style={{ position: "relative", minWidth: "100%", width: `${Math.max(600, totalDur * 20 * zoom + 200)}px`, cursor: tool === "razor" ? "crosshair" : "default" }}
-                onClick={handleTimelineClick}>
-                <div style={{ height: 32, background: "#18181b", borderBottom: `1px solid ${BORDER}`, position: "sticky", top: 0, zIndex: 10, display: "flex", alignItems: "flex-end" }}>
+                onClick={handleTimelineClick}
+                onMouseDown={e => {
+                  if (e.button !== 0 || tool !== "select" || e.shiftKey) return;
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setKeyframeSelectBox({ rect, x1: e.clientX - rect.left, y1: e.clientY - rect.top, x2: e.clientX - rect.left, y2: e.clientY - rect.top });
+                }}>
+                <div
+                  onMouseDown={e => {
+                    if (e.button !== 0) return;
+                    e.stopPropagation();
+                    const rect = e.currentTarget.parentElement?.getBoundingClientRect();
+                    if (!rect) return;
+                    const nextTime = clamp((e.clientX - rect.left) / (20 * zoom), 0, totalDur || 1);
+                    setPlaying(false);
+                    setTime(nextTime);
+                    setPlayheadDrag(true);
+                    setDragStart({ x: e.clientX, y: e.clientY, ts: nextTime, dur: 0, rowIndex: 0, kind: 'playhead' });
+                  }}
+                  style={{ height: 52, background: "#18181b", borderBottom: `1px solid ${BORDER}`, position: "sticky", top: 0, zIndex: 10, display: "flex", alignItems: "flex-end", cursor: "ew-resize" }}>
                   {Array.from({ length: Math.ceil(totalDur / 1) + 5 }).map((_, i) => (
                     <div key={i} style={{ position: "absolute", left: i * 20 * zoom, fontSize: 11, color: "#52525b", paddingBottom: 4, pointerEvents: "none", whiteSpace: "nowrap", fontWeight: 600 }}>
                       {i % Math.max(1, Math.round(5 / zoom)) === 0 ? fmt(i) : ""}
@@ -4530,46 +5244,124 @@ export default function HMStudio() {
                     </div>
                   ))}
                 </div>
-                <div style={{ position: 'absolute', top: 32, bottom: 0, left: renderIn * 20 * zoom, width: Math.max(2, (Math.max(renderIn, renderOut == null ? totalDur : renderOut) - renderIn) * 20 * zoom), background: 'rgba(34,197,94,0.08)', boxShadow: 'inset 0 0 0 1px rgba(34,197,94,0.18)', pointerEvents: 'none' }} />
-                <div style={{ position: 'absolute', top: 32, bottom: 0, left: renderIn * 20 * zoom, width: 2, background: '#22c55e', zIndex: 110, pointerEvents: 'none' }}>
-                  <div style={{ position: 'absolute', top: -14, left: -4, width: 0, height: 0, borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderTop: '10px solid #22c55e' }} />
-                  <div style={{ position: 'absolute', top: -32, left: -14, background: '#22c55e', color: '#000', fontSize: 11, fontWeight: 900, padding: '3px 6px', borderRadius: 4 }}>IN</div>
+                <div style={{ position: 'absolute', top: 52, bottom: 0, left: renderIn * 20 * zoom, width: Math.max(2, (Math.max(renderIn, renderOut == null ? totalDur : renderOut) - renderIn) * 20 * zoom), background: 'rgba(34,197,94,0.08)', boxShadow: 'inset 0 0 0 1px rgba(34,197,94,0.18)', pointerEvents: 'none' }} />
+                {keyframeSelectBox && (
+                  <div style={{
+                    position: 'absolute',
+                    left: Math.min(keyframeSelectBox.x1, keyframeSelectBox.x2),
+                    top: Math.min(keyframeSelectBox.y1, keyframeSelectBox.y2),
+                    width: Math.abs(keyframeSelectBox.x2 - keyframeSelectBox.x1),
+                    height: Math.abs(keyframeSelectBox.y2 - keyframeSelectBox.y1),
+                    background: 'rgba(56,189,248,0.14)',
+                    border: '1px solid rgba(56,189,248,0.8)',
+                    pointerEvents: 'none',
+                    zIndex: 200
+                  }} />
+                )}
+                <div 
+                  onMouseDown={e => {
+                    if (e.button !== 0) return;
+                    e.stopPropagation();
+                    e.preventDefault();
+                    suppressTimelineClickRef.current = true;
+                    snap();
+                    setMarkerDrag('in');
+                    setDragStart({ x: e.clientX, y: e.clientY, ts: renderIn, dur: 0, rowIndex: 0, kind: 'marker' });
+                  }}
+                  style={{ position: 'absolute', top: 0, height: 52, left: renderIn * 20 * zoom, width: 28, transform: 'translateX(-50%)', background: 'transparent', zIndex: 110, cursor: 'ew-resize' }}
+                >
+                  <div style={{ position: 'absolute', top: 52, left: '50%', transform: 'translateX(-50%)', width: 2, height: 9999, background: '#22c55e', pointerEvents: 'none' }} />
+                  <div style={{ position: 'absolute', top: 38, left: '50%', transform: 'translateX(-50%)', width: 0, height: 0, borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderTop: '10px solid #22c55e', pointerEvents: 'none' }} />
+                  <div style={{ position: 'absolute', top: 4, left: '50%', transform: 'translateX(-50%)', background: '#22c55e', color: '#000', fontSize: 11, fontWeight: 900, padding: '3px 6px', borderRadius: 4, pointerEvents: 'none', whiteSpace: 'nowrap' }}>시작</div>
                 </div>
-                <div style={{ position: 'absolute', top: 32, bottom: 0, left: (renderOut == null ? totalDur : renderOut) * 20 * zoom, width: 2, background: '#f43f5e', zIndex: 110, pointerEvents: 'none' }}>
-                  <div style={{ position: 'absolute', top: -14, left: -4, width: 0, height: 0, borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderTop: '10px solid #f43f5e' }} />
-                  <div style={{ position: 'absolute', top: -32, left: -18, background: '#f43f5e', color: '#fff', fontSize: 11, fontWeight: 900, padding: '3px 6px', borderRadius: 4 }}>OUT</div>
+                <div 
+                  onMouseDown={e => {
+                    if (e.button !== 0) return;
+                    e.stopPropagation();
+                    e.preventDefault();
+                    suppressTimelineClickRef.current = true;
+                    snap();
+                    setMarkerDrag('out');
+                    setDragStart({ x: e.clientX, y: e.clientY, ts: renderOut == null ? totalDur : renderOut, dur: 0, rowIndex: 0, kind: 'marker' });
+                  }}
+                  style={{ position: 'absolute', top: 0, height: 52, left: (renderOut == null ? totalDur : renderOut) * 20 * zoom, width: 28, transform: 'translateX(-50%)', background: 'transparent', zIndex: 110, cursor: 'ew-resize' }}
+                >
+                  <div style={{ position: 'absolute', top: 52, left: '50%', transform: 'translateX(-50%)', width: 2, height: 9999, background: '#f43f5e', pointerEvents: 'none' }} />
+                  <div style={{ position: 'absolute', top: 38, left: '50%', transform: 'translateX(-50%)', width: 0, height: 0, borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderTop: '10px solid #f43f5e', pointerEvents: 'none' }} />
+                  <div style={{ position: 'absolute', top: 4, left: '50%', transform: 'translateX(-50%)', background: '#f43f5e', color: '#fff', fontSize: 11, fontWeight: 900, padding: '3px 6px', borderRadius: 4, pointerEvents: 'none', whiteSpace: 'nowrap' }}>끝</div>
                 </div>
-                <div style={{ position: "absolute", top: 0, bottom: 0, left: time * 20 * zoom, width: 2, background: ACCENT, zIndex: 50, pointerEvents: "none" }}>
-                  <div style={{ width: 14, height: 14, background: ACCENT, position: "absolute", top: 32, left: -6, transform: "rotate(45deg)" }} />
+                <div
+                  onMouseDown={e => {
+                    e.stopPropagation();
+                    setPlaying(false);
+                    setPlayheadDrag(true);
+                    setDragStart({ x: e.clientX, y: e.clientY, ts: time, dur: 0, rowIndex: 0, kind: 'playhead' });
+                  }}
+                  style={{ position: "absolute", top: 0, height: 52, left: time * 20 * zoom, width: 14, transform: "translateX(-50%)", background: `linear-gradient(90deg, transparent 0 6px, ${ACCENT} 6px 8px, transparent 8px)`, zIndex: 50, cursor: "ew-resize" }}
+                >
+                  <div style={{ position: "absolute", top: 52, left: "50%", transform: "translateX(-50%)", width: 2, height: 9999, background: ACCENT, pointerEvents: "none" }} />
+                  <div style={{ 
+                    position: "absolute", 
+                    top: 2, 
+                    left: "50%", 
+                    transform: "translateX(-50%)", 
+                    color: ACCENT, 
+                    fontSize: 15, 
+                    fontWeight: "bold",
+                    lineHeight: 1,
+                    textShadow: "0 1px 2px rgba(0,0,0,0.6)"
+                  }}>
+                    ▼
+                  </div>
                 </div>
                 {timelineLayers.map((layer, rowIdx) => {
+                  const isBottomSub = layer.__kind === 'graphic' && !(layer.sourceName || layer.compName || "").includes("상단");
                   const isExpanded = expandedLayers.has(layer.id);
                   const rowHeight = isExpanded ? 72 + 8 + (24 * 5) : 72;
-                  const commonStyle = { position: 'absolute', top: 6, height: 60, left: layer.ts * 20 * zoom, width: Math.max(4, layer.dur * 20 * zoom), borderRadius: 6, cursor: tool === 'razor' && layer.__kind === 'clip' ? 'crosshair' : 'move', overflow: 'hidden', boxSizing: 'border-box' };
+                  const timelineItemKey = `${layer.__kind}:${layer.id}`;
+                  const isTimelineSelected = selectedTimelineItems.has(timelineItemKey) || (layer.__kind === 'clip' ? selClipId === layer.id : selGfxId === layer.id);
+                  const commonStyle = { position: 'absolute', top: 6, height: 60, left: layer.ts * 20 * zoom, width: Math.max(4, layer.dur * 20 * zoom), borderRadius: 6, cursor: tool === 'razor' ? 'crosshair' : 'move', overflow: 'hidden', boxSizing: 'border-box' };
                   return (
                     <div key={layer.id + '-row'} style={{ position: 'relative', height: rowHeight, background: rowIdx % 2 ? '#1c1c1f' : '#18181b', borderBottom: `1px solid ${BORDER}` }}>
                       <div
                         style={{ 
                           ...commonStyle, 
-                          background: layer.__type === 'audio' 
-                            ? (selClipId === layer.id ? '#0a121a' : '#0a1018') 
-                            : layer.__type === 'video' 
-                              ? (selClipId === layer.id ? '#1a1010' : '#181818') 
-                              : (selGfxId === layer.id ? '#0f1a10' : '#0a1208'), 
+                          transform: timelineDrag === layer.id ? `translateY(${timelineDragOffset}px)` : 'none',
+                          zIndex: timelineDrag === layer.id ? 100 : 1,
+                          boxShadow: timelineDrag === layer.id ? '0 12px 30px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.1)' : 'none',
+                          opacity: timelineDrag === layer.id ? 0.85 : 1,
+                          background: layer.__kind === 'clip'
+                            ? (isTimelineSelected ? '#211204' : '#140c03')
+                            : isBottomSub
+                              ? (isTimelineSelected ? '#0a121c' : '#060b12')
+                              : (isTimelineSelected ? '#0f1a10' : '#0a1208'), 
                           border: `2px solid ${
-                            layer.__type === 'audio' 
-                              ? (selClipId === layer.id ? '#38bdf8' : '#1e3a5f') 
-                              : layer.__type === 'video' 
-                                ? (selClipId === layer.id ? ACCENT : '#3f3f46') 
-                                : (selGfxId === layer.id ? ACCENT2 : ACCENT2 + '44')
+                            layer.__kind === 'clip'
+                              ? (isTimelineSelected ? ACCENT : ACCENT + '44')
+                              : isBottomSub
+                                ? (isTimelineSelected ? '#38bdf8' : '#38bdf844')
+                                : (isTimelineSelected ? ACCENT2 : ACCENT2 + '44')
                           }` 
                         }}
                         onMouseDown={e => {
                           e.stopPropagation();
+                          if (e.shiftKey) {
+                            setSelectedTimelineItems(prev => {
+                              const next = new Set(prev);
+                              if (next.has(timelineItemKey)) next.delete(timelineItemKey);
+                              else next.add(timelineItemKey);
+                              return next;
+                            });
+                            if (layer.__kind === 'clip') { setSelClipId(layer.id); setSelGfxId(null); }
+                            else { setSelGfxId(layer.id); setSelClipId(null); }
+                            return;
+                          }
+                          setSelectedTimelineItems(new Set([timelineItemKey]));
                           if (layer.__kind === 'clip') {
                             if (tool === 'razor') { handleSplit(layer.id); return; }
                             snap(); setSelClipId(layer.id); setSelGfxId(null); setTimelineDrag(layer.id); setDragStart({ x: e.clientX, y: e.clientY, ts: layer.ts, dur: layer.dur, rowIndex: rowIdx, kind: 'clip' });
                           } else {
+                            if (tool === 'razor') { handleGraphicSplit(layer.id); return; }
                             snap(); setSelGfxId(layer.id); setSelClipId(null); setTimelineDrag(layer.id); setDragStart({ x: e.clientX, y: e.clientY, ts: layer.ts, dur: layer.dur, rowIndex: rowIdx, kind: 'graphic' });
                           }
                         }}>
@@ -4605,7 +5397,7 @@ export default function HMStudio() {
                         </div>
                         </>
                         )}
-                        <div style={{ padding: '2px 10px', fontSize: 11, color: layer.__type === 'audio' ? '#38bdf8' : layer.__kind === 'clip' ? '#e4e4e7' : ACCENT2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', lineHeight: '56px', display: 'flex', alignItems: 'center', gap: 6, height: '100%', position: 'relative', zIndex: 1, paddingLeft: layer.__kind === 'clip' && layer.__type === 'video' ? 90 : 10, textShadow: '0 1px 2px rgba(0,0,0,0.8)' }}>
+                        <div style={{ padding: '2px 10px', fontSize: 11, color: layer.__kind === 'clip' ? ACCENT : (isBottomSub ? '#38bdf8' : ACCENT2), whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', lineHeight: '56px', display: 'flex', alignItems: 'center', gap: 6, height: '100%', position: 'relative', zIndex: 1, paddingLeft: layer.__kind === 'clip' && layer.__type === 'video' ? 90 : 10, textShadow: '0 1px 2px rgba(0,0,0,0.8)' }}>
                           <span style={{ fontSize: 10 }}>{layer.__type === 'video' ? '🎥' : layer.__type === 'audio' ? '🔊' : (layer.type === 'ae_template' ? '🎨' : layer.type === 'text' ? 'T' : '■')}</span>
                           <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: 600 }}>{layer.__label}</span>
                         </div>
@@ -4614,7 +5406,7 @@ export default function HMStudio() {
                           { (layer.__type === 'audio' || layer.__type === 'video' || layer.type === 'video' || layer.type === 'audio') && layer.url ? (
                             <DetailedWaveform 
                               url={layer.url} 
-                              color={(layer.__type === 'audio' || layer.type === 'audio') ? '#38bdf8' : ACCENT} 
+                              color={layer.__kind === 'clip' ? ACCENT : (isBottomSub ? '#38bdf8' : ACCENT2)} 
                               opacity={0.8}
                             />
                           ) : (
@@ -4633,15 +5425,19 @@ export default function HMStudio() {
                       
                       {collectAllKeyframes(layer).map((kf, i) => {
                         const kt = kf.t;
+                        const displayKt = kt - (layer.startT || 0);
+                        if (displayKt < -0.001 || displayKt > layer.dur + 0.001) return null;
                         const propConf = KF_PROP_CONFIG[kf.prop];
                         if (!propConf) return null;
-                        const isSelected = Math.abs(time - (layer.ts + kt)) < 0.001;
+                        const keyframeKey = `${layer.__kind}:${layer.id}:${kf.prop}:${Number(kt).toFixed(3)}`;
+                        const isSelected = selectedKeyframes.has(keyframeKey) || Math.abs(time - (layer.ts + displayKt)) < 0.001;
                         const isEase = kf.easing === 'ease';
                         const isPopupActive = activeKeyframePopup?.layerId === layer.id && Math.abs(activeKeyframePopup.time - kt) < 0.001 && activeKeyframePopup.prop === kf.prop;
                         
                         const handleKeyframeClick = (e: any) => {
                           e.stopPropagation();
-                          setTime(layer.ts + kt);
+                          setTime(layer.ts + displayKt);
+                          setSelectedKeyframes(new Set([keyframeKey]));
                           if (isPopupActive) setActiveKeyframePopup(null);
                           else setActiveKeyframePopup({ layerId: layer.id, time: kt, prop: kf.prop });
                         };
@@ -4649,7 +5445,7 @@ export default function HMStudio() {
                         const yPosStyle = isExpanded ? { top: 72 + 8 + propConf.index * 24 + 3 } : { bottom: 3 };
                         
                         return (
-                          <div key={`${kf.prop}-${i}`} style={{ position: 'absolute', left: (layer.ts + kt) * 20 * zoom - 9, ...yPosStyle, zIndex: 10 + i }}>
+                          <div key={`${kf.prop}-${i}`} style={{ position: 'absolute', left: (layer.ts + displayKt) * 20 * zoom - 9, ...yPosStyle, zIndex: 10 + i }}>
                             {isPopupActive && (
                               <div data-keyframe-popup="true" style={{ position: 'absolute', bottom: 22, left: '50%', transform: 'translateX(-50%)', background: '#27272a', padding: '8px', borderRadius: 8, display: 'flex', flexDirection: 'column', gap: 6, boxShadow: '0 4px 12px rgba(0,0,0,0.8)', zIndex: 100, whiteSpace: 'nowrap', border: `1px solid ${ACCENT}` }}>
                                 <div style={{ fontSize: 13, fontWeight: 800, color: ACCENT, textAlign: 'center', borderBottom: '1px solid #3f3f46', paddingBottom: 4, marginBottom: 2 }}>{propConf.label}</div>
@@ -4674,7 +5470,7 @@ export default function HMStudio() {
                                    onMouseEnter={e => e.currentTarget.style.background = 'rgba(239,68,68,0.4)'}
                                    onMouseLeave={e => e.currentTarget.style.background = 'rgba(239,68,68,0.2)'}
                                 >
-                                  🗑️ 키프레임 삭제
+                                  🗑️ 애니메이션 키 삭제
                                 </button>
                               </div>
                             )}
@@ -4718,24 +5514,37 @@ export default function HMStudio() {
 
         {/* ── RIGHT PANEL: EFFECT CONTROLS (2nd Priority) ── */}
         <div style={{ width: rightPanelWidth, borderLeft: `1px solid ${BORDER}`, background: "#09090b", display: "flex", flexDirection: "column", flexShrink: 0, overflow: "hidden" }}>
-          <div style={{ padding: "14px 16px 10px", borderBottom: `1px solid ${BORDER}` }}>
-            <div style={{ fontSize: 12, fontWeight: 800, color: "#52525b", textTransform: "uppercase", letterSpacing: "0.1em" }}>효과 컨트롤</div>
-          </div>
           <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
             {selGfx ? (
               <>
-                <div style={{ fontSize: 13, fontWeight: 800, color: selGfx.type === "ae_template" ? ACCENT2 : ACCENT, marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontSize: 16 }}>{selGfx.type === "ae_template" ? "🎨" : selGfx.type === "text" ? "T" : "■"}</span>
-                  <span>{selGfx.type === "ae_template" ? "템플릿" : selGfx.type === "text" ? "텍스트" : "도형"}</span>
-                </div>
+                {(() => {
+                  const isBottom = selGfx.type === "ae_template" && !(selGfx.sourceName || selGfx.compName || "").includes("상단");
+                  const headerColor = selGfx.type === "ae_template" ? (isBottom ? '#38bdf8' : ACCENT2) : ACCENT;
+                  const headerText = selGfx.type === "ae_template" 
+                    ? (() => {
+                        const name1 = (selGfx.compName || "").trim();
+                        const name2 = (selGfx.sourceName || selGfx.name || "").trim();
+                        const combined = (name1 && name2 && name1 === name2) 
+                          ? name1 
+                          : (name1 && name2) 
+                            ? `${name1} - ${name2}` 
+                            : (name1 || name2);
+                        const templateTypeStr = isBottom ? "하단 자막템플릿" : "상단 자막템플릿";
+                        return `${templateTypeStr} (${combined})`;
+                      })()
+                    : selGfx.type === "text" ? "텍스트" : "도형";
+
+                  return (
+                    <div style={{ fontSize: 13, fontWeight: 800, color: headerColor, marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 16 }}>{selGfx.type === "ae_template" ? "🎨" : selGfx.type === "text" ? "T" : "■"}</span>
+                      <span>{headerText}</span>
+                    </div>
+                  );
+                })()}
                 {/* AE Template fields */}
                 {selGfx.type === "ae_template" && (
                   <div style={{ marginBottom: 16 }}>
-                    <div style={{ fontSize: 12, color: "#52525b", fontWeight: 800, textTransform: "uppercase", marginBottom: 8 }}>템플릿 정보</div>
-                    <div style={{ fontSize: 13, color: "#a1a1aa", marginBottom: 12, padding: "10px 12px", background: "#0a1a0a", borderRadius: 6, border: `1px solid ${ACCENT2}22` }}>
-                      {selGfx.compName}
-                    </div>
-                    <div style={{ fontSize: 12, color: "#52525b", fontWeight: 800, textTransform: "uppercase", margin: "16px 0 10px" }}>텍스트 필드</div>
+                    <div style={{ fontSize: 12, color: "#52525b", fontWeight: 800, textTransform: "uppercase", margin: "0 0 10px" }}>텍스트 필드</div>
                     {(selGfx.fields || []).length > 0 ? (selGfx.fields || []).slice().sort((a, b) => {
                       const aMain = /Main/i.test(a.label || "");
                       const bMain = /Main/i.test(b.label || "");
@@ -4748,7 +5557,13 @@ export default function HMStudio() {
                       return (
                         <div key={f.id} style={{ marginBottom: 12, padding: 8, background: "#0f1115", border: `1px solid ${BORDER}`, borderRadius: 6 }}>
                           <div style={{ marginBottom: 6 }}>
-                            <div style={{ fontSize: 11, color: ACCENT2, fontWeight: 700 }}>{f.label || `텍스트 ${idx + 1}`}</div>
+                            <div style={{ fontSize: 11, color: ACCENT2, fontWeight: 700 }}>
+                              {/Main_Text/i.test(f.label || "") 
+                                ? "메인 문구" 
+                                : /Sub_Text/i.test(f.label || "") 
+                                  ? "서브 문구" 
+                                  : (f.label || `텍스트 ${idx + 1}`)}
+                            </div>
                           </div>
                           {!internalMode && <div style={{ fontSize: 9, color: "#f59e0b", marginBottom: 6 }}>현재 JSON 글리프로는 이 문자를 못 그려서 웹폰트 오버레이로 표시합니다.</div>}
                           <input type="text" value={f.value} 
@@ -4796,14 +5611,18 @@ export default function HMStudio() {
                               <option value="right">오른쪽 정렬</option>
                             </select>
                           </div>
-                          <div style={{ display: "grid", gridTemplateColumns: "1fr 70px 1fr", gap: 6, marginBottom: internalMode ? 0 : 6 }}>
+                          <div style={{ display: "grid", gridTemplateColumns: "1fr 70px 1fr", gap: 6, marginBottom: 6 }}>
                             <input type="color" value={f.strokeColor || "#0a4a4d"} onChange={e => { updateFieldProps(selGfx.id, f.id, { strokeColor: e.target.value }); snap(); }} style={{ width: "100%", height: 32, background: "#27272a", border: "1px solid #52525b", borderRadius: 6, outline: "none", cursor: "pointer" }} />
                             <ScrubbableNumberInput value={Number(f.strokeWidth || 0)} min={0} max={60} step={1} onChange={v => updateFieldProps(selGfx.id, f.id, { strokeWidth: v })} onCommit={snap} style={{ background: "#27272a", border: "1px solid #52525b", borderRadius: 6, color: "#ffffff", fontSize: 13, height: 32, width: 70 }} />
                             <select value={f.strokeMode || "outside"} onChange={e => { updateFieldProps(selGfx.id, f.id, { strokeMode: e.target.value }); snap(); }} style={{ background: "#27272a", border: "1px solid #52525b", color: "#ffffff", fontSize: 13, padding: "6px 8px", borderRadius: 6, outline: "none" }}>
-                              <option value="outside">바깥 느낌 획</option>
+                              <option value="outside">바깥 획</option>
                               <option value="center">기본 획</option>
                               {!internalMode && <option value="inside">안쪽 획</option>}
                             </select>
+                          </div>
+                          <div style={{ display: "grid", gridTemplateColumns: "1fr 50px", gap: 6, marginBottom: internalMode ? 0 : 6 }}>
+                            <input type="text" value={f.highlightText || ""} onChange={e => updateFieldProps(selGfx.id, f.id, { highlightText: e.target.value })} onBlur={snap} placeholder="↑ 위의 텍스트에서 강조하고 싶은 부분을 복사/붙여넣기 하세요" style={{ background: "#18181b", border: `1px solid ${BORDER}`, borderRadius: 6, color: "#fff", padding: "6px 8px", fontSize: 12, outline: "none" }} />
+                            <input type="color" value={f.highlightColor || "#ffea00"} onChange={e => { updateFieldProps(selGfx.id, f.id, { highlightColor: e.target.value }); snap(); }} style={{ width: "100%", height: 32, background: "#27272a", border: "1px solid #52525b", borderRadius: 6, outline: "none", cursor: "pointer" }} />
                           </div>
                           {!internalMode && (
                             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6 }}>
@@ -4895,19 +5714,116 @@ export default function HMStudio() {
                 )}
                 {/* Transform */}
                 <div>
+                  {/* Alignment Controls */}
+                  <div style={{ marginBottom: 20 }}>
+                    <div style={{ fontSize: 14, color: "#e4e4e7", fontWeight: 800, textTransform: "uppercase", marginBottom: 12 }}>정렬</div>
+                    
+                    {/* Horizontal */}
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, background: "rgba(255,255,255,0.02)", padding: "8px 12px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.04)" }}>
+                      <span style={{ fontSize: 12, color: "#a1a1aa", fontWeight: 700 }}>가로 정렬</span>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        <button 
+                          onClick={() => handleAlign('horizontal', 'left')}
+                          title="왼쪽 정렬" 
+                          style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#e4e4e7", width: 28, height: 28, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.1s" }}
+                          onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.15)"}
+                          onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                            <rect x="2" y="2" width="2" height="12" rx="0.5"/>
+                            <rect x="6" y="4" width="8" height="3" rx="1"/>
+                            <rect x="6" y="9" width="5" height="3" rx="1"/>
+                          </svg>
+                        </button>
+                        <button 
+                          onClick={() => handleAlign('horizontal', 'center')}
+                          title="가운데 정렬" 
+                          style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#e4e4e7", width: 28, height: 28, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.1s" }}
+                          onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.15)"}
+                          onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                            <rect x="7" y="2" width="2" height="12" rx="0.5"/>
+                            <rect x="3" y="4" width="10" height="3" rx="1"/>
+                            <rect x="5" y="9" width="6" height="3" rx="1"/>
+                          </svg>
+                        </button>
+                        <button 
+                          onClick={() => handleAlign('horizontal', 'right')}
+                          title="오른쪽 정렬" 
+                          style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#e4e4e7", width: 28, height: 28, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.1s" }}
+                          onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.15)"}
+                          onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                            <rect x="12" y="2" width="2" height="12" rx="0.5"/>
+                            <rect x="2" y="4" width="8" height="3" rx="1"/>
+                            <rect x="5" y="9" width="5" height="3" rx="1"/>
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Vertical */}
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "rgba(255,255,255,0.02)", padding: "8px 12px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.04)" }}>
+                      <span style={{ fontSize: 12, color: "#a1a1aa", fontWeight: 700 }}>세로 정렬</span>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        <button 
+                          onClick={() => handleAlign('vertical', 'top')}
+                          title="위쪽 정렬" 
+                          style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#e4e4e7", width: 28, height: 28, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.1s" }}
+                          onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.15)"}
+                          onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                            <rect x="2" y="2" width="12" height="2" rx="0.5"/>
+                            <rect x="4" y="6" width="3" height="8" rx="1"/>
+                            <rect x="9" y="6" width="3" height="5" rx="1"/>
+                          </svg>
+                        </button>
+                        <button 
+                          onClick={() => handleAlign('vertical', 'center')}
+                          title="가운데 정렬" 
+                          style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#e4e4e7", width: 28, height: 28, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.1s" }}
+                          onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.15)"}
+                          onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                            <rect x="2" y="7" width="12" height="2" rx="0.5"/>
+                            <rect x="4" y="3" width="3" height="10" rx="1"/>
+                            <rect x="9" y="5" width="3" height="6" rx="1"/>
+                          </svg>
+                        </button>
+                        <button 
+                          onClick={() => handleAlign('vertical', 'bottom')}
+                          title="아래쪽 정렬" 
+                          style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#e4e4e7", width: 28, height: 28, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.1s" }}
+                          onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.15)"}
+                          onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                            <rect x="2" y="12" width="12" height="2" rx="0.5"/>
+                            <rect x="4" y="2" width="3" height="8" rx="1"/>
+                            <rect x="9" y="5" width="3" height="5" rx="1"/>
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
                   <div style={{ fontSize: 15, color: "#e4e4e7", fontWeight: 800, textTransform: "uppercase", marginBottom: 16, marginTop: 4 }}>변형</div>
-                  <AnimPropRow label="위치 X" value={Math.round(selGfx.x * 10) / 10} min={0} max={100} step={0.1} unit="%"
+                  <AnimPropRow label="위치 X" value={Math.round((selGfx.x / 100) * comp.w)} min={-comp.w} max={comp.w * 2} step={1} unit="px"
                     keyframed={hasKeyframeAt(selGfx, "x", clamp(time - selGfx.ts, 0, selGfx.dur))}
                     onToggleKeyframe={() => toggleGraphicKeyframe(selGfx, "x")}
                     onPrevKeyframe={() => jumpToKeyframe(selGfx, "x", "prev")}
                     onNextKeyframe={() => jumpToKeyframe(selGfx, "x", "next")}
-                    onChange={v => updateGfx(selGfx.id, { x: v })} onCommit={snap} />
-                  <AnimPropRow label="위치 Y" value={Math.round(selGfx.y * 10) / 10} min={0} max={100} step={0.1} unit="%"
+                    onChange={v => updateGfx(selGfx.id, { x: (v / comp.w) * 100 })} onCommit={snap} />
+                  <AnimPropRow label="위치 Y" value={Math.round((selGfx.y / 100) * comp.h)} min={-comp.h} max={comp.h * 2} step={1} unit="px"
                     keyframed={hasKeyframeAt(selGfx, "y", clamp(time - selGfx.ts, 0, selGfx.dur))}
                     onToggleKeyframe={() => toggleGraphicKeyframe(selGfx, "y")}
                     onPrevKeyframe={() => jumpToKeyframe(selGfx, "y", "prev")}
                     onNextKeyframe={() => jumpToKeyframe(selGfx, "y", "next")}
-                    onChange={v => updateGfx(selGfx.id, { y: v })} onCommit={snap} />
+                    onChange={v => updateGfx(selGfx.id, { y: (v / comp.h) * 100 })} onCommit={snap} />
                   <AnimPropRow label="비율" value={Math.round(selGfx.scale)} min={10} max={500} step={1} unit="%"
                     keyframed={hasKeyframeAt(selGfx, "scale", clamp(time - selGfx.ts, 0, selGfx.dur))}
                     onToggleKeyframe={() => toggleGraphicKeyframe(selGfx, "scale")}
@@ -4931,19 +5847,115 @@ export default function HMStudio() {
             ) : selClip ? (
               <>
                 <div style={{ fontSize: 14, fontWeight: 700, color: ACCENT, marginBottom: 12 }}>🎬 {selClip.name}</div>
+                {/* Alignment Controls */}
+                <div style={{ marginBottom: 20 }}>
+                  <div style={{ fontSize: 14, color: "#e4e4e7", fontWeight: 800, textTransform: "uppercase", marginBottom: 12 }}>정렬</div>
+                  
+                  {/* Horizontal */}
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, background: "rgba(255,255,255,0.02)", padding: "8px 12px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.04)" }}>
+                    <span style={{ fontSize: 12, color: "#a1a1aa", fontWeight: 700 }}>가로 정렬</span>
+                    <div style={{ display: "flex", gap: 4 }}>
+                      <button 
+                        onClick={() => handleAlign('horizontal', 'left')}
+                        title="왼쪽 정렬" 
+                        style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#e4e4e7", width: 28, height: 28, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.1s" }}
+                        onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.15)"}
+                        onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                          <rect x="2" y="2" width="2" height="12" rx="0.5"/>
+                          <rect x="6" y="4" width="8" height="3" rx="1"/>
+                          <rect x="6" y="9" width="5" height="3" rx="1"/>
+                        </svg>
+                      </button>
+                      <button 
+                        onClick={() => handleAlign('horizontal', 'center')}
+                        title="가운데 정렬" 
+                        style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#e4e4e7", width: 28, height: 28, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.1s" }}
+                        onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.15)"}
+                        onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                          <rect x="7" y="2" width="2" height="12" rx="0.5"/>
+                          <rect x="3" y="4" width="10" height="3" rx="1"/>
+                          <rect x="5" y="9" width="6" height="3" rx="1"/>
+                        </svg>
+                      </button>
+                      <button 
+                        onClick={() => handleAlign('horizontal', 'right')}
+                        title="오른쪽 정렬" 
+                        style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#e4e4e7", width: 28, height: 28, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.1s" }}
+                        onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.15)"}
+                        onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                          <rect x="12" y="2" width="2" height="12" rx="0.5"/>
+                          <rect x="2" y="4" width="8" height="3" rx="1"/>
+                          <rect x="5" y="9" width="5" height="3" rx="1"/>
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Vertical */}
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "rgba(255,255,255,0.02)", padding: "8px 12px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.04)" }}>
+                    <span style={{ fontSize: 12, color: "#a1a1aa", fontWeight: 700 }}>세로 정렬</span>
+                    <div style={{ display: "flex", gap: 4 }}>
+                      <button 
+                        onClick={() => handleAlign('vertical', 'top')}
+                        title="위쪽 정렬" 
+                        style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#e4e4e7", width: 28, height: 28, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.1s" }}
+                        onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.15)"}
+                        onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                          <rect x="2" y="2" width="12" height="2" rx="0.5"/>
+                          <rect x="4" y="6" width="3" height="8" rx="1"/>
+                          <rect x="9" y="6" width="3" height="5" rx="1"/>
+                        </svg>
+                      </button>
+                      <button 
+                        onClick={() => handleAlign('vertical', 'center')}
+                        title="가운데 정렬" 
+                        style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#e4e4e7", width: 28, height: 28, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.1s" }}
+                        onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.15)"}
+                        onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                          <rect x="2" y="7" width="12" height="2" rx="0.5"/>
+                          <rect x="4" y="3" width="3" height="10" rx="1"/>
+                          <rect x="9" y="5" width="3" height="6" rx="1"/>
+                        </svg>
+                      </button>
+                      <button 
+                        onClick={() => handleAlign('vertical', 'bottom')}
+                        title="아래쪽 정렬" 
+                        style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#e4e4e7", width: 28, height: 28, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.1s" }}
+                        onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.15)"}
+                        onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                          <rect x="2" y="12" width="12" height="2" rx="0.5"/>
+                          <rect x="4" y="2" width="3" height="8" rx="1"/>
+                          <rect x="9" y="5" width="3" height="5" rx="1"/>
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                </div>
                 <div style={{ fontSize: 15, color: "#e4e4e7", fontWeight: 800, textTransform: "uppercase", marginBottom: 16 }}>변형</div>
-                <AnimPropRow label="위치 X" value={Math.round(selClip.x * 10) / 10} min={0} max={100} step={0.1} unit="%"
+                <AnimPropRow label="위치 X" value={Math.round((selClip.x / 100) * comp.w)} min={-comp.w} max={comp.w * 2} step={1} unit="px"
                   keyframed={hasKeyframeAt(selClip, "x", clamp(time - selClip.ts, 0, selClip.dur))}
                   onToggleKeyframe={() => toggleClipKeyframe(selClip, "x")}
                   onPrevKeyframe={() => jumpToKeyframe(selClip, "x", "prev")}
                   onNextKeyframe={() => jumpToKeyframe(selClip, "x", "next")}
-                  onChange={v => updateClip(selClip.id, { x: v })} onCommit={snap} />
-                <AnimPropRow label="위치 Y" value={Math.round(selClip.y * 10) / 10} min={0} max={100} step={0.1} unit="%"
+                  onChange={v => updateClip(selClip.id, { x: (v / comp.w) * 100 })} onCommit={snap} />
+                <AnimPropRow label="위치 Y" value={Math.round((selClip.y / 100) * comp.h)} min={-comp.h} max={comp.h * 2} step={1} unit="px"
                   keyframed={hasKeyframeAt(selClip, "y", clamp(time - selClip.ts, 0, selClip.dur))}
                   onToggleKeyframe={() => toggleClipKeyframe(selClip, "y")}
                   onPrevKeyframe={() => jumpToKeyframe(selClip, "y", "prev")}
                   onNextKeyframe={() => jumpToKeyframe(selClip, "y", "next")}
-                  onChange={v => updateClip(selClip.id, { y: v })} onCommit={snap} />
+                  onChange={v => updateClip(selClip.id, { y: (v / comp.h) * 100 })} onCommit={snap} />
                 <AnimPropRow label="비율" value={Math.round(selClip.scale)} min={10} max={500} step={1} unit="%"
                   keyframed={hasKeyframeAt(selClip, "scale", clamp(time - selClip.ts, 0, selClip.dur))}
                   onToggleKeyframe={() => toggleClipKeyframe(selClip, "scale")}
@@ -5081,30 +6093,241 @@ export default function HMStudio() {
           {/* Top Bar */}
           <div style={{ height: 48, background: "#141414", borderBottom: "1px solid #27272a", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 20px", flexShrink: 0 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              <span style={{ fontWeight: 800, fontSize: 16, letterSpacing: "-0.02em" }}>HM STUDIO <span style={{fontSize: 10, opacity: 0.5}}>v4.3-FIT-ALL-FIX</span></span>
+              <span style={{ fontWeight: 800, fontSize: 16, letterSpacing: "-0.02em" }}>HM STUDIO</span>
             </div>
             <div style={{ display: "flex", gap: 16 }}>
               <button onClick={() => setIsExportView(false)} style={{ background: "none", border: "none", color: "#71717a", fontSize: 24, cursor: "pointer" }}>×</button>
             </div>
           </div>
 
-          <div style={{ height: 40, background: "#0c0c0c", display: "flex", alignItems: "center", padding: "0 20px", gap: 8, borderBottom: "1px solid #1c1c1e", flexShrink: 0 }}>
+          <div style={{ display: "none" }}>
             <span style={{ color: "#38bdf8", fontSize: 14 }}>📥</span>
             <span style={{ fontSize: 11, color: "#a1a1aa" }}>내보내기 엔진 활성화됨</span>
           </div>
 
           <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
             {/* Center Area */}
-            <div style={{ flex: 1, position: "relative", background: "#000", borderRight: "1px solid #27272a", overflow: "hidden" }}>
-              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                <div style={{ 
-                  position: "relative", width: "100%", height: "100%", maxWidth: "100%", maxHeight: "100%", 
-                  aspectRatio: `${comp.w} / ${comp.h}`, background: "#000", overflow: "hidden", 
-                  display: "flex", alignItems: "center", justifyContent: "center" 
-                }}>
-                  <div style={{ width: "100%", height: "100%", pointerEvents: "none" }}>
-                    <WebGLRenderStage clips={clips} graphics={graphics} composition={comp} time={time} />
+            <div style={{ 
+              flex: 1, 
+              position: "relative",
+              display: "flex",
+              flexDirection: "column",
+              background: '#0c0c0e', 
+              borderRight: "1px solid #27272a", 
+              overflow: "hidden" 
+            }}>
+              {/* Modern Preview Header Bar for Export */}
+              <div style={{
+                height: 38,
+                background: '#121214',
+                borderBottom: `1px solid #27272a`,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '0 16px',
+                fontSize: 12,
+                fontWeight: 600,
+                color: '#a1a1aa',
+                userSelect: 'none',
+                width: '100%',
+                boxSizing: 'border-box',
+                flexShrink: 0
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ color: ACCENT, fontSize: 14 }}>📥</span>
+                  <span style={{ color: '#e4e4e7', fontWeight: 800, fontSize: 13 }}>대기열 렌더 모니터</span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ color: '#38bdf8', fontSize: 13, fontWeight: 800, background: 'rgba(56,189,248,0.1)', padding: '4px 10px', borderRadius: 6, border: '1px solid rgba(56,189,248,0.2)', letterSpacing: '0.02em' }}>
+                    🖥️ {comp.w} × {comp.h} ({comp.w === 3840 ? '4K UHD' : comp.w === 1920 ? 'FHD' : 'HD'})
+                  </span>
+                </div>
+              </div>
+              
+              <div style={{
+                flex: 1,
+                position: 'relative',
+                background: '#000',
+                overflow: 'hidden',
+                paddingBottom: 154,
+                boxSizing: 'border-box'
+              }}>
+                <div 
+                  ref={exportStageContainerRef} 
+                  style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", padding: 0, boxSizing: "border-box" }}
+                >
+                <div 
+                  ref={exportStageRef} 
+                  style={{ 
+                    position: "relative", 
+                    width: (() => {
+                      const compW = Number(comp?.w || 1920);
+                      const compH = Number(comp?.h || 1080);
+                      const maxW = exportStageParentDim?.w || 800;
+                      const maxH = exportStageParentDim?.h || 600;
+                      const compRatio = compH > 0 ? compW / compH : 16/9;
+                      const parentRatio = maxH > 0 ? maxW / maxH : 4/3;
+                      const val = compRatio > parentRatio ? maxW : maxH * compRatio;
+                      return `${Math.round(val)}px`;
+                    })(),
+                    height: (() => {
+                      const compW = Number(comp?.w || 1920);
+                      const compH = Number(comp?.h || 1080);
+                      const maxW = exportStageParentDim?.w || 800;
+                      const maxH = exportStageParentDim?.h || 600;
+                      const compRatio = compH > 0 ? compW / compH : 16/9;
+                      const parentRatio = maxH > 0 ? maxW / maxH : 4/3;
+                      const val = compRatio > parentRatio ? maxW / compRatio : maxH;
+                      return `${Math.round(val)}px`;
+                    })(),
+                    background: comp.bg, 
+                    overflow: "hidden",
+                    boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
+                    display: "flex", 
+                    alignItems: "center", 
+                    justifyContent: "center",
+                    '--stage-scale': exportStageWidth / comp.w
+                  } as any}
+                >
+                  
+                  {previewLayers.length > 0 && (
+                    <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
+                      {previewLayers.map(layer => {
+                        if (layer.__kind === 'clip') {
+                          const clip = layer;
+                          const clipScale = lerp(clip.kf?.scale, time - clip.ts, clip.scale) / 100;
+                          const clipLeft = lerp(clip.kf?.x, time - clip.ts, clip.x);
+                          const clipTop = lerp(clip.kf?.y, time - clip.ts, clip.y);
+                          const clipRot = lerp(clip.kf?.rotation, time - clip.ts, clip.rotation ?? 0);
+                          const clipOpacity = lerp(clip.kf?.opacity, time - clip.ts, clip.opacity);
+                          const assetW = (clip.sourceW || comp.w);
+                          const assetH = (clip.sourceH || comp.h);
+                          const assetWPct = (assetW / comp.w) * 100;
+                          const assetHPct = (assetH / comp.h) * 100;
+                          return (
+                            <div key={`export-${clip.id}`} style={{ position: 'absolute', left: `${clipLeft}%`, top: `${clipTop}%`, width: `${assetWPct}%`, height: `${assetHPct}%`, transform: `translate(-50%,-50%) scale(${clipScale}) rotate(${clipRot}deg)`, transformOrigin: 'center center', zIndex: layerZMap.get(layerKey(layer)) || 1, display: clip.type === 'audio' ? 'none' : 'block' }}>
+                              {clip.type === 'image' ? (
+                                <img 
+                                  src={clip.serverUrl || clip.url}
+                                  style={{ width: '100%', height: '100%', objectFit: 'fill', opacity: clipOpacity, pointerEvents: 'none', display: 'block' }} 
+                                />
+                              ) : (
+                                <video 
+                                  src={clip.serverUrl || clip.url} 
+                                  playsInline 
+                                  muted 
+                                  preload='auto' 
+                                  style={{ width: '100%', height: '100%', objectFit: 'fill', opacity: clipOpacity, pointerEvents: 'none', display: 'block' }} 
+                                  ref={el => {
+                                    if (el) {
+                                      videoRefs.current["export-" + clip.id] = el;
+                                      el.dataset.clipId = clip.id;
+                                    } else {
+                                      delete videoRefs.current["export-" + clip.id];
+                                    }
+                                  }}
+                                />
+                              )}
+                            </div>
+                          );
+                        }
+                        const g = layer;
+                        return <GraphicEl key={`export-${g.id}`} g={g} time={time} renderZ={layerZMap.get(layerKey(layer)) || 1} selected={false} editing={false} onEdit={() => {}} onEndEdit={() => {}} onChange={() => {}} />;
+                      })}
+                      {/* Audio Clips Hidden Sync inside Export View */}
+                      <div style={{ display: 'none' }}>
+                        {clips.filter(c => c.type === 'audio' && time >= c.ts && time < c.ts + c.dur).map(c => (
+                          <audio 
+                            key={`export-audio-${c.id}`} 
+                            src={c.serverUrl || c.url}
+                            playsInline
+                            ref={el => {
+                              if (el) {
+                                videoRefs.current["export-" + c.id] = el;
+                              } else {
+                                delete videoRefs.current["export-" + c.id];
+                              }
+                            }}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+            <div style={{ position: "absolute", left: 0, right: 0, bottom: 0, height: 154, background: "#0c0c0c", borderTop: "1px solid #27272a", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "12px 20px", boxSizing: "border-box", gap: 10, zIndex: 20 }}>
+                {/* Row 1: Play Bar (Fully centered, taking up maxWidth: 720 with zero side overlap risk) */}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", width: "100%", maxWidth: 720 }}>
+                  <div style={{ position: "relative", flex: 1, height: 82, display: "flex", alignItems: "center" }}>
+                    <div style={{ position: "absolute", left: `${totalDur > 0 ? ((renderIn || 0) / totalDur) * 100 : 0}%`, top: 36, bottom: 20, width: 2, transform: "translateX(-50%)", background: "#22c55e", pointerEvents: "none", zIndex: 2 }} />
+                    <div style={{ position: "absolute", left: `${totalDur > 0 ? ((renderIn || 0) / totalDur) * 100 : 0}%`, top: 30, transform: "translateX(-50%)", width: 0, height: 0, borderLeft: "6px solid transparent", borderRight: "6px solid transparent", borderTop: "10px solid #22c55e", pointerEvents: "none", zIndex: 3 }} />
+                    <div
+                      onMouseDown={e => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        const track = e.currentTarget.parentElement;
+                        if (!track || totalDur <= 0) return;
+                        const rect = track.getBoundingClientRect();
+                        const move = (mv) => {
+                          const next = clamp(((mv.clientX - rect.left) / rect.width) * totalDur, 0, renderOut == null ? totalDur : renderOut);
+                          setRenderIn(next);
+                        };
+                        const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
+                        window.addEventListener('mousemove', move);
+                        window.addEventListener('mouseup', up);
+                        move(e);
+                      }}
+                      style={{ position: "absolute", left: `${totalDur > 0 ? ((renderIn || 0) / totalDur) * 100 : 0}%`, top: 0, transform: "translateX(-50%)", background: "#22c55e", color: "#000", fontSize: 14, fontWeight: 900, padding: "7px 12px", borderRadius: 6, cursor: "ew-resize", whiteSpace: "nowrap", zIndex: 4 }}
+                    >렌더범위(시작)</div>
+                    <div style={{ position: "absolute", left: `${totalDur > 0 ? (((renderOut == null ? totalDur : renderOut) || 0) / totalDur) * 100 : 100}%`, top: 36, bottom: 20, width: 2, transform: "translateX(-50%)", background: "#f43f5e", pointerEvents: "none", zIndex: 2 }} />
+                    <div style={{ position: "absolute", left: `${totalDur > 0 ? (((renderOut == null ? totalDur : renderOut) || 0) / totalDur) * 100 : 100}%`, top: 30, transform: "translateX(-50%)", width: 0, height: 0, borderLeft: "6px solid transparent", borderRight: "6px solid transparent", borderTop: "10px solid #f43f5e", pointerEvents: "none", zIndex: 3 }} />
+                    <div
+                      onMouseDown={e => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        const track = e.currentTarget.parentElement;
+                        if (!track || totalDur <= 0) return;
+                        const rect = track.getBoundingClientRect();
+                        const move = (mv) => {
+                          const next = clamp(((mv.clientX - rect.left) / rect.width) * totalDur, renderIn || 0, totalDur);
+                          setRenderOut(next);
+                        };
+                        const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
+                        window.addEventListener('mousemove', move);
+                        window.addEventListener('mouseup', up);
+                        move(e);
+                      }}
+                      style={{ position: "absolute", left: `${totalDur > 0 ? (((renderOut == null ? totalDur : renderOut) || 0) / totalDur) * 100 : 100}%`, top: 0, transform: "translateX(-50%)", background: "#f43f5e", color: "#fff", fontSize: 14, fontWeight: 900, padding: "7px 12px", borderRadius: 6, cursor: "ew-resize", whiteSpace: "nowrap", zIndex: 4 }}
+                    >렌더범위(끝)</div>
+                    <div style={{ position: "absolute", left: `${totalDur > 0 ? ((renderIn || 0) / totalDur) * 100 : 0}%`, width: `${totalDur > 0 ? Math.max(0, (((renderOut == null ? totalDur : renderOut) - (renderIn || 0)) / totalDur) * 100) : 100}%`, top: 50, height: 6, background: "rgba(34,197,94,0.28)", borderRadius: 999, pointerEvents: "none" }} />
+                    <input
+                      type="range"
+                      min={0}
+                      max={totalDur}
+                      step={1 / Math.max(1, comp.fps || 30)}
+                      value={clamp(time, 0, totalDur)}
+                      onChange={e => setTime(Number(e.target.value))}
+                      style={{ width: "100%", accentColor: "#f59e0b", position: "relative", zIndex: 1, marginTop: 34 }}
+                    />
                   </div>
+                </div>
+
+                {/* Row 2: Playback Controls and Right-aligned Large Time Indicator */}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", width: "100%", maxWidth: 720, position: "relative" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 16 }}>
+                    <button onClick={() => { setTime(renderIn || 0); setPlaying(false); }} style={{ background: "none", border: "none", color: "#71717a", fontSize: 16, cursor: "pointer" }}>⏮</button>
+                    <button onClick={() => setTime(t => Math.max(renderIn || 0, t - 5))} style={{ background: "none", border: "none", color: "#71717a", fontSize: 14, cursor: "pointer" }}>◁◁</button>
+                    <button onClick={() => setPlaying(p => !p)} style={{ width: 40, height: 40, borderRadius: 10, background: "#f59e0b", border: "none", color: "#000", fontSize: 18, cursor: "pointer", fontWeight: 700 }}>
+                      {playing ? '⏸' : '▶'}
+                    </button>
+                    <button onClick={() => setTime(t => Math.min(renderOut == null ? totalDur : renderOut, t + 5))} style={{ background: "none", border: "none", color: "#71717a", fontSize: 14, cursor: "pointer" }}>▷▷</button>
+                    <button onClick={() => { setTime(renderOut == null ? totalDur : renderOut); setPlaying(false); }} style={{ background: "none", border: "none", color: "#71717a", fontSize: 16, cursor: "pointer" }}>⏭</button>
+                  </div>
+
+                  <span style={{ position: "absolute", right: 0, fontSize: 14, fontWeight: 700, color: "#a1a1aa", fontVariantNumeric: "tabular-nums" }}>
+                    {fmt(time)} / {fmt(renderOut == null ? totalDur : renderOut)}
+                  </span>
                 </div>
               </div>
             </div>
@@ -5191,7 +6414,41 @@ export default function HMStudio() {
                       <div key={item.id} style={{ minWidth: 280, background: bgColor, border: `1px solid ${borderColor}`, borderRadius: 8, padding: "10px 14px" }}>
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
                           <span style={{ fontSize: 11, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{item.name}</span>
-                          <span style={{ fontSize: 10, color: isDone ? "#22c55e" : isFailed ? "#ef4444" : "#3b82f6", fontWeight: 700, marginLeft: 8 }}>{statusLabel}</span>
+                          <div style={{ display: "flex", alignItems: "center" }}>
+                            {isActive && (
+                              <>
+                                <style>{`
+                                  @keyframes hm-spin {
+                                    0% { transform: rotate(-90deg); }
+                                    100% { transform: rotate(270deg); }
+                                  }
+                                `}</style>
+                                <svg width="14" height="14" viewBox="0 0 20 20" style={{ transform: "rotate(-90deg)", marginRight: 6, animation: "hm-spin 2s linear infinite" }}>
+                                  <circle
+                                    cx="10"
+                                    cy="10"
+                                    r="8"
+                                    stroke="rgba(59, 130, 246, 0.15)"
+                                    strokeWidth="2.5"
+                                    fill="transparent"
+                                  />
+                                  <circle
+                                    cx="10"
+                                    cy="10"
+                                    r="8"
+                                    stroke="#3b82f6"
+                                    strokeWidth="2.5"
+                                    fill="transparent"
+                                    strokeDasharray={50.26}
+                                    strokeDashoffset={50.26 - (Math.max(2, displayProgress) / 100) * 50.26}
+                                    strokeLinecap="round"
+                                    style={{ transition: "stroke-dashoffset 0.3s ease" }}
+                                  />
+                                </svg>
+                              </>
+                            )}
+                            <span style={{ fontSize: 10, color: isDone ? "#22c55e" : isFailed ? "#ef4444" : "#3b82f6", fontWeight: 700 }}>{statusLabel}</span>
+                          </div>
                         </div>
                         {item.statusText && <div style={{ fontSize: 9, color: "#71717a", marginBottom: 4 }}>{item.statusText}</div>}
                         {isActive && (
@@ -5232,3 +6489,123 @@ export default function HMStudio() {
     </div>
   );
 }
+
+function LoginScreenComponent({
+  loginId,
+  setLoginId,
+  loginPw,
+  setLoginPw,
+  isLoggingIn,
+  loginError,
+  handleLoginSubmit
+}: {
+  loginId: string;
+  setLoginId: (val: string) => void;
+  loginPw: string;
+  setLoginPw: (val: string) => void;
+  isLoggingIn: boolean;
+  loginError: string;
+  handleLoginSubmit: (e?: React.FormEvent) => void;
+}) {
+  return (
+    <div style={{
+      width: '100vw', height: '100vh', background: 'linear-gradient(135deg, #2d4d44 0%, #0f1a18 100%)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#e4e4e7', fontFamily: "'Inter', sans-serif"
+    }}>
+      <div style={{
+        width: 1000, height: 600, background: '#121616', borderRadius: 12, display: 'flex', overflow: 'hidden',
+        boxShadow: '0 24px 48px rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.05)'
+      }}>
+        {/* Left Side */}
+        <div style={{ flex: 1, padding: '60px', display: 'flex', flexDirection: 'column', justifyContent: 'space-between', borderRight: '1px solid rgba(255,255,255,0.05)' }}>
+          <div>
+            <img src="/HMStudio_logo.png" alt="HMStudio Logo" style={{ height: 95, margin: "0 0 12px 0", padding: 0, display: 'block', objectFit: 'contain' }} />
+            <h1 style={{ fontSize: 44, fontWeight: 900, lineHeight: 1.1, margin: 0, letterSpacing: '-0.02em', color: '#fff' }}>
+              HANMAC<br />STUDIO
+            </h1>
+            <p style={{ marginTop: 40, fontSize: 18, color: '#a1a1aa', lineHeight: 1.6, maxWidth: 480 }}>
+              한맥가족 임직원들을 위한 쉽고 간편한 영상 편집 솔루션.<br />
+              한맥가족만의 전용 디자인 템플릿으로 누구나 전문가처럼<br />
+              영상을 완성할 수 있습니다.
+            </p>
+          </div>
+          <div>
+            <div style={{ fontSize: 14, color: '#71717a', fontWeight: 600 }}>v1.0.0</div>
+            
+            <div style={{ marginTop: 60 }}>
+              <div style={{ fontSize: 13, color: '#a1a1aa', fontWeight: 600, marginBottom: 16 }}>한맥가족사</div>
+              <div style={{ display: 'flex', gap: 24, flexWrap: 'nowrap', opacity: 0.6 }}>
+                {['HANMAC', 'SAMAN', 'JANGHEON', 'PTC', 'HALLA', 'BARON'].map(id => (
+                  <span key={id} style={{ fontSize: 12, fontWeight: 800 }}>{id}</span>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Right Side - Login Form */}
+        <div style={{ width: 420, padding: '60px', display: 'flex', flexDirection: 'column', justifyContent: 'center', background: '#161b1b' }}>
+          <h2 style={{ fontSize: 32, fontWeight: 800, margin: 0, marginBottom: 8 }}>LOG-IN</h2>
+          <p style={{ fontSize: 14, color: '#71717a', marginBottom: 40 }}>사번과 비밀번호를 입력하십시오.</p>
+          
+          <form onSubmit={handleLoginSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#52525b', marginBottom: 8, letterSpacing: '0.05em' }}>
+                사번 (EMPLOYEE ID)
+              </label>
+              <input 
+                type="text" 
+                placeholder="ID Number"
+                value={loginId}
+                onChange={e => setLoginId(e.target.value)}
+                style={{
+                  width: '100%', height: 48, background: '#0d1111', border: '1px solid #27272a',
+                  borderRadius: 6, padding: '0 16px', color: '#fff', fontSize: 14, outline: 'none'
+                }}
+              />
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#52525b', marginBottom: 8, letterSpacing: '0.05em' }}>
+                비번 (PASSWORD)
+              </label>
+              <input 
+                type="password" 
+                placeholder="••••••••"
+                value={loginPw}
+                onChange={e => setLoginPw(e.target.value)}
+                style={{
+                  width: '100%', height: 48, background: '#0d1111', border: '1px solid #27272a',
+                  borderRadius: 6, padding: '0 16px', color: '#fff', fontSize: 14, outline: 'none'
+                }}
+              />
+            </div>
+            
+            {loginError && <div style={{ fontSize: 12, color: '#ef4444' }}>{loginError}</div>}
+
+            <button 
+              type="submit"
+              disabled={isLoggingIn}
+              style={{
+                width: '100%', height: 48, background: '#ff9000', color: '#000', border: 'none',
+                borderRadius: 6, fontSize: 15, fontWeight: 800, cursor: 'pointer', marginTop: 8,
+                transition: 'all 0.2s', opacity: isLoggingIn ? 0.7 : 1
+              }}
+            >
+              {isLoggingIn ? "인증 중..." : "로그인"}
+            </button>
+
+            <div style={{ textAlign: 'center', marginTop: 16 }}>
+              <button type="button" style={{ background: 'none', border: 'none', color: '#71717a', fontSize: 12, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, width: '100%' }}>
+                <span>📱</span> 휴대폰으로 로그인
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+      <div style={{ position: 'absolute', bottom: 40, left: 40, fontSize: 12, color: 'rgba(255,255,255,0.2)', letterSpacing: '0.1em' }}>
+        © 2026 HANMAC STUDIO. ALL RIGHTS RESERVED.
+      </div>
+    </div>
+  );
+}
+

@@ -77,6 +77,8 @@ export class WebGLCompositor {
     const gl = canvas.getContext('webgl2', { premultipliedAlpha: true, antialias: true, preserveDrawingBuffer: true });
     if (!gl) throw new Error('webgl2 not available');
     this.gl = gl;
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     this.program = createProgram(gl);
     this.vao = gl.createVertexArray()!;
     gl.bindVertexArray(this.vao);
@@ -188,7 +190,8 @@ export class WebGLCompositor {
 
   private drawTemplateLayer(layer: AETemplateLayer, comp: ProjectState['composition'], localTime: number, templates?: Record<string, HTMLCanvasElement>) {
     // If we have a pre-rendered Lottie canvas from the render stage, use it for 100% fidelity.
-    const lottieCanvas = templates?.[layer.id];
+    // Exclude vector_subtitle and multi_png_title layers from using pre-rendered Lottie canvas, as they require custom dynamic drawing.
+    const lottieCanvas = (layer.templateKind === 'vector_subtitle' || layer.templateKind === 'multi_png_title') ? undefined : templates?.[layer.id];
     const canvas = lottieCanvas || rasterizeTemplateToCanvas(layer, localTime, 1);
     const tex = this.getTexture(`template:${layer.id}:${localTime.toFixed(3)}`, canvas);
     this.drawTexture(tex.texture, canvas.width, canvas.height, comp.w, comp.h, layer, localTime);
