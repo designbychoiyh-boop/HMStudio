@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { legacySceneToProjectState } from './legacy-adapter';
 import { lerpKeyframe } from './interpolate';
-import { rasterizeTemplateToCanvas } from './template-canvas';
+import { rasterizeTemplateToCanvas, preloadTemplateImages } from './template-canvas';
 // @ts-ignore
 import lottie from 'lottie-web';
 
@@ -135,62 +135,125 @@ async function waitForVisibleImages(images: Map<string, HTMLImageElement>, layer
   }
 }
 
-async function syncLottieToTime(lottieItem: { anim: any, canvas: HTMLCanvasElement, isLoaded?: boolean }, layer: any, time: number, fps: number) {
+// [FIX] Use canvas renderer instead of svg renderer for Lottie.
+// The svg renderer serializes the DOM via XMLSerializer which triggers browser
+// security restrictions: cross-origin images and font-loaded glyphs are tainted
+// and come out blank. The canvas renderer draws directly to an offscreen canvas,
+// bypassing the taint restriction and faithfully reproducing text & image layers.
+type LottieItem = {
+  anim: any;
+  canvas: HTMLCanvasElement;
+  isCached: boolean;
+  frameCache: Map<number, ImageData>;
+  isLoaded: boolean;
+};
+
+async function syncLottieToTime(item: LottieItem, layer: any, time: number, fps: number) {
   try {
     const local = Math.max(0, Number(time || 0) - Number(layer.ts || 0));
-    const frame = local * (layer.lottieData?.fr || fps || 30);
-    lottieItem.anim.goToAndStop(frame, true);
-    await wait(0);
+    const lottieFps = layer.lottieData?.fr || fps || 30;
+    const frame = Math.round(local * lottieFps);
+    const totalFrames = item.anim.totalFrames || 0;
+    const clampedFrame = Math.min(frame, Math.max(0, totalFrames - 1));
+
+    const ctx = item.canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Serve from ImageData cache (faster than re-rendering)
+    if (item.frameCache.has(clampedFrame)) {
+      const cached = item.frameCache.get(clampedFrame)!;
+      ctx.putImageData(cached, 0, 0);
+      return;
+    }
+
+    // Seek lottie-web to frame; canvas renderer paints synchronously
+    item.anim.goToAndStop(clampedFrame, true);
+
+    // Give the canvas renderer one microtask to flush its draw calls
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    // Cache the rendered ImageData for this frame
+    try {
+      const imageData = ctx.getImageData(0, 0, item.canvas.width, item.canvas.height);
+      item.frameCache.set(clampedFrame, imageData);
+    } catch {
+      // getImageData may fail if the canvas is tainted (cross-origin video); skip caching
+    }
   } catch (err) {
     console.warn('[RenderStage] syncLottieToTime failed:', err);
   }
 }
 
-async function waitForVisibleLotties(lotties: Map<string, { anim: any, canvas: HTMLCanvasElement, isLoaded?: boolean }>, layers: any[], time: number, fps: number) {
-  const active = layers.filter(layer => layer.type === 'ae_template' && layer.lottieData && layer.templateKind !== 'vector_subtitle' && layer.templateKind !== 'multi_png_title' && layer.visible !== false && time >= Number(layer.ts || 0) && time < Number(layer.ts || 0) + Number(layer.dur || 0));
+async function waitForVisibleLotties(
+  lotties: Map<string, LottieItem>,
+  layers: any[],
+  time: number,
+  fps: number
+) {
+  const active = layers.filter(
+    layer =>
+      layer.type === 'ae_template' &&
+      layer.lottieData &&
+      layer.visible !== false &&
+      time >= Number(layer.ts || 0) &&
+      time < Number(layer.ts || 0) + Number(layer.dur || 0)
+  );
+
   for (const layer of active) {
     let item = lotties.get(layer.id);
-    if (!item) {
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.max(2, Math.round(layer.templateW || layer.width || 1000));
-      canvas.height = Math.max(2, Math.round(layer.templateH || layer.height || 200));
-      canvas.style.background = 'transparent';
-      const ctx = canvas.getContext('2d', { alpha: true });
-      ctx?.clearRect(0, 0, canvas.width, canvas.height);
 
+    if (!item) {
       const animData = JSON.parse(JSON.stringify(layer.lottieData));
+      const w = Math.max(2, Number(animData.w || 1000));
+      const h = Math.max(2, Number(animData.h || 1000));
+
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+
+      // [FIX] canvas renderer: Lottie draws directly to an HTMLCanvasElement.
+      // Images referenced via asset.u+asset.p paths are loaded normally (same-origin
+      // or CORS-enabled), and text glyphs are rasterised by the browser's own canvas
+      // text API — none of this goes through XMLSerializer, so nothing gets tainted.
       const anim = lottie.loadAnimation({
-        container: null,
         renderer: 'canvas',
         loop: false,
         autoplay: false,
         animationData: animData,
         rendererSettings: {
           canvas,
-          context: ctx || undefined,
           clearCanvas: true,
-          progressiveLoad: false,
-          hideOnTransparent: true,
-          preserveAspectRatio: 'xMidYMid meet'
-        }
+          preserveAspectRatio: 'xMidYMid meet',
+        },
       });
 
-      const entry: { anim: any, canvas: HTMLCanvasElement, isLoaded?: boolean } = { anim, canvas, isLoaded: false };
+      const entry: LottieItem = {
+        anim,
+        canvas,
+        isCached: false,
+        frameCache: new Map(),
+        isLoaded: false,
+      };
+
+      // lottie-web canvas renderer fires DOMLoaded when the first frame is ready
       anim.addEventListener('DOMLoaded', () => { entry.isLoaded = true; });
-      anim.addEventListener('data_ready', () => { entry.isLoaded = true; });
-      anim.addEventListener('loaded_images', () => { entry.isLoaded = true; });
+      anim.addEventListener('data_ready',  () => { entry.isLoaded = true; });
+
       lotties.set(layer.id, entry);
+      if (typeof window !== 'undefined') {
+        const list = ((window as any).__HM_LOTTIE_INSTANCES ||= []);
+        if (!list.includes(anim)) list.push(anim);
+      }
       item = entry;
     }
 
+    // Wait up to 2 s for the animation to initialise
     let waitCount = 0;
     while (!item.isLoaded && waitCount < 200) {
       await wait(10);
       waitCount++;
     }
 
-    const ctx = item.canvas.getContext('2d', { alpha: true });
-    ctx?.clearRect(0, 0, item.canvas.width, item.canvas.height);
     await syncLottieToTime(item, layer, time, fps);
   }
 }
@@ -285,9 +348,17 @@ function renderCanvas2D(ctx: CanvasRenderingContext2D, project: any, time: numbe
       const canvas = makeShapeCanvas(layer);
       drawLayerImage(ctx, canvas, canvas.width, canvas.height, comp.w, comp.h, layer, localTime);
     } else if (layer.type === 'ae_template') {
-      if (layer.templateKind === 'vector_subtitle' || layer.templateKind === 'multi_png_title') continue;
-      const canvas = resources.templates[layer.id] || rasterizeTemplateToCanvas(layer, localTime, 1);
-      drawLayerImage(ctx, canvas, canvas.width, canvas.height, comp.w, comp.h, layer, localTime);
+      if (layer.templateKind === 'vector_subtitle' || layer.templateKind === 'multi_png_title') {
+        continue;
+      }
+      const lottieCanvas = resources.templates[layer.id];
+      if (lottieCanvas) {
+        drawLayerImage(ctx, lottieCanvas, lottieCanvas.width, lottieCanvas.height, comp.w, comp.h, layer, localTime);
+      } else {
+        // Fallback: canvas-based template rasterisation for vector_subtitle / multi_png_title
+        const fallback = rasterizeTemplateToCanvas(layer, localTime, 1);
+        drawLayerImage(ctx, fallback, fallback.width, fallback.height, comp.w, comp.h, layer, localTime);
+      }
     }
   }
 }
@@ -302,7 +373,7 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const videosRef = useRef<Map<string, HTMLVideoElement>>(new Map());
   const imagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
-  const lottiesRef = useRef<Map<string, { anim: any, canvas: HTMLCanvasElement, isLoaded?: boolean }>>(new Map());
+  const lottiesRef = useRef<Map<string, LottieItem>>(new Map());
   const drawTokenRef = useRef(0);
   const [imageLoadTick, setImageLoadTick] = useState(0);
 
@@ -310,7 +381,10 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
 
   useEffect(() => {
     return () => {
-      lottiesRef.current.forEach(item => item.anim.destroy());
+      lottiesRef.current.forEach(item => {
+        try { item.anim.destroy(); } catch {}
+        try { item.canvas.width = 0; } catch {}
+      });
       lottiesRef.current.clear();
       videosRef.current.forEach(video => { try { video.pause(); } catch { } });
       videosRef.current.clear();
@@ -318,9 +392,7 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
     };
   }, []);
 
-  // [FIX] Destroy Lottie instances for layers that are no longer in the graphics list.
-  // Without this, removed/swapped layers accumulate hidden RAF loops and Canvas GPU
-  // contexts, leading to unbounded memory growth during long render sessions.
+  // Destroy Lottie instances for layers that are no longer in the graphics list
   useEffect(() => {
     const activeLottieIds = new Set(
       graphics
@@ -329,8 +401,14 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
     );
     for (const [id, item] of lottiesRef.current.entries()) {
       if (!activeLottieIds.has(id)) {
+        try {
+          const list = (window as any).__HM_LOTTIE_INSTANCES;
+          if (Array.isArray(list)) {
+            const idx = list.indexOf(item.anim);
+            if (idx >= 0) list.splice(idx, 1);
+          }
+        } catch {}
         try { item.anim.destroy(); } catch {}
-        // Setting width=0 releases the GPU texture held by the offscreen canvas
         try { item.canvas.width = 0; } catch {}
         lottiesRef.current.delete(id);
       }
@@ -424,6 +502,7 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
         await waitForVisibleVideos(videosRef.current, project.layers, time, project.composition.fps);
         await waitForVisibleImages(imagesRef.current, project.layers, time);
         await waitForVisibleLotties(lottiesRef.current, project.layers, time, project.composition.fps);
+        await preloadTemplateImages(project.layers);
       } catch (err) {
         console.warn('[RenderStage] Resource sync failed, rendering available layers:', err);
       }
@@ -446,10 +525,6 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
         new URLSearchParams(window.location.search).has('renderJob') ||
         document.documentElement.getAttribute('data-render-ready') !== null
       );
-      // [FIX] In render mode, skip nextPaint() entirely.
-      // Chromium background windows throttle requestAnimationFrame to ~1fps,
-      // which would stall the frame capture loop. Synchronous canvas painting
-      // is correct here because __HM_SET_RENDER_TIME awaits this draw() Promise.
       if (!isRender) {
         await nextPaint();
       }

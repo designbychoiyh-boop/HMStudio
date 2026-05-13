@@ -844,6 +844,29 @@ const computeLottieVisibleBounds = data => {
   const maxY = Math.min(sourceH, Math.max(...boxes.map(box => box.y + box.h)));
   return { x: minX, y: minY, w: Math.max(1, maxX - minX), h: Math.max(1, maxY - minY), sourceW, sourceH };
 };
+
+const getTemplateContentBounds = (template, fields = []) => {
+  const sourceW = Math.max(1, Number(template?.templateW || template?.lottieData?.w || template?.webDef?.w || 1000));
+  const sourceH = Math.max(1, Number(template?.templateH || template?.lottieData?.h || template?.webDef?.h || 170));
+  const fallback = { x: 0, y: 0, w: sourceW, h: sourceH, sourceW, sourceH };
+  const normalize = bounds => {
+    if (!bounds) return fallback;
+    const bw = Math.max(1, Number(bounds.w || bounds.width || sourceW));
+    const bh = Math.max(1, Number(bounds.h || bounds.height || sourceH));
+    return {
+      x: Number.isFinite(Number(bounds.x)) ? Number(bounds.x) : 0,
+      y: Number.isFinite(Number(bounds.y)) ? Number(bounds.y) : 0,
+      w: bw,
+      h: bh,
+      sourceW: Math.max(1, Number(bounds.sourceW || sourceW)),
+      sourceH: Math.max(1, Number(bounds.sourceH || sourceH)),
+    };
+  };
+
+  if (template?.cropBounds) return normalize(template.cropBounds);
+  if (template?.lottieData) return normalize(computeLottieVisibleBounds(template.lottieData));
+  return fallback;
+};
 const getLottieFillEffectColor = (layer) => {
   const fillEffect = (layer?.ef || []).find(e => e?.mn === "ADBE Fill");
   if (!fillEffect) return null;
@@ -923,7 +946,7 @@ const extractLottieTextFields = (data, metaFields = null) => {
           fontSize: Math.round(Number(doc.s || 72) * sx),
           color: lottieColorToHex(fillEffColor || doc.fc || [1, 1, 1]),
           strokeColor: lottieColorToHex(doc.sc || [0, 0, 0]),
-          strokeWidth: Number(doc.sw || 0) <= 1 ? 0 : Number(doc.sw || 0),
+          strokeWidth: Number(doc.sw || 0) <= 1 ? 0 : Number(doc.sw || 0) * sx,
           textAlign: lottieJustifyToAlign(doc.j),
           strokeMode: doc.of ? "center" : "outside",
           lineHeight: Math.round(Number(doc.lh || doc.s || 72) * sy),
@@ -2104,7 +2127,7 @@ const DetailedWaveform = memo(({ url, color, opacity = 0.6 }) => {
 
 export default function HMStudio() {
   // ── State ──────────────────────────────────────────────────────────────
-  const [keyframeDrag, setKeyframeDrag] = useState<{ layerId: string, kind: string, prop: string, initialT: number, currentT: number } | null>(null);
+  const [keyframeDrag, setKeyframeDrag] = useState<{ layerId: string, kind: string, prop: string, initialT: number, currentT: number, entries?: Array<{ prop: string, initialT: number, currentT: number }> } | null>(null);
   const [expandedLayers, setExpandedLayers] = useState<Set<string>>(new Set());
   const toggleLayerExpand = (id: string) => {
     const next = new Set(expandedLayers);
@@ -2124,6 +2147,20 @@ export default function HMStudio() {
   const [keyframeSelectBox, setKeyframeSelectBox] = useState<any>(null);
   const suppressTimelineClickRef = useRef(false);
   const [copiedItem, setCopiedItem] = useState<{ kind: 'clip' | 'graphic', data: any } | null>(null);
+  const makeTimelineKey = (kind: string, id: string) => `${kind}:${id}`;
+  const makeAnimationKeyId = (layerId: string, prop: string, t: number) => `${layerId}:${prop}:${Number(t).toFixed(4)}`;
+  const buildTimelineGroupTs = (keys: Set<string>) => {
+    const groupTs: Record<string, number> = {};
+    clips.forEach(c => {
+      const key = makeTimelineKey('clip', c.id);
+      if (keys.has(key)) groupTs[key] = Number(c.ts || 0);
+    });
+    graphics.forEach(g => {
+      const key = makeTimelineKey('graphic', g.id);
+      if (keys.has(key)) groupTs[key] = Number(g.ts || 0);
+    });
+    return groupTs;
+  };
   const [editingGfxId, setEditingGfxId] = useState(null);
   const [tool, setTool] = useState("select"); // select | razor | text | rect | circle | ae
   const [zoom, setZoom] = useState(1);
@@ -2240,7 +2277,7 @@ export default function HMStudio() {
   const [markerDrag, setMarkerDrag] = useState(null); // 'in' | 'out' | null
   const [playheadDrag, setPlayheadDrag] = useState(false);
   const [timelineDragOffset, setTimelineDragOffset] = useState(0);
-  const [dragStart, setDragStart] = useState({ x: 0, y: 0, ts: 0, dur: 0, rowIndex: 0, kind: null });
+  const [dragStart, setDragStart] = useState<any>({ x: 0, y: 0, ts: 0, dur: 0, rowIndex: 0, kind: null });
   const [renderStatus, setRenderStatus] = useState("idle"); // idle | queued | rendering | done
   const [renderQueue, setRenderQueue] = useState([]);
   const savedJobsRef = useRef(new Set());
@@ -2581,8 +2618,36 @@ export default function HMStudio() {
   const isRenderMode = !!renderJobId;
   const [renderJobLoaded, setRenderJobLoaded] = useState(!isRenderMode);
   const renderReadyResolverRef = useRef(null);
+  const isPrecachingRef = useRef(false);
+
+  useEffect(() => {
+    // main.ts toggles this during the Lottie pre-render pass so the Electron
+    // capture hook does not write warm-up frames into FFmpeg.
+    (window as any).isPrecachingRef = isPrecachingRef;
+    return () => {
+      delete (window as any).isPrecachingRef;
+    };
+  }, []);
   
   useEffect(() => {
+    // @ts-ignore
+    window.__HM_PRECACHE_FRAME = async (ts) => {
+      document.documentElement.setAttribute('data-render-ready', '0');
+      document.body.setAttribute('data-render-ready', '0');
+      setTime(ts);
+      return new Promise(resolve => {
+        // @ts-ignore
+        renderReadyResolverRef.current = resolve;
+        const tid = setTimeout(() => {
+          document.documentElement.setAttribute('data-render-ready', '1');
+          document.body.setAttribute('data-render-ready', '1');
+          resolve(true);
+        }, 3000);
+        // @ts-ignore
+        (renderReadyResolverRef as any)._tid = tid;
+      });
+    };
+
     // @ts-ignore
     window.__HM_SET_RENDER_TIME = async (ts) => {
       document.documentElement.setAttribute('data-render-ready', '0');
@@ -2617,6 +2682,8 @@ export default function HMStudio() {
     return () => {
       // @ts-ignore
       delete window.__HM_SET_RENDER_TIME;
+      // @ts-ignore
+      delete window.__HM_PRECACHE_FRAME;
     };
   }, []);
 
@@ -2679,6 +2746,9 @@ export default function HMStudio() {
       // Transition the editor into bare full-resolution canvas mode
       setIsElectronRendering(true);
       setRenderJobLoaded(true);
+      
+      // Global flag to prevent __onElectronFrameReady from capturing pixels during precache
+      isPrecachingRef.current = false;
 
       let frame = 0;
       const originalTime = time;
@@ -2688,7 +2758,7 @@ export default function HMStudio() {
         // so onFrameReady must NOT advance frame or call setTime itself.
         // Its sole job is to (1) extract pixels and (2) invoke 'frame-captured'
         // so main.ts can write bytes to FFmpeg stdin and release the per-frame latch.
-        if (frame >= totalFrames) return;
+        if (frame >= totalFrames || isPrecachingRef.current) return;
 
         try {
           const width = canvas.width;
@@ -3335,25 +3405,45 @@ export default function HMStudio() {
         const targetTime = Math.max(0, initialT + dx);
         if (Math.abs(targetTime - currentT) > 0.001) {
            const setLayer = kind === 'clip' ? setClips : setGraphics;
+           const dragEntries = keyframeDrag.entries?.length ? keyframeDrag.entries : [{ prop, initialT, currentT }];
+           const nextEntries: Array<{ prop: string, initialT: number, currentT: number }> = [];
            setLayer(arr => arr.map(item => {
              if (item.id !== layerId) return item;
              const nextKf = { ...(item.kf || {}) };
-             const propArr = [...(nextKf[prop] || [])];
-             
-             const kfIndex = propArr.findIndex(k => Math.abs(k.t - currentT) < 0.001);
-             if (kfIndex >= 0) {
-               propArr[kfIndex] = { ...propArr[kfIndex], t: targetTime };
-               propArr.sort((a, b) => a.t - b.t);
-               nextKf[prop] = propArr;
-             }
+             dragEntries.forEach(entry => {
+               const propArr = [...(nextKf[entry.prop] || [])];
+               const kfIndex = propArr.findIndex(k => Math.abs(k.t - entry.currentT) < 0.001);
+               const nextT = Math.max(0, entry.initialT + (targetTime - initialT));
+               if (kfIndex >= 0) {
+                 propArr[kfIndex] = { ...propArr[kfIndex], t: nextT };
+                 propArr.sort((a, b) => a.t - b.t);
+                 nextKf[entry.prop] = propArr;
+                 nextEntries.push({ ...entry, currentT: nextT });
+               }
+             });
              return { ...item, kf: nextKf };
            }));
-           setKeyframeDrag(prev => prev ? { ...prev, currentT: targetTime } : null);
+           const keptEntries = nextEntries.length ? nextEntries : dragEntries.map(entry => ({ ...entry, currentT: Math.max(0, entry.initialT + (targetTime - initialT)) }));
+           setSelectedKeyframes(new Set(keptEntries.map(entry => `${kind}:${layerId}:${entry.prop}:${Number(entry.currentT).toFixed(3)}`)));
+           setKeyframeDrag(prev => prev ? { ...prev, currentT: targetTime, entries: keptEntries } : null);
         }
       } else if (timelineDrag) {
         const ns = Math.max(0, dragStart.ts + dx);
-        setClips(cs => cs.map(c => c.id === timelineDrag && dragStart.kind === 'clip' ? { ...c, ts: ns } : c));
-        setGraphics(gs => gs.map(g => g.id === timelineDrag && dragStart.kind === 'graphic' ? { ...g, ts: ns } : g));
+        const groupTs = (dragStart as any).groupTs || {};
+        const groupKeys = new Set(Object.keys(groupTs));
+        if (groupKeys.size > 1) {
+          setClips(cs => cs.map(c => {
+            const key = makeTimelineKey('clip', c.id);
+            return groupKeys.has(key) ? { ...c, ts: Math.max(0, Number(groupTs[key] || 0) + dx) } : c;
+          }));
+          setGraphics(gs => gs.map(g => {
+            const key = makeTimelineKey('graphic', g.id);
+            return groupKeys.has(key) ? { ...g, ts: Math.max(0, Number(groupTs[key] || 0) + dx) } : g;
+          }));
+        } else {
+          setClips(cs => cs.map(c => c.id === timelineDrag && dragStart.kind === 'clip' ? { ...c, ts: ns } : c));
+          setGraphics(gs => gs.map(g => g.id === timelineDrag && dragStart.kind === 'graphic' ? { ...g, ts: ns } : g));
+        }
         
         const dy = e.clientY - dragStart.y;
         const targetIndex = Math.max(0, Math.min(getCurrentTimelineLayers().length - 1, dragStart.rowIndex + Math.round(dy / rowH)));
@@ -3782,9 +3872,20 @@ export default function HMStudio() {
     setTimeout(requestPreviewFullscreenNow, 80);
     setTimeout(requestPreviewFullscreenNow, 300);
     snap();
-    const naturalW = Math.max(1, Number(template.templateKind === "vector_subtitle" ? (template.vectorModel?.baseBarWidth || template.templateW || 1000) : (template.templateW || 1000)));
-    const naturalH = Math.max(1, Number(template.templateKind === "vector_subtitle" ? (template.vectorModel?.baseBarHeight || template.templateH || 170) : (template.templateH || 170)));
-    const cropBounds = template.cropBounds || { x: 0, y: 0, w: naturalW, h: naturalH };
+    let insertBounds;
+    try {
+      insertBounds = getTemplateContentBounds(template, template.fields || []);
+    } catch (err) {
+      console.error("Template bounds failed:", err);
+      const fallbackW = Math.max(1, Number(template?.templateW || template?.lottieData?.w || 1000));
+      const fallbackH = Math.max(1, Number(template?.templateH || template?.lottieData?.h || 170));
+      insertBounds = { x: 0, y: 0, w: fallbackW, h: fallbackH, sourceW: fallbackW, sourceH: fallbackH };
+    }
+    const naturalW = Math.max(1, Number(template.templateKind === "vector_subtitle" ? (template.vectorModel?.baseBarWidth || template.templateW || 1000) : (insertBounds.sourceW || template.templateW || 1000)));
+    const naturalH = Math.max(1, Number(template.templateKind === "vector_subtitle" ? (template.vectorModel?.baseBarHeight || template.templateH || 170) : (insertBounds.sourceH || template.templateH || 170)));
+    const cropBounds = template.templateKind === "vector_subtitle"
+      ? (template.cropBounds || { x: 0, y: 0, w: naturalW, h: naturalH, sourceW: naturalW, sourceH: naturalH })
+      : { x: Number(insertBounds.x || 0), y: Number(insertBounds.y || 0), w: Number(insertBounds.w || naturalW), h: Number(insertBounds.h || naturalH), sourceW: naturalW, sourceH: naturalH };
     const visibleW = Math.max(1, Number(cropBounds.w || naturalW));
     const visibleH = Math.max(1, Number(cropBounds.h || naturalH));
 
@@ -3792,8 +3893,13 @@ export default function HMStudio() {
     let defaultX = 50;
     let defaultY = 74;
 
+    const templateLabel = String(template?.name || template?.compName || "");
+    const isBottomTemplate = templateLabel.includes("하단") || templateLabel.toLowerCase().includes("bottom");
     if (template.templateKind === "vector_subtitle") {
       fitScale = (comp.w * 0.4) / visibleW;
+    } else if (isBottomTemplate) {
+      fitScale = Math.max(800, comp.w * 0.54) / visibleW;
+      defaultY = 74;
     } else if (visibleW >= 1920) {
       fitScale = comp.w / visibleW;
       defaultX = 50;
@@ -3829,7 +3935,7 @@ export default function HMStudio() {
       strictInternalText: !!template.strictInternalText,
     };
     setGraphics(gs => [...gs, g]);
-    setSelGfxId(g.id); setShowAEPanel(false); setTool("select");
+    setSelGfxId(g.id); setSelClipId(null); setSelectedTimelineItems(new Set([`graphic:${g.id}`])); setShowAEPanel(false); setTool("select");
   };
   const selGfx = graphics.find(g => g.id === selGfxId);
   const selClip = clips.find(c => c.id === selClipId);
@@ -4725,7 +4831,6 @@ export default function HMStudio() {
       return g;
     });
   }, [graphics]);
-
   const isTransparent = queryParams.get('transparent') === '1';
   const renderOnlyStage = (
     <div style={{ position: 'fixed', top: 0, left: 0, width: comp.w, height: comp.h, background: isTransparent ? 'transparent' : '#000', overflow: 'hidden', margin: 0, padding: 0, border: 'none' }}>
@@ -4737,10 +4842,14 @@ export default function HMStudio() {
             graphics={processedGraphicsForWebGL}
             time={time}
             onReady={async (canvas) => {
+              const isElectronIpcCapture = !!((window as any).electron && (window as any).__onElectronFrameReady);
+              if (!isElectronIpcCapture) {
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+              }
               document.documentElement.setAttribute('data-render-ready', '1');
               document.body.setAttribute('data-render-ready', '1');
 
-              if ((window as any).electron && (window as any).__onElectronFrameReady) {
+              if (isElectronIpcCapture) {
                 // In Electron IPC mode: invoke('frame-captured') inside __onElectronFrameReady
                 // writes RGBA bytes to FFmpeg stdin and awaits ipcMain.handle's return.
                 // We MUST await this before resolving renderReadyResolverRef so that
@@ -5143,7 +5252,7 @@ export default function HMStudio() {
                         <div style={{ fontSize: 11, color: "#fff", fontWeight: 400, width: '100%', marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'center' }}>{t.name}</div>
                       </div>
                       <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
-                        <button onClick={() => addAETemplate(t)} style={{ flex: 1, padding: "6px", background: ACCENT2, color: "#000", border: "none", borderRadius: 6, fontSize: 11, fontWeight: 800, cursor: "pointer" }}>삽입</button>
+                        <button onClick={(e) => { e.stopPropagation(); addAETemplate(t); }} style={{ flex: 1, padding: "6px", background: ACCENT2, color: "#000", border: "none", borderRadius: 6, fontSize: 11, fontWeight: 800, cursor: "pointer" }}>삽입</button>
                       </div>
                     </div>
                   ))}
@@ -5179,7 +5288,7 @@ export default function HMStudio() {
                         <div style={{ fontSize: 11, color: "#fff", fontWeight: 400, width: '100%', marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'center' }}>{t.name}</div>
                       </div>
                       <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
-                        <button onClick={() => addAETemplate(t)} style={{ flex: 1, padding: "6px", background: "#38bdf8", color: "#000", border: "none", borderRadius: 6, fontSize: 11, fontWeight: 800, cursor: "pointer" }}>삽입</button>
+                        <button onClick={(e) => { e.stopPropagation(); addAETemplate(t); }} style={{ flex: 1, padding: "6px", background: "#38bdf8", color: "#000", border: "none", borderRadius: 6, fontSize: 11, fontWeight: 800, cursor: "pointer" }}>삽입</button>
                       </div>
                     </div>
                   ))}
@@ -5457,13 +5566,14 @@ export default function HMStudio() {
                             else { setSelGfxId(layer.id); setSelClipId(null); }
                             return;
                           }
-                          setSelectedTimelineItems(new Set([timelineItemKey]));
+                          const dragSelection = selectedTimelineItems.has(timelineItemKey) ? new Set(selectedTimelineItems) : new Set([timelineItemKey]);
+                          setSelectedTimelineItems(dragSelection);
                           if (layer.__kind === 'clip') {
                             if (tool === 'razor') { handleSplit(layer.id); return; }
-                            snap(); setSelClipId(layer.id); setSelGfxId(null); setTimelineDrag(layer.id); setDragStart({ x: e.clientX, y: e.clientY, ts: layer.ts, dur: layer.dur, rowIndex: rowIdx, kind: 'clip' });
+                            snap(); setSelClipId(layer.id); setSelGfxId(null); setTimelineDrag(layer.id); setDragStart({ x: e.clientX, y: e.clientY, ts: layer.ts, dur: layer.dur, rowIndex: rowIdx, kind: 'clip', groupTs: buildTimelineGroupTs(dragSelection) });
                           } else {
                             if (tool === 'razor') { handleGraphicSplit(layer.id); return; }
-                            snap(); setSelGfxId(layer.id); setSelClipId(null); setTimelineDrag(layer.id); setDragStart({ x: e.clientX, y: e.clientY, ts: layer.ts, dur: layer.dur, rowIndex: rowIdx, kind: 'graphic' });
+                            snap(); setSelGfxId(layer.id); setSelClipId(null); setTimelineDrag(layer.id); setDragStart({ x: e.clientX, y: e.clientY, ts: layer.ts, dur: layer.dur, rowIndex: rowIdx, kind: 'graphic', groupTs: buildTimelineGroupTs(dragSelection) });
                           }
                         }}>
                         {layer.__kind === 'clip' && layer.__type === 'video' && layer.url && (
@@ -5538,6 +5648,15 @@ export default function HMStudio() {
                         const handleKeyframeClick = (e: any) => {
                           e.stopPropagation();
                           setTime(layer.ts + displayKt);
+                          if (e.shiftKey) {
+                            setSelectedKeyframes(prev => {
+                              const next = new Set(prev);
+                              if (next.has(keyframeKey)) next.delete(keyframeKey);
+                              else next.add(keyframeKey);
+                              return next;
+                            });
+                            return;
+                          }
                           setSelectedKeyframes(new Set([keyframeKey]));
                           if (isPopupActive) setActiveKeyframePopup(null);
                           else setActiveKeyframePopup({ layerId: layer.id, time: kt, prop: kf.prop });
@@ -5579,7 +5698,13 @@ export default function HMStudio() {
                             <svg width="18" height="18" viewBox="0 0 24 24" 
                               onMouseDown={e => {
                                 e.stopPropagation();
-                                setKeyframeDrag({ layerId: layer.id, kind: layer.__kind, prop: kf.prop, initialT: kt, currentT: kt });
+                                if (e.shiftKey) return;
+                                const dragKeys = selectedKeyframes.has(keyframeKey) ? new Set(selectedKeyframes) : new Set([keyframeKey]);
+                                if (!selectedKeyframes.has(keyframeKey)) setSelectedKeyframes(dragKeys);
+                                const entries = collectAllKeyframes(layer)
+                                  .filter(item => dragKeys.has(`${layer.__kind}:${layer.id}:${item.prop}:${Number(item.t).toFixed(3)}`))
+                                  .map(item => ({ prop: item.prop, initialT: item.t, currentT: item.t }));
+                                setKeyframeDrag({ layerId: layer.id, kind: layer.__kind, prop: kf.prop, initialT: kt, currentT: kt, entries: entries.length ? entries : [{ prop: kf.prop, initialT: kt, currentT: kt }] });
                                 setDragStart({ x: e.clientX, y: e.clientY });
                               }}
                               onClick={handleKeyframeClick} 

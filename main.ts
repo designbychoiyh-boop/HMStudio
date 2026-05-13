@@ -1,8 +1,8 @@
-import { app, BrowserWindow, ipcMain, dialog, protocol, net, screen } from 'electron';
+﻿import { app, BrowserWindow, ipcMain, dialog, protocol, net, screen } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import fsp from 'fs/promises';
-import { spawn, execSync, exec, fork } from 'child_process';
+import { spawn, spawnSync, execSync, exec, fork } from 'child_process';
 import os from 'os';
 import crypto from 'crypto';
 import ffmpegStaticPath from 'ffmpeg-static';
@@ -23,6 +23,10 @@ const ROOT = (app && app.isPackaged) ? path.dirname(process.execPath) : process.
 const APP_PORT = 3001; // Port used for Vite development server (fallback)
 const AE_RENDER_ROOT = process.env.AE_RENDER_ROOT 
   ? path.resolve(process.env.AE_RENDER_ROOT)
+  : process.env.PORTABLE_EXECUTABLE_DIR
+  ? path.join(process.env.PORTABLE_EXECUTABLE_DIR, 'HMStudio_AE_Render_Server')
+  : (app && app.isPackaged)
+  ? path.join(path.dirname(process.execPath), 'HMStudio_AE_Render_Server')
   : process.platform === 'win32'
   ? path.join(os.homedir(), 'Desktop', 'HMStudio_AE_Render_Server')
   : path.join(ROOT, '.runtime', 'HMStudio_AE_Render_Server');
@@ -249,12 +253,8 @@ function browserBin() {
 function hasAudioStream(filePath: string): boolean {
   try {
     const bin = ffmpegBin();
-    let out = '';
-    try {
-      execSync(`"${bin}" -i "${filePath}"`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch (e: any) {
-      out = (e.stderr || '').toString() + (e.stdout || '').toString();
-    }
+    const probe = spawnSync(bin, ['-i', filePath], { encoding: 'utf8' });
+    const out = `${probe.stderr || ''}${probe.stdout || ''}`;
     return out.toLowerCase().includes('audio:');
   } catch (e) {
     return false;
@@ -309,7 +309,7 @@ async function executeRenderJob(record: RenderJobRecord) {
 
   record.status = 'preparing';
   record.progress = 2.00;
-  record.statusText = `?뚮뜑 ?붿쭊 以鍮?以?.. (${frameCount}?꾨젅??`;
+  record.statusText = `?뚮뜑留??붿쭊 以鍮?以?.. (${frameCount} ?꾨젅??`;
   record.totalFrames = frameCount;
   record.currentFrame = 0;
   record.updatedAt = nowIso();
@@ -330,24 +330,187 @@ async function executeRenderJob(record: RenderJobRecord) {
     encoder = 'libx264';
   }
 
+  // [AUTO-RESOLVE] & Hybrid Checks
+  let clips = record.payload?.clips || [];
+  const graphics = record.payload?.graphics || [];
+  const safeName = (n: string) => n.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+  clips = clips.map((c: any) => {
+    let resolvedPath = c.storedPath;
+    if (!resolvedPath || !fs.existsSync(resolvedPath)) {
+      if (fs.existsSync(ASSET_DIR)) {
+        const files = fs.readdirSync(ASSET_DIR);
+        const cleanName = safeName(c.name).replace(/\.[^/.]+$/, '');
+        const cleanExt = path.extname(c.name).toLowerCase();
+        const match = files.find(f => f.toLowerCase().endsWith(cleanExt) && f.toLowerCase().replace(/_+/g, '_').includes(cleanName.replace(/_+/g, '_').replace(/^_|_$/g, '').toLowerCase()));
+        if (match) resolvedPath = path.join(ASSET_DIR, match);
+        else {
+          const parts = c.name.split('_');
+          const lastPart = parts[parts.length - 1];
+          if (lastPart && lastPart.length > 5) {
+            const match2 = files.find(f => f.toLowerCase().endsWith(lastPart.toLowerCase()));
+            if (match2) resolvedPath = path.join(ASSET_DIR, match2);
+          }
+        }
+      }
+    }
+    return { ...c, storedPath: resolvedPath };
+  });
+  if (record.payload) record.payload.clips = clips;
+
+  const videoClips = clips.filter((c: any) => (c.type === 'video' || c.type === 'clip' || !c.type) && c.storedPath && fs.existsSync(c.storedPath));
+  const isSimpleImage = (c: any) => c.type === 'image' && c.storedPath && fs.existsSync(c.storedPath) && (!c.kf || Object.keys(c.kf).length === 0) && !c.rotation;
+  const imageClips = clips.filter(isSimpleImage);
+  const hasComplexClips = clips.some((c: any) => c.type === 'image' && !isSimpleImage(c));
+  const canRunHybrid = !hasComplexClips && (videoClips.length > 0 || imageClips.length > 0);
+  const hasGraphics = graphics.some((g: any) => g.visible !== false);
+  const lottiePrecacheFrames: { ts: number; layerId: string; frame: number }[] = [];
+  const lottiePrecacheSeen = new Set<string>();
+  const getLottieFrameInfo = (layer: any) => {
+    const lottieFps = Math.max(1, Number(layer.lottieData?.fr || fps || 30));
+    const ip = Number(layer.lottieData?.ip || 0);
+    const op = Number(layer.lottieData?.op || 0);
+    const framesFromOp = op > ip ? Math.ceil(op - ip) : 0;
+    const framesFromDuration = Math.ceil(Math.max(0, Number(layer.templateDuration || 0)) * lottieFps);
+    const framesFromLayer = Math.ceil(Math.max(0, Number(layer.dur || 0)) * lottieFps);
+    const animationFrameCount = Math.max(1, framesFromOp || framesFromDuration || framesFromLayer);
+    return {
+      lottieFps,
+      animationFrameCount,
+      animationDuration: animationFrameCount / lottieFps,
+    };
+  };
+  const hasTransformKeyframes = (layer: any) => {
+    const kf = layer?.kf || {};
+    return Object.values(kf).some((value: any) => Array.isArray(value) && value.length > 0);
+  };
+  const graphicsFrameKey = (ts: number, frameIndex: number) => {
+    if (!canRunHybrid || !hasGraphics) return `dynamic:${frameIndex}`;
+
+    const parts: string[] = [];
+    for (const layer of graphics) {
+      if (layer?.visible === false) continue;
+
+      const layerStart = Number(layer.ts || 0);
+      const layerDur = Math.max(0, Number(layer.dur || 0));
+      if (ts < layerStart || ts >= layerStart + layerDur) continue;
+
+      if (layer.type !== 'ae_template' || !layer.lottieData || hasTransformKeyframes(layer)) {
+        return `dynamic:${frameIndex}`;
+      }
+
+      const { lottieFps, animationFrameCount } = getLottieFrameInfo(layer);
+      const local = Math.max(0, ts - layerStart);
+      const lottieFrame = Math.min(Math.round(local * lottieFps), animationFrameCount - 1);
+      parts.push(`${layer.id}:${lottieFrame}`);
+    }
+
+    return parts.length ? parts.sort().join('|') : 'empty';
+  };
+
+  for (const layer of graphics) {
+    if (layer?.type !== 'ae_template' || !layer.lottieData || layer.visible === false) continue;
+
+    const layerStart = Number(layer.ts || 0);
+    const layerDur = Math.max(0, Number(layer.dur || 0));
+    const layerEnd = layerStart + layerDur;
+    const overlapIn = Math.max(renderIn, layerStart);
+    const overlapOut = Math.min(renderOut, layerEnd);
+    if (overlapOut <= overlapIn) continue;
+
+    const { lottieFps, animationFrameCount, animationDuration } = getLottieFrameInfo(layer);
+
+    const firstFrame = Math.max(0, Math.floor((overlapIn - layerStart) * lottieFps));
+    const animatedOverlapEnd = Math.min(overlapOut, layerStart + animationDuration);
+    const lastAnimatedFrame = Math.min(
+      animationFrameCount - 1,
+      Math.max(0, Math.ceil((animatedOverlapEnd - layerStart) * lottieFps) - 1)
+    );
+
+    for (let frame = firstFrame; frame <= lastAnimatedFrame; frame++) {
+      const key = `${layer.id}:${frame}`;
+      if (lottiePrecacheSeen.has(key)) continue;
+      lottiePrecacheSeen.add(key);
+      lottiePrecacheFrames.push({
+        ts: layerStart + frame / lottieFps,
+        layerId: String(layer.id),
+        frame,
+      });
+    }
+
+    if (overlapOut > layerStart + animationDuration || overlapIn >= layerStart + animationDuration) {
+      const frame = animationFrameCount - 1;
+      const key = `${layer.id}:${frame}`;
+      if (!lottiePrecacheSeen.has(key)) {
+        lottiePrecacheSeen.add(key);
+        lottiePrecacheFrames.push({
+          ts: layerStart + frame / lottieFps,
+          layerId: String(layer.id),
+          frame,
+        });
+      }
+    }
+  }
+
+  if (canRunHybrid) console.log(`[Render ${jobId}] Hybrid pipeline enabled (Videos:${videoClips.length} Images:${imageClips.length} Graphics:${hasGraphics})`);
+
   // Raw RGBA pixel stream configuration for FFmpeg!
-  const ffmpegArgs = [
+  let ffmpegArgs = [
     '-y',
     '-f', 'rawvideo',
     '-pix_fmt', 'rgba', // Browser getImageData is RGBA
     '-s', `${width}x${height}`,
     '-framerate', String(fps),
-    '-i', '-', // Standard input pipe
-    '-c:v', encoder,
-    // [FIX] NVENC preset system: p1(fast)~p7(quality). '-preset p7 -cq 12' sets
-    // max quality mode; add -rc vbr -maxrate/bufsize for proper VBR rate control.
-    ...(encoder === 'hevc_nvenc'
-      ? ['-preset', 'p7', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '50M', '-bufsize', '100M']
-      : ['-preset', 'medium', '-crf', '18']),
-    '-pix_fmt', 'yuv420p',
-    '-movflags', '+faststart',
-    tempOutputPath,
   ];
+
+  if (canRunHybrid) {
+    if (hasGraphics) ffmpegArgs.push('-i', '-'); // Input 0: Browser graphics via stdin
+    ffmpegArgs.push('-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:d=${duration.toFixed(6)}:r=${fps}`); // Input 1 (or 0 if !hasGraphics)
+    for (const clip of videoClips) {
+      const clipIn = Math.max(clip.ts, renderIn);
+      const overlapDur = Math.min(clip.ts + clip.dur, renderOut) - clipIn;
+      const trimStart = (clip.startT || 0) + Math.max(0, renderIn - clip.ts);
+      ffmpegArgs.push('-ss', trimStart.toFixed(6), '-t', overlapDur.toFixed(6), '-i', clip.storedPath);
+    }
+    for (const clip of imageClips) {
+      const clipIn = Math.max(clip.ts, renderIn);
+      const overlapDur = Math.min(clip.ts + clip.dur, renderOut) - clipIn;
+      ffmpegArgs.push('-loop', '1', '-t', overlapDur.toFixed(6), '-i', clip.storedPath);
+    }
+    let filterComplex = '';
+    let lastV = hasGraphics ? '1:v' : '0:v';
+    let currentInputIdx = hasGraphics ? 2 : 1;
+    for (let idx = 0; idx < videoClips.length; idx++) {
+      const clip = videoClips[idx];
+      const relTs = Math.max(0, clip.ts - renderIn);
+      const overlapDur = Math.min(clip.ts + clip.dur, renderOut) - Math.max(clip.ts, renderIn);
+      const dLabel = `dv${idx}`, oLabel = `ov${idx}`;
+      filterComplex += `[${currentInputIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setpts=PTS-STARTPTS+${relTs.toFixed(6)}/TB[${dLabel}];[${lastV}][${dLabel}]overlay=0:0:enable='between(t,${relTs.toFixed(6)},${(relTs + overlapDur).toFixed(6)})'[${oLabel}];`;
+      lastV = oLabel; currentInputIdx++;
+    }
+    for (let idx = 0; idx < imageClips.length; idx++) {
+      const clip = imageClips[idx];
+      const relTs = Math.max(0, clip.ts - renderIn);
+      const overlapDur = Math.min(clip.ts + clip.dur, renderOut) - Math.max(clip.ts, renderIn);
+      const dLabel = `di${idx}`, oLabel = `oi${idx}`;
+      filterComplex += `[${currentInputIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2[${dLabel}];[${lastV}][${dLabel}]overlay=0:0:enable='between(t,${relTs.toFixed(6)},${(relTs + overlapDur).toFixed(6)})'[${oLabel}];`;
+      lastV = oLabel; currentInputIdx++;
+    }
+    if (hasGraphics) filterComplex += `[${lastV}][0:v]overlay=0:0[outv]`;
+    else filterComplex = filterComplex.replace(/;$/, '');
+    
+    if (filterComplex) ffmpegArgs.push('-filter_complex', filterComplex, '-map', hasGraphics ? '[outv]' : `[${lastV}]`);
+    else ffmpegArgs.push('-map', hasGraphics ? '0:v' : '1:v');
+  } else {
+    ffmpegArgs.push('-i', '-', '-map', '0:v');
+  }
+
+  ffmpegArgs.push('-c:v', encoder);
+  if (encoder === 'hevc_nvenc') {
+    ffmpegArgs.push('-preset', 'p3', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '50M', '-bufsize', '100M');
+  } else {
+    ffmpegArgs.push('-preset', 'veryfast', '-crf', '18', '-threads', '0');
+  }
+  ffmpegArgs.push('-pix_fmt', 'yuv420p', '-movflags', '+faststart', tempOutputPath);
 
   const logStream = fs.createWriteStream(logPath, { flags: 'a' });
   const ffmpegProc = spawn(bin, ffmpegArgs);
@@ -360,9 +523,12 @@ async function executeRenderJob(record: RenderJobRecord) {
     height,
     show: false, // Background/invisible window
     paintWhenInitiallyHidden: true,
+    transparent: true,
+    frame: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       webSecurity: false,
+      backgroundThrottling: false,
     }
   });
 
@@ -387,7 +553,7 @@ async function executeRenderJob(record: RenderJobRecord) {
           
           // Audio mixing and thumbnail generation
           record.progress = 96.00;
-          record.statusText = '?몄퐫???꾨즺, ?ㅻ뵒???⑹꽦 以?..';
+          record.statusText = '3?④퀎. ?ㅻ뵒??誘뱀떛 吏꾪뻾 以?..';
           await saveJob(record);
 
           // Extract single thumbnail JPG using FFmpeg
@@ -429,14 +595,17 @@ async function executeRenderJob(record: RenderJobRecord) {
 
             for (let idx = 0; idx < audioClips.length; idx++) {
               const clip = audioClips[idx];
-              const overlapIn = Math.max(clip.ts, renderIn);
-              const overlapOut = Math.min(clip.ts + clip.dur, renderOut);
+              const clipTs = Number(clip.ts || 0);
+              const rawDur = Number(clip.dur);
+              const clipDur = Number.isFinite(rawDur) && rawDur > 0 ? rawDur : Math.max(0.1, renderOut - clipTs);
+              const overlapIn = Math.max(clipTs, renderIn);
+              const overlapOut = Math.min(clipTs + clipDur, renderOut);
               const overlapDur = overlapOut - overlapIn;
               
               if (overlapDur <= 0) continue;
 
-              const trimStart = (clip.startT || 0) + Math.max(0, renderIn - clip.ts);
-              const delayMs = Math.max(0, Math.round((clip.ts - renderIn) * 1000));
+              const trimStart = Number(clip.startT || 0) + Math.max(0, renderIn - clipTs);
+              const delayMs = Math.max(0, Math.round((clipTs - renderIn) * 1000));
               const label = `aud${idx}`;
 
               // [FIX] Use adelay=delays=X:all=1 to handle all channel layouts
@@ -467,14 +636,17 @@ async function executeRenderJob(record: RenderJobRecord) {
               finalPassArgs.push(finalPassTemp);
 
               try {
-                execSync(`"${bin}" ${finalPassArgs.map(arg => `"${arg}"`).join(' ')}`);
+                const finalPass = spawnSync(bin, finalPassArgs, { encoding: 'utf8' });
+                if (finalPass.status !== 0) {
+                  throw new Error(`${finalPass.stderr || finalPass.stdout || 'FFmpeg audio pass failed'}`);
+                }
                 if (fs.existsSync(finalPassTemp)) {
                   await moveFile(finalPassTemp, outputPath);
                   await fsp.unlink(tempOutputPath).catch(() => {});
                 }
               } catch (err: any) {
-                console.warn('Audio pass failed, falling back to silent video:', err);
-                await moveFile(tempOutputPath, outputPath);
+                console.error('Audio pass failed:', err);
+                throw err;
               }
             } else {
               await moveFile(tempOutputPath, outputPath);
@@ -508,7 +680,7 @@ async function executeRenderJob(record: RenderJobRecord) {
         try { renderWin.close(); } catch {}
         record.status = 'failed';
         record.progress = -1;
-        record.statusText = '?ㅽ뙣';
+        record.statusText = '?뚮뜑 ?ㅽ뙣';
         record.error = String(err.message || err);
         record.updatedAt = nowIso();
         await fsp.writeFile(errorPath, record.error, 'utf8').catch(() => {});
@@ -520,15 +692,44 @@ async function executeRenderJob(record: RenderJobRecord) {
 
     try {
       // Load the app render stage in the background window
-      const url = `http://localhost:${APP_PORT}/?renderJob=${jobId}&renderTs=${encodeURIComponent(renderIn.toFixed(6))}`;
+      const url = `http://localhost:${APP_PORT}/?renderJob=${jobId}&renderTs=${encodeURIComponent(renderIn.toFixed(6))}` + (canRunHybrid ? '&transparent=1&onlyGraphics=1' : '');
       await renderWin.loadURL(url);
 
       record.status = 'rendering';
-      record.progress = 10.00;
-      record.statusText = `\ub80c\ub354\ub9c1 \uc2dc\uc791... (0/${frameCount})`;
+      record.progress = 5.00;
+      record.statusText = `1?④퀎. Lottie ?먮쭑 ?쒗뵆由??꾨━罹먯떛 以?.. (0/${lottiePrecacheFrames.length})`;
       await saveJob(record);
 
-      // Step 1: Send start-client-render so App.tsx registers __onElectronFrameReady
+      // Wait for precaching to finish (Lottie files, fonts, images loaded)
+      // The React app sets data-render-ready="1" on documentElement when ready.
+      let waitTime = 0;
+      while (waitTime < 15000) {
+        try {
+          const isReady = await renderWin.webContents.executeJavaScript(`document.documentElement.getAttribute('data-render-ready')`);
+          if (isReady === '1') break;
+        } catch {}
+        await new Promise(r => setTimeout(r, 200));
+        waitTime += 200;
+      }
+
+      // Step 1: Pre-cache only the actual Lottie animation frames.
+      // Hold sections reuse the cached final frame instead of rendering the whole composition range.
+      await renderWin.webContents.executeJavaScript(`if (window.isPrecachingRef) { window.isPrecachingRef.current = true; }`);
+      for (let i = 0; i < lottiePrecacheFrames.length; i++) {
+        const precacheFrame = lottiePrecacheFrames[i];
+        try {
+          await renderWin.webContents.executeJavaScript(`window.__HM_PRECACHE_FRAME(${precacheFrame.ts})`);
+        } catch (precacheErr) {
+          console.error(`[Render ${jobId}] Lottie precache ${precacheFrame.layerId}:${precacheFrame.frame} error:`, precacheErr);
+        }
+        record.progress = Number((5 + ((i + 1) / Math.max(1, lottiePrecacheFrames.length)) * 15).toFixed(2)); // 5% to 20%
+        record.statusText = `1?④퀎. Lottie ?먮쭑 ?쒗뵆由??꾨━罹먯떛 以?.. (${i + 1}/${lottiePrecacheFrames.length})`;
+        record.updatedAt = nowIso();
+        await saveJob(record);
+      }
+      await renderWin.webContents.executeJavaScript(`if (window.isPrecachingRef) { window.isPrecachingRef.current = false; }`);
+
+      // Step 2: Send start-client-render so App.tsx registers __onElectronFrameReady
       // before the frame loop begins.
       renderWin.webContents.send('start-client-render', {
         jobId,
@@ -536,23 +737,14 @@ async function executeRenderJob(record: RenderJobRecord) {
         totalFrames: frameCount,
       });
 
-      // Give the renderer process a tick to register the IPC listener
-      // and set window.__onElectronFrameReady before we start firing frames.
-      await new Promise(r => setTimeout(r, 200));
+      // Start the FFmpeg capture loop
+      record.progress = 20.00;
+      record.statusText = `2단계. FFmpeg 영상 합성 진행 중... (0/${frameCount})`;
+      await saveJob(record);
 
-      // Step 2: Frame loop.
-      // executeJavaScript calls window.__HM_SET_RENDER_TIME(ts) which:
-      //   - calls setTime(ts) in React
-      //   - returns a Promise that resolves ONLY when WebGLRenderStage.onReady fires
-      //     (or after 100ms fallback)
-      // Inside onReady, __onElectronFrameReady(canvas) is called, which:
-      //   - calls ipcRenderer.invoke('frame-captured') — this writes RGBA to FFmpeg stdin
-      //   - the invoke BLOCKS the renderer until ipcMain.handle returns { ok: true }
-      //   - ipcMain.handle returns AFTER the stdin write (with backpressure)
-      // So: await executeJavaScript = await full pixel pipeline for that frame.
+      let lastSavedAt = 0;
       for (let i = 0; i < frameCount; i++) {
         const ts = renderIn + i / fps;
-
         try {
           await renderWin.webContents.executeJavaScript(
             `window.__HM_SET_RENDER_TIME(${ts})`
@@ -564,10 +756,14 @@ async function executeRenderJob(record: RenderJobRecord) {
         }
 
         record.currentFrame = i + 1;
-        record.progress = Number((10 + ((i + 1) / frameCount) * 85).toFixed(2));
-        record.statusText = `\ud504\ub808\uc784 \ub80c\ub354\ub9c1 \uc911 (${i + 1}/${frameCount})`;
+        record.progress = Number((20 + ((i + 1) / frameCount) * 75).toFixed(2)); // 20% to 95%
+        record.statusText = `2단계. FFmpeg 영상 합성 진행 중... (${i + 1}/${frameCount})`;
         record.updatedAt = nowIso();
-        await saveJob(record);
+        const nowMs = Date.now();
+        if (nowMs - lastSavedAt > 1000 || i === frameCount - 1) {
+          await saveJob(record);
+          lastSavedAt = nowMs;
+        }
       }
 
       // All frames written \u2014 close FFmpeg stdin and finalise.
@@ -630,42 +826,28 @@ async function createWindow() {
     },
   });
 
-  // ?꾨━酉??앹뾽 李??앹꽦 ?쒖뼱 (?ㅼ쨷 紐⑤땲?????
-  mainWindow.webContents.setWindowOpenHandler(({ url, frameName }) => {
+  // ?袁ⓥ봺????밸씜 筌???밴쉐 ??뽯선 (??쇱㉦ 筌뤴뫀???????
+  mainWindow.webContents.setWindowOpenHandler(({ url, frameName, features }) => {
     if (frameName === 'hmstudio-preview-monitor') {
-      const displays = screen.getAllDisplays();
-      const mainBounds = mainWindow ? mainWindow.getBounds() : { x: winX, y: winY, width: winWidth, height: winHeight };
-      const mainDisplay = screen.getDisplayMatching(mainBounds);
-      const externalDisplay = displays.find(d => d.id !== mainDisplay.id);
-      // 硫붿씤 ?덈룄?곌? 媛 ?덈뒗 紐⑤땲?곌? ?꾨땶 ?ㅻⅨ ?붿뒪?뚮젅??寃??      const externalDisplay = displays.find(d => d.id !== mainDisplay.id);
+      const parsedFeatures: Record<string, string> = {};
+      features.split(',').forEach(f => {
+        const [k, v] = f.split('=');
+        if (k && v) parsedFeatures[k] = v;
+      });
 
-      let targetBounds;
-      if (externalDisplay) {
-        // 蹂댁“ 紐⑤땲?곌? 議댁옱?섎㈃ ?대떦 紐⑤땲???꾩껜 ?곸뿭??留욎떠 ??ㅽ겕由곗쑝濡??ㅽ뻾
-        targetBounds = {
-          x: externalDisplay.bounds.x,
-          y: externalDisplay.bounds.y,
-          width: externalDisplay.bounds.width,
-          height: externalDisplay.bounds.height,
-        };
-      } else {
-        // ?깃? 紐⑤땲?곗씪 寃쎌슦 二?紐⑤땲???곗륫 ?덈컲??諛곗튂
-        targetBounds = {
-          x: scrX + Math.floor(scrW / 2),
-          y: scrY,
-          width: Math.floor(scrW / 2),
-          height: scrH,
-        };
-      }
+      const targetX = parseInt(parsedFeatures.left || parsedFeatures.screenX || '0');
+      const targetY = parseInt(parsedFeatures.top || parsedFeatures.screenY || '0');
+      const targetWidth = parseInt(parsedFeatures.width || '1920');
+      const targetHeight = parseInt(parsedFeatures.height || '1080');
 
       return {
         action: 'allow',
         overrideBrowserWindowOptions: {
-          x: targetBounds.x,
-          y: targetBounds.y,
-          width: targetBounds.width,
-          height: targetBounds.height,
-          fullscreen: !!externalDisplay, // 蹂댁“ 紐⑤땲?곌? ?덉쓣 ?뚮쭔 ?꾩껜 ?붾㈃
+          x: targetX,
+          y: targetY,
+          width: targetWidth,
+          height: targetHeight,
+          fullscreen: parsedFeatures.fullscreen === 'yes',
           autoHideMenuBar: true,
           webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
@@ -679,8 +861,8 @@ async function createWindow() {
     return { action: 'allow' };
   });
 
-  // ?앹꽦???꾨━酉?李쎌뿉 ?꾩떆濡?3珥덇컙 ?대룞 諛??ш린 怨좎젙 ??Lock)??嫄몄뼱
-  // ?꾨줎?몄뿏?쒖쓽 遺?뺥솗??moveTo, resizeTo ?몄텧???섑빐 李쎌씠 ????꾩긽???먯쿇 李⑤떒?⑸땲??
+  // ??諛댁뎽???熬곣뱿遊??嶺뚢돦?⑵굢??熬곣뫖六삣슖?3?貫?껇??????????????μ쪠????Lock)??濾곌쑬梨룟젆?
+  // ?熬곣뫁夷?筌뤾쑬???戮곕꺄 ?酉쒓텢?筌먐쇰꼪??moveTo, resizeTo ?筌뤾쑵?????臾먰돵 嶺뚢돦????????熬곣뫕留???????嶺뚢뼰維???紐껊퉵??
   mainWindow.webContents.on('did-create-window', (childWindow, { frameName }) => {
     if (frameName === 'hmstudio-preview-monitor') {
       let allowMoving = false;
@@ -733,7 +915,7 @@ async function createWindow() {
           mainWindow.maximize();
           mainWindow.focus();
         }
-      }, 500); // 由ъ븸???쇱슦???대룞 ?쒓컙??諛곕젮??500ms ???덉쟾??議곗옉
+      }, 500); // ?洹먮봾留????源녿뮡?????????蹂?뜟???꾩룄????500ms ?????깆쓧???브퀗???
     }
   });
 
@@ -828,7 +1010,7 @@ ipcMain.handle('api-request', async (event, { url, init }) => {
     if (cleanUrl === '/system/browse-folder') {
       const result = await dialog.showOpenDialog(mainWindow!, {
         properties: ['openDirectory'],
-        title: '?뚮뜑留곸쓣 ??ν븷 ?대뜑瑜??좏깮?섏꽭??'
+        title: '?????춯?삳궚?????繞③뇡?????臾딅ご???ルㅎ臾??琉얠돪??'
       });
       if (result.canceled) return { ok: false, message: 'Canceled' };
       return { ok: true, path: result.filePaths[0] };
@@ -900,7 +1082,7 @@ ipcMain.handle('api-request', async (event, { url, init }) => {
           }
         }, 800);
       }
-      return { success: !!successful, message: successful ? undefined : '?ъ썝踰덊샇 ?먮뒗 鍮꾨?踰덊샇媛 ?щ컮瑜댁? ?딆뒿?덈떎.' };
+      return { success: !!successful, message: successful ? undefined : '????뀀┛??녾퉰 ???裕??????뺢퀡???먯쾸? ????紐?? ???용????덈펲.' };
     }
 
     if (cleanUrl === '/render-jobs') {
@@ -974,7 +1156,7 @@ ipcMain.handle('api-request', async (event, { url, init }) => {
 ipcMain.handle('open-media-dialog', async () => {
   const result = await dialog.showOpenDialog(mainWindow!, {
     properties: ['openFile', 'multiSelections'],
-    title: '誘몃뵒???뚯씪(?숈쁺?? ?ㅻ뵒?? ?대?吏)???좏깮?섏꽭??',
+    title: '亦껋꼶梨띌?????逾????됯껀?? ???논꺏?? ????嶺뚯솘?)????ルㅎ臾??琉얠돪??',
     filters: [
       { name: 'Media Files', extensions: ['mp4', 'mov', 'webm', 'avi', 'mkv', 'mp3', 'wav', 'm4a', 'aac', 'ogg', 'png', 'jpg', 'jpeg', 'webp', 'gif'] }
     ]
@@ -1042,7 +1224,7 @@ app.whenReady().then(() => {
           mainWindow.maximize();
           mainWindow.focus();
         }
-      }, 500); // 由ъ븸???섏씠吏 濡쒕뱶 ?덉갑???꾪빐 500ms ?ъ쑀瑜??〓땲??
+      }, 500); // ?洹먮봾留????瑜곷턄嶺뚯솘? ?β돦裕녻キ?????빼???熬곥굥??500ms ????????蹂λ퉵??
     }
   });
 

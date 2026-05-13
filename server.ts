@@ -1,4 +1,4 @@
-import express from 'express';
+﻿import express from 'express';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
@@ -443,6 +443,7 @@ async function launchRenderSession(browserPath: string, width: number, height: n
   await client.send('Page.enable');
   await client.send('Runtime.enable');
   await client.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false, screenWidth: width, screenHeight: height });
+  await client.send('Emulation.setDefaultBackgroundColorOverride', { color: { r: 0, g: 0, b: 0, a: 0 } }).catch(() => {});
   await waitForRenderReady(client, 15000);
   return {
     browser,
@@ -524,7 +525,7 @@ async function renderJob(record: RenderJobRecord) {
 
   record.status = 'preparing';
   record.progress = 2.00;
-  record.statusText = `렌더링을 준비 중입니다... (총 ${frameCount}프레임)`;
+  record.statusText = `렌더 준비 중... (총 ${frameCount}프레임, 하이브리드 검사 중)`;
   record.totalFrames = frameCount;
   record.currentFrame = 0;
   record.updatedAt = nowIso();
@@ -540,6 +541,7 @@ async function renderJob(record: RenderJobRecord) {
     return;
   }
 
+  const rlog = (msg: string) => { const line = `[${new Date().toISOString()}] ${msg}`; console.log(line); try { fs.appendFileSync(logPath, line + '\n'); } catch {} };
   let hybridRenderSuccess = false;
   let clips = record.payload?.clips || [];
   
@@ -605,11 +607,63 @@ async function renderJob(record: RenderJobRecord) {
   const hasComplexClips = clips.some((c: any) => c.type === 'image' && !isSimpleImage(c));
   const hasComplexGraphics = graphics.some((g: any) => g.visible !== false && g.type !== 'ae_template');
   const hasGraphics = graphics.some((g: any) => g.visible !== false);
+  const normalizedVideoClips = videoClips
+    .map((clip: any) => {
+      const start = Math.max(Number(clip.ts || 0), renderIn);
+      const end = Math.min(Number(clip.ts || 0) + Math.max(0, Number(clip.dur || 0)), renderOut);
+      return { ...clip, __renderStart: start, __renderEnd: end, __renderDur: end - start };
+    })
+    .filter((clip: any) => clip.__renderDur > 0.001)
+    .sort((a: any, b: any) => Number(a.__renderStart || 0) - Number(b.__renderStart || 0));
+  const isBasicVideoClip = (clip: any) => {
+    if (clip.visible === false) return false;
+    if (clip.type && clip.type !== 'video' && clip.type !== 'clip') return false;
+    if (!clip.storedPath || !fs.existsSync(clip.storedPath)) return false;
+    if (clip.kf && Object.values(clip.kf).some((value: any) => Array.isArray(value) && value.length > 0)) return false;
+    if (Math.abs(Number(clip.rotation || 0)) > 0.0001) return false;
+    if (Math.abs(Number(clip.opacity ?? 100) - 100) > 0.0001) return false;
+    if (Math.abs(Number(clip.scale ?? 100) - 100) > 0.0001) return false;
+    if (Math.abs(Number(clip.x ?? 50) - 50) > 0.0001) return false;
+    if (Math.abs(Number(clip.y ?? 50) - 50) > 0.0001) return false;
+    const srcW = Math.round(Number(clip.sourceW || width));
+    const srcH = Math.round(Number(clip.sourceH || height));
+    return srcW === Math.round(width) && srcH === Math.round(height);
+  };
+  const areSequentialVideos = normalizedVideoClips.length > 0 && normalizedVideoClips.every(isBasicVideoClip)
+    && normalizedVideoClips.every((clip: any, idx: number) => {
+      if (idx === 0) return Math.abs(Number(clip.__renderStart || 0) - renderIn) <= 0.05;
+      const prev = normalizedVideoClips[idx - 1];
+      return Math.abs(Number(clip.__renderStart || 0) - Number(prev.__renderEnd || 0)) <= 0.05;
+    })
+    && Math.abs(Number(normalizedVideoClips[normalizedVideoClips.length - 1].__renderEnd || 0) - renderOut) <= 0.05
+    && imageClips.length === 0;
+
+  // [DEBUG] Detailed hybrid render decision logging
+  rlog(`[Render ${record.id}] ===== HYBRID RENDER DECISION =====`);
+  rlog(`[Render ${record.id}]   clips total: ${clips.length}`);
+  rlog(`[Render ${record.id}]   videoClips (with valid storedPath): ${videoClips.length}`);
+  videoClips.forEach((c: any, i: number) => rlog(`[Render ${record.id}]     video[${i}]: name="${c.name}" storedPath="${c.storedPath}" ts=${c.ts} dur=${c.dur}`));
+  rlog(`[Render ${record.id}]   imageClips (simple): ${imageClips.length}`);
+  imageClips.forEach((c: any, i: number) => rlog(`[Render ${record.id}]     image[${i}]: name="${c.name}" storedPath="${c.storedPath}" ts=${c.ts} dur=${c.dur}`));
+  rlog(`[Render ${record.id}]   hasComplexClips: ${hasComplexClips}`);
+  rlog(`[Render ${record.id}]   graphics total: ${graphics.length}`);
+  graphics.forEach((g: any, i: number) => rlog(`[Render ${record.id}]     graphic[${i}]: type=${g.type} visible=${g.visible} templateKind=${g.templateKind || 'N/A'} id=${g.id}`));
+  rlog(`[Render ${record.id}]   hasGraphics: ${hasGraphics}`);
+  rlog(`[Render ${record.id}]   hasComplexGraphics: ${hasComplexGraphics}`);
 
   const canRunHybrid = !hasComplexClips;
+  const canConcatSequentialVideos = canRunHybrid && areSequentialVideos && normalizedVideoClips.length > 1;
+  rlog(`[Render ${record.id}]   canRunHybrid: ${canRunHybrid}`);
+  rlog(`[Render ${record.id}]   canConcatSequentialVideos: ${canConcatSequentialVideos}`);
+  rlog(`[Render ${record.id}] ==================================`);
 
   if (canRunHybrid) {
-    console.log(`[Render ${record.id}] TRIGGERED ADVANCED HYBRID RENDER PATH!`);
+    rlog(`[Render ${record.id}] TRIGGERED ADVANCED HYBRID RENDER PATH!`);
+    record.statusText = `하이브리드 렌더 시작 (영상:${videoClips.length} 이미지:${imageClips.length} 그래픽:${graphics.length})`;
+    record.updatedAt = nowIso();
+    await saveJob(record);
+    rlog(`[Render ${record.id}]   ??Stage 1 (Browser transparent capture): ${hasGraphics ? 'WILL RUN' : 'SKIPPED (no graphics)'}`);
+    rlog(`[Render ${record.id}]   ??Stage 2 (FFmpeg overlay): WILL RUN`);
     const hybridDir = path.join(TEMP_DIR, `hybrid_${record.id}`);
     if (!fs.existsSync(hybridDir)) {
       fs.mkdirSync(hybridDir, { recursive: true });
@@ -622,16 +676,33 @@ async function renderJob(record: RenderJobRecord) {
       let introDuration = 0;
 
       if (hasGraphics) {
+        rlog(`[Hybrid Render] Stage 1: Launching transparent browser session for graphics capture...`);
         const transparentUrl = `http://localhost:${APP_PORT}/?renderJob=${record.id}&renderTs=${encodeURIComponent(renderIn.toFixed(6))}&transparent=1&onlyGraphics=1`;
+        rlog(`[Hybrid Render] Stage 1 URL: ${transparentUrl}`);
         transSession = await launchRenderSession(browserPath, width, height, transparentUrl);
+        rlog(`[Hybrid Render] Stage 1: Browser session launched successfully`);
 
         // [FIX] Warm up: set to first frame and wait for render-ready signal
         // (replaces the unreliable fixed sleep(500) heuristic)
         await setRenderTime(transSession.client, Number(renderIn.toFixed(6)));
         await waitForRenderReady(transSession.client, 8000);
+        rlog(`[Hybrid Render] Stage 1: Browser warm-up complete, ready to capture frames`);
+
+        const payloadIntroDuration = Math.max(0, ...graphics
+          .filter((g: any) => g?.visible !== false && g?.type === 'ae_template' && g?.lottieData)
+          .map((g: any) => {
+            const fr = Math.max(1, Number(g.lottieData?.fr || fps || 30));
+            const ip = Number(g.lottieData?.ip || 0);
+            const op = Number(g.lottieData?.op || ip + fr);
+            const byLottie = Math.max(0, (op - ip) / fr);
+            if (byLottie > 0) return byLottie;
+            const fallbackDur = Number(g.templateDuration || 0);
+            return fallbackDur > 0 ? Math.min(fallbackDur, 2.0) : 2.0;
+          }));
+        introDuration = Math.min(duration, payloadIntroDuration || 2.0);
 
         // [FIX] Read actual Lottie animation duration from the browser context
-        // instead of hardcoding Math.min(2.0, duration)
+        // and fall back to the payload duration instead of a hardcoded 2 seconds.
         try {
           const lottieDurResult = await transSession.client.send('Runtime.evaluate', {
             expression: `(() => {
@@ -653,24 +724,23 @@ async function renderJob(record: RenderJobRecord) {
           });
           const detectedDur = lottieDurResult?.result?.value;
           if (typeof detectedDur === 'number' && detectedDur > 0) {
-            introDuration = Math.min(detectedDur, duration);
-            console.log(`[Hybrid Render] Lottie introDuration detected from browser: ${introDuration.toFixed(3)}s`);
+            introDuration = Math.min(duration, introDuration > 0 ? Math.min(introDuration, detectedDur) : detectedDur);
+            rlog(`[Hybrid Render] Lottie introDuration detected from browser: ${introDuration.toFixed(3)}s`);
           } else {
-            introDuration = Math.min(2.0, duration);
-            console.log(`[Hybrid Render] Could not detect Lottie duration, using fallback: ${introDuration.toFixed(3)}s`);
+            rlog(`[Hybrid Render] Could not detect Lottie duration, using payload fallback: ${introDuration.toFixed(3)}s`);
           }
         } catch (e) {
-          introDuration = Math.min(2.0, duration);
-          console.warn(`[Hybrid Render] Lottie duration detection failed, using fallback: ${introDuration.toFixed(3)}s`, e);
+          rlog(`[Hybrid Render] Lottie duration detection failed, using payload fallback: ${introDuration.toFixed(3)}s - ${e}`);
         }
 
         introFrameCount = Math.max(1, Math.ceil(introDuration * fps));
 
-        record.statusText = `자막템플릿 캐싱중 (0/${introFrameCount})`;
+        record.statusText = `1단계. 자막 템플릿 캐시 생성 중... (0/${introFrameCount})`;
         record.updatedAt = nowIso();
         await saveJob(record);
 
-        console.log(`[Hybrid Render] Rendering intro transparent WebP sequence (${introFrameCount} frames)...`);
+        rlog(`[Hybrid Render] Rendering intro transparent WebP sequence (${introFrameCount} frames)...`);
+        let lastPrecacheSavedAt = Date.now();
         
         for (let i = 0; i < introFrameCount; i++) {
           const ts = renderIn + i / fps;
@@ -679,33 +749,33 @@ async function renderJob(record: RenderJobRecord) {
           // [FIX] Use WebP lossless instead of PNG: preserves alpha channel,
           // 40-60% smaller payload, fromSurface bypasses CPU readback overhead
           const result = await transSession.client.send('Page.captureScreenshot', {
-            format: 'webp',
-            quality: 90,
+            format: 'png',
             clip: { x: 0, y: 0, width, height, scale: 1 },
             fromSurface: true,
           });
           const frameBuffer = Buffer.from(result.data, 'base64');
-          // Keep .png extension so FFmpeg image2 demuxer pattern still works;
-          // WebP is valid input for FFmpeg overlay regardless of extension
           const framePath = path.join(hybridDir, `frame_${String(i).padStart(3, '0')}.png`);
           await fsp.writeFile(framePath, frameBuffer);
           
           record.progress = Number((10 + (i / introFrameCount) * 40).toFixed(2));
           record.currentFrame = i;
-          record.statusText = `자막템플릿 캐싱중 (${i + 1}/${introFrameCount})`;
+          record.statusText = `1단계. 자막 템플릿 캐시 생성 중... (${i + 1}/${introFrameCount})`;
           record.updatedAt = nowIso();
-          await saveJob(record);
+          const saveNow = Date.now();
+          if (saveNow - lastPrecacheSavedAt > 1000 || i === introFrameCount - 1) {
+            await saveJob(record);
+            lastPrecacheSavedAt = saveNow;
+          }
         }
         
         if (duration > introDuration) {
-          console.log(`[Hybrid Render] Rendering static hold frame (WebP)...`);
+          rlog(`[Hybrid Render] Rendering static hold frame (WebP)...`);
           const ts = renderIn + introDuration;
           await setRenderTime(transSession.client, Number(ts.toFixed(6)));
 
           // [FIX] WebP lossless + fromSurface for static hold frame
           const result = await transSession.client.send('Page.captureScreenshot', {
-            format: 'webp',
-            quality: 90,
+            format: 'png',
             clip: { x: 0, y: 0, width, height, scale: 1 },
             fromSurface: true,
           });
@@ -716,9 +786,13 @@ async function renderJob(record: RenderJobRecord) {
         
         await transSession.dispose();
         transSession = null;
+        rlog(`[Hybrid Render] Stage 1: COMPLETED - Browser session disposed`);
+      } else {
+        rlog(`[Hybrid Render] Stage 1: SKIPPED (no visible graphics in project)`);
       }
       
-      record.statusText = '하이브리드 비디오/이미지 병합 및 인코딩 중...';
+      rlog(`[Hybrid Render] Stage 2: Starting FFmpeg hardware-accelerated overlay composition...`);
+      record.statusText = '2단계. FFmpeg 렌더 진행 중... (인코딩 시작)';
       record.progress = 60.0;
       record.updatedAt = nowIso();
       await saveJob(record);
@@ -735,27 +809,91 @@ async function renderJob(record: RenderJobRecord) {
       }
       
       const hybridArgs = ['-y'];
-      
-      // Input 0: base black canvas
-      hybridArgs.push('-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:d=${duration.toFixed(6)}:r=${fps}`);
-      
-      // Inputs 1 to M: video clips
-      for (const clip of videoClips) {
-        const clipIn = Math.max(clip.ts, renderIn);
-        const clipOut = Math.min(clip.ts + clip.dur, renderOut);
-        const overlapDur = clipOut - clipIn;
-        const trimStart = (clip.startT || 0) + Math.max(0, renderIn - clip.ts);
+      let filterComplex = '';
+      let lastV = '0:v';
+      let currentInputIdx = 0;
+
+      if (canConcatSequentialVideos) {
+        rlog(`[Hybrid Render] Stage 2: Using sequential video concat path (${normalizedVideoClips.length} clips)`);
+        for (const clip of normalizedVideoClips) {
+          const trimStart = Number(clip.startT || 0) + Math.max(0, Number(clip.__renderStart || 0) - Number(clip.ts || 0));
+          hybridArgs.push('-ss', trimStart.toFixed(6), '-t', Number(clip.__renderDur || 0).toFixed(6), '-i', clip.storedPath);
+        }
+        const concatLabels: string[] = [];
+        for (let idx = 0; idx < normalizedVideoClips.length; idx++) {
+          const label = `catv_${idx}`;
+          filterComplex += `[${idx}:v]fps=${fps},scale=${width}:${height},setsar=1,setpts=PTS-STARTPTS[${label}];`;
+          concatLabels.push(`[${label}]`);
+        }
+        filterComplex += `${concatLabels.join('')}concat=n=${normalizedVideoClips.length}:v=1:a=0[basev];`;
+        lastV = 'basev';
+        currentInputIdx = normalizedVideoClips.length;
+      } else {
+        // Input 0: base black canvas
+        hybridArgs.push('-f', 'lavfi', '-i', `color=c=black:s=${width}x${height}:d=${duration.toFixed(6)}:r=${fps}`);
+        lastV = '0:v';
+        currentInputIdx = 1;
+
+        // Inputs 1 to M: video clips
+        for (const clip of videoClips) {
+          const clipIn = Math.max(clip.ts, renderIn);
+          const clipOut = Math.min(clip.ts + clip.dur, renderOut);
+          const overlapDur = clipOut - clipIn;
+          const trimStart = (clip.startT || 0) + Math.max(0, renderIn - clip.ts);
+          
+          hybridArgs.push('-ss', trimStart.toFixed(6), '-t', overlapDur.toFixed(6), '-i', clip.storedPath);
+        }
         
-        hybridArgs.push('-ss', trimStart.toFixed(6), '-t', overlapDur.toFixed(6), '-i', clip.storedPath);
-      }
-      
-      // Inputs M+1 to M+N: simple image clips
-      for (const clip of imageClips) {
-        const clipIn = Math.max(clip.ts, renderIn);
-        const clipOut = Math.min(clip.ts + clip.dur, renderOut);
-        const overlapDur = clipOut - clipIn;
+        // Inputs M+1 to M+N: simple image clips
+        for (const clip of imageClips) {
+          const clipIn = Math.max(clip.ts, renderIn);
+          const clipOut = Math.min(clip.ts + clip.dur, renderOut);
+          const overlapDur = clipOut - clipIn;
+          
+          hybridArgs.push('-loop', '1', '-t', overlapDur.toFixed(6), '-i', clip.storedPath);
+        }
+
+        // Process background videos
+        for (let idx = 0; idx < videoClips.length; idx++) {
+          const clip = videoClips[idx];
+          const relativeTs = Math.max(0, clip.ts - renderIn);
+          const overlapDur = Math.min(clip.ts + clip.dur, renderOut) - Math.max(clip.ts, renderIn);
+          
+          const delayedLabel = `v_delay_${idx}`;
+          const nextLabel = `v_step_${idx}`;
+          
+          filterComplex += `[${currentInputIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,setpts=PTS-STARTPTS+${relativeTs.toFixed(6)}/TB[${delayedLabel}];`;
+          filterComplex += `[${lastV}][${delayedLabel}]overlay=0:0:enable='between(t,${relativeTs.toFixed(6)},${(relativeTs + overlapDur).toFixed(6)})'[${nextLabel}];`;
+          
+          lastV = nextLabel;
+          currentInputIdx++;
+        }
         
-        hybridArgs.push('-loop', '1', '-t', overlapDur.toFixed(6), '-i', clip.storedPath);
+        // Process simple images
+        for (let idx = 0; idx < imageClips.length; idx++) {
+          const clip = imageClips[idx];
+          const relativeTs = Math.max(0, clip.ts - renderIn);
+          const overlapDur = Math.min(clip.ts + clip.dur, renderOut) - Math.max(clip.ts, renderIn);
+          
+          const scale = (clip.scale ?? 100) / 100;
+          const srcW = clip.sourceW || width;
+          const srcH = clip.sourceH || height;
+          const finalW = Math.round(srcW * scale);
+          const finalH = Math.round(srcH * scale);
+          const xPct = clip.x ?? 50;
+          const yPct = clip.y ?? 50;
+          const fx = Math.round((xPct / 100) * width - finalW / 2);
+          const fy = Math.round((yPct / 100) * height - finalH / 2);
+          
+          const delayedLabel = `img_delay_${idx}`;
+          const nextLabel = `img_step_${idx}`;
+          
+          filterComplex += `[${currentInputIdx}:v]scale=${finalW}:${finalH},setpts=PTS-STARTPTS+${relativeTs.toFixed(6)}/TB[${delayedLabel}];`;
+          filterComplex += `[${lastV}][${delayedLabel}]overlay=${fx}:${fy}:enable='between(t,${relativeTs.toFixed(6)},${(relativeTs + overlapDur).toFixed(6)})'[${nextLabel}];`;
+          
+          lastV = nextLabel;
+          currentInputIdx++;
+        }
       }
       
       // Subtitle template inputs (if present)
@@ -764,52 +902,6 @@ async function renderJob(record: RenderJobRecord) {
         if (staticFramePath && fs.existsSync(staticFramePath)) {
           hybridArgs.push('-loop', '1', '-i', staticFramePath);
         }
-      }
-      
-      let filterComplex = '';
-      let lastV = '0:v';
-      let currentInputIdx = 1;
-      
-      // Process background videos
-      for (let idx = 0; idx < videoClips.length; idx++) {
-        const clip = videoClips[idx];
-        const relativeTs = Math.max(0, clip.ts - renderIn);
-        const overlapDur = Math.min(clip.ts + clip.dur, renderOut) - Math.max(clip.ts, renderIn);
-        
-        const delayedLabel = `v_delay_${idx}`;
-        const nextLabel = `v_step_${idx}`;
-        
-        filterComplex += `[${currentInputIdx}:v]scale=${width}:${height},setpts=PTS-STARTPTS+${relativeTs.toFixed(6)}/TB[${delayedLabel}];`;
-        filterComplex += `[${lastV}][${delayedLabel}]overlay=0:0:enable='between(t,${relativeTs.toFixed(6)},${(relativeTs + overlapDur).toFixed(6)})'[${nextLabel}];`;
-        
-        lastV = nextLabel;
-        currentInputIdx++;
-      }
-      
-      // Process simple images
-      for (let idx = 0; idx < imageClips.length; idx++) {
-        const clip = imageClips[idx];
-        const relativeTs = Math.max(0, clip.ts - renderIn);
-        const overlapDur = Math.min(clip.ts + clip.dur, renderOut) - Math.max(clip.ts, renderIn);
-        
-        const scale = (clip.scale ?? 100) / 100;
-        const srcW = clip.sourceW || width;
-        const srcH = clip.sourceH || height;
-        const finalW = Math.round(srcW * scale);
-        const finalH = Math.round(srcH * scale);
-        const xPct = clip.x ?? 50;
-        const yPct = clip.y ?? 50;
-        const fx = Math.round((xPct / 100) * width - finalW / 2);
-        const fy = Math.round((yPct / 100) * height - finalH / 2);
-        
-        const delayedLabel = `img_delay_${idx}`;
-        const nextLabel = `img_step_${idx}`;
-        
-        filterComplex += `[${currentInputIdx}:v]scale=${finalW}:${finalH},setpts=PTS-STARTPTS+${relativeTs.toFixed(6)}/TB[${delayedLabel}];`;
-        filterComplex += `[${lastV}][${delayedLabel}]overlay=${fx}:${fy}:enable='between(t,${relativeTs.toFixed(6)},${(relativeTs + overlapDur).toFixed(6)})'[${nextLabel}];`;
-        
-        lastV = nextLabel;
-        currentInputIdx++;
       }
       
       // Process subtitle templates (if present)
@@ -850,25 +942,79 @@ async function renderJob(record: RenderJobRecord) {
       // [FIX] NVENC uses p1~p7 preset scale, not libx264's slow/medium/fast strings.
       // Using 'slow' on nvenc causes unpredictable fallback behavior.
       if (encoder.endsWith('_nvenc')) {
-        hybridArgs.push('-preset', 'p4', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '50M', '-bufsize', '100M');
+        hybridArgs.push('-preset', 'p3', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '50M', '-bufsize', '100M');
       } else {
-        hybridArgs.push('-preset', 'medium', '-crf', '18');
+        hybridArgs.push('-preset', 'veryfast', '-crf', '18', '-threads', '0');
       }
       hybridArgs.push('-pix_fmt', 'yuv420p');
+      hybridArgs.push('-t', duration.toFixed(6));
       hybridArgs.push('-movflags', '+faststart');
       hybridArgs.push(tempOutputPath);
       
-      console.log(`[Hybrid Render] Running advanced FFmpeg overlay:`, hybridArgs.join(' '));
+      rlog(`[Hybrid Render] Stage 2: FFmpeg command:`);
+      rlog(`[Hybrid Render]   ${bin} ${hybridArgs.join(' ')}`);
+      if (filterComplex) {
+        rlog(`[Hybrid Render]   filter_complex: ${filterComplex}`);
+      }
       
+      let lastHybridProgressSavedAt = Date.now();
       await new Promise<void>((resolve, reject) => {
         const p = spawn(bin, hybridArgs);
         let err = '';
-        p.stderr.on('data', d => { err += d.toString(); });
+        let progressLog = '';
+        p.stderr.on('data', d => {
+          const chunk = d.toString();
+          err += chunk;
+          progressLog += chunk;
+          if (progressLog.includes('frame=') || progressLog.includes('time=')) {
+            const lines = progressLog.split('\r');
+            const last = lines[lines.length - 1] || lines[lines.length - 2] || '';
+            if (last.includes('frame=')) {
+              rlog(`[Hybrid Render] Stage 2 progress: ${last.trim()}`);
+              // Parse current frame from FFmpeg progress for UI
+              const frameMatch = last.match(/frame=\s*(\d+)/);
+              if (frameMatch) {
+                const ffFrame = parseInt(frameMatch[1], 10);
+                const ffTotal = Math.ceil(duration * fps);
+                record.statusText = `2단계. FFmpeg 렌더 진행 중... (${ffFrame}/${ffTotal})`;
+                record.currentFrame = ffFrame;
+                record.progress = Number((60 + Math.min(ffFrame / Math.max(1, ffTotal), 1) * 35).toFixed(2));
+                record.updatedAt = nowIso();
+                const saveNow = Date.now();
+                if (saveNow - lastHybridProgressSavedAt > 1000 || ffFrame >= ffTotal) {
+                  lastHybridProgressSavedAt = saveNow;
+                  saveJob(record).catch(() => {});
+                }
+              }
+            }
+            progressLog = '';
+          }
+        });
         p.on('close', code => {
-          if (code === 0) resolve();
-          else reject(new Error(`FFmpeg hybrid overlay failed (code ${code}): ${err}`));
+          if (code === 0) {
+            rlog(`[Hybrid Render] Stage 2: FFmpeg overlay encoding COMPLETED (exit code 0)`);
+            resolve();
+          } else {
+            rlog(`[Hybrid Render] Stage 2: FFmpeg FAILED (exit code ${code})`);
+            rlog(`[Hybrid Render] Stage 2: FFmpeg stderr (last 500 chars): ${err.slice(-500)}`);
+            reject(new Error(`FFmpeg hybrid overlay failed (code ${code}): ${err.slice(-500)}`));
+          }
+        });
+        p.on('error', (spawnErr) => {
+          rlog(`[Hybrid Render] Stage 2: FFmpeg spawn error: ${spawnErr}`);
+          reject(spawnErr);
         });
       });
+      
+      // Verify output file exists and has content
+      if (!fs.existsSync(tempOutputPath)) {
+        throw new Error(`Hybrid render completed but output file does not exist: ${tempOutputPath}`);
+      }
+      const outputStat = fs.statSync(tempOutputPath);
+      if (outputStat.size < 1024) {
+        throw new Error(`Hybrid render output file is suspiciously small (${outputStat.size} bytes): ${tempOutputPath}`);
+      }
+      rlog(`[Hybrid Render] Stage 2: Output file verified: ${tempOutputPath} (${(outputStat.size / 1024 / 1024).toFixed(1)}MB)`);
       
       const previewSec = (duration / 2).toFixed(3);
       const previewArgs = ['-y', '-ss', previewSec, '-i', tempOutputPath, '-vframes', '1', '-q:v', '2', previewPath];
@@ -878,9 +1024,19 @@ async function renderJob(record: RenderJobRecord) {
       });
       
       hybridRenderSuccess = true;
-      console.log(`[Hybrid Render] COMPLETED SUCCESSFULLY!`);
+      const hybridElapsed = ((Date.now() - renderStartedAt) / 1000).toFixed(1);
+      rlog(`[Hybrid Render] COMPLETED SUCCESSFULLY in ${hybridElapsed}s`);
+      record.statusText = `하이브리드 렌더 완료 (${hybridElapsed}초)`;
+      record.progress = 95.0;
+      record.updatedAt = nowIso();
+      await saveJob(record);
     } catch (err: any) {
-      console.error(`[Hybrid Render] FAILED, FALLING BACK TO STANDARD CAPTURE:`, err);
+      rlog(`[Hybrid Render] FAILED, FALLING BACK TO STANDARD CAPTURE`);
+      rlog(`[Hybrid Render]   Error: ${err.message}`);
+      rlog(`[Hybrid Render]   Stack: ${err.stack || 'N/A'}`);
+      record.statusText = `하이브리드 렌더 실패: ${(err.message || '').slice(0, 80)} - 프레임 캡처 방식으로 전환 중...`;
+      record.updatedAt = nowIso();
+      await saveJob(record).catch(() => {});
       if (transSession) {
         await transSession.dispose().catch(() => {});
       }
@@ -905,13 +1061,22 @@ async function renderJob(record: RenderJobRecord) {
   let ffmpegProc: any = null;
   try {
     if (!hybridRenderSuccess) {
+      rlog(`[Render ${record.id}] STANDARD CAPTURE PATH (frame-by-frame browser screenshot)`);
+      if (canRunHybrid) {
+        rlog(`[Render ${record.id}] NOTE: Hybrid was attempted but FAILED, falling back to slow standard capture`);
+        record.statusText = '하이브리드 렌더 실패, 프레임 캡처 방식으로 전환 중...';
+        record.updatedAt = nowIso();
+        await saveJob(record);
+      } else {
+        rlog(`[Render ${record.id}] Hybrid was not eligible (hasComplexClips=${hasComplexClips}), using standard capture`);
+      }
       const url = `http://localhost:${APP_PORT}/?renderJob=${record.id}&renderTs=${encodeURIComponent(renderIn.toFixed(6))}`;
       session = await launchRenderSession(browserPath, width, height, url);
 
       console.log(`[Render ${record.id}] Browser launched in ${Date.now() - renderStartedAt}ms`);
       record.status = 'rendering';
       record.progress = 10.00;
-      record.statusText = `프레임 렌더링 중... (0/${frameCount})`;
+      record.statusText = `1단계. 프레임 캡처 준비 중... (0/${frameCount})`;
       record.updatedAt = nowIso();
       await saveJob(record);
 
@@ -937,8 +1102,8 @@ async function renderJob(record: RenderJobRecord) {
         // [FIX] NVENC preset system: p1(fast)~p7(quality). 'slow' is a libx264 term,
         // not valid for nvenc and causes undefined fallback behavior.
         ...(encoder.endsWith('_nvenc')
-          ? ['-preset', 'p4', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '50M', '-bufsize', '100M']
-          : ['-preset', 'medium', '-crf', '18']),
+          ? ['-preset', 'p3', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '50M', '-bufsize', '100M']
+          : ['-preset', 'veryfast', '-crf', '18', '-threads', '0']),
         '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart',
         tempOutputPath,
@@ -969,7 +1134,7 @@ async function renderJob(record: RenderJobRecord) {
           throw new Error('cancelled');
         }
         if (ffmpegCrashed) {
-          throw new Error('렌더링 도중 비디오 백엔드(FFmpeg)가 비정상 종료되었습니다. 상세 내용은 로그를 확인하세요.');
+          throw new Error('렌더링 중 비디오 인코더(FFmpeg)가 비정상 종료되었습니다. 자세한 내용은 로그를 확인해 주세요.');
         }
         const ts = renderIn + i / fps;
         const t1 = Date.now();
@@ -982,7 +1147,7 @@ async function renderJob(record: RenderJobRecord) {
         const t3 = Date.now();
         
         if (!ffmpegProc.stdin.writable) {
-           throw new Error('FFmpeg ??낆젾 ???뵠?袁? ???굧??щ빍??');
+           throw new Error('FFmpeg 입력 스트림을 사용할 수 없습니다.');
         }
 
         if (!ffmpegProc.stdin.write(frameBuffer)) {
@@ -996,12 +1161,17 @@ async function renderJob(record: RenderJobRecord) {
 
         if (i < 10 || i % 30 === 0) console.log(`[Render ${record.id}] Frame ${i}/${frameCount}: setTime ${t2 - t1}ms, capture ${t3 - t2}ms, pipe ${t4 - t3}ms, elapsed ${((Date.now() - renderStartedAt) / 1000).toFixed(1)}s`);
         
-        const elapsed = ((Date.now() - renderStartedAt) / 1000).toFixed(0);
         record.progress = Number((10 + ((i + 1) / frameCount) * 85).toFixed(2));
         record.currentFrame = i + 1;
-        record.statusText = `프레임 렌더링 중... (${i + 1}/${frameCount}) - ${elapsed}초 경과`;
+        // Stage 1: first 20% of frames = pre-caching (Lottie warm-up), rest = stage 2 FFmpeg pipe
+        const precacheFrames = Math.ceil(frameCount * 0.2);
+        if (i < precacheFrames) {
+          record.statusText = `1단계. 프레임 캡처 준비 중... (${i + 1}/${precacheFrames})`;
+        } else {
+          record.statusText = `2단계. FFmpeg 렌더 진행 중... (${i + 1 - precacheFrames}/${frameCount - precacheFrames})`;
+        }
         record.updatedAt = nowIso();
-        // [FIX] Debounce saveJob to once per second — 30fps x 30s = 900 fsync calls
+        // [FIX] Debounce saveJob to once per second ??30fps x 30s = 900 fsync calls
         // was adding measurable I/O latency per frame on every write.
         const nowMs = Date.now();
         if (nowMs - lastSavedAt > 1000) {
@@ -1018,7 +1188,7 @@ async function renderJob(record: RenderJobRecord) {
 
     // --- Final Pass: Audio Mixing & Thumbnail ---
     record.progress = 96.00;
-    record.statusText = '렌더링 완료, 오디오 합성 및 인코딩 진행 중...';
+    record.statusText = '3단계. 오디오 합성 중...';
     record.updatedAt = nowIso();
     await saveJob(record);
 
@@ -1066,7 +1236,7 @@ async function renderJob(record: RenderJobRecord) {
           
           const label = `aud${idx}`;
           // Trim -> Reset PTS -> Delay using modern all=1 option for robust multi-channel support
-          audioFilters += `[${idx + aStartIdx}:a]atrim=start=${trimStart.toFixed(3)}:duration=${overlapDur.toFixed(3)},asetpts=PTS-STARTPTS,adelay=delays=${delayMs}:all=1[${label}];`;
+          audioFilters += `[${idx + aStartIdx}:a]atrim=start=${trimStart.toFixed(3)}:duration=${overlapDur.toFixed(3)},asetpts=PTS-STARTPTS,adelay=delays=${delayMs}:all=1,aresample=async=1:first_pts=0[${label}];`;
           amixLabels.push(`[${label}]`);
           mixCount++;
         }
@@ -1074,24 +1244,28 @@ async function renderJob(record: RenderJobRecord) {
         if (mixCount > 0) {
           if (mixCount === 1) {
             // Bypass amix filter to prevent attenuation when there is only 1 audio stream
-            filterComplex = audioFilters.replace(`[${amixLabels[0].slice(1, -1)}]`, 'outa');
+            filterComplex = `${audioFilters}${amixLabels[0]}anull[outa]`;
           } else {
             // Mix multiple audios with normalize=0 to preserve full volume
-            filterComplex = `${audioFilters}${amixLabels.join('')}amix=inputs=${mixCount}:normalize=0[outa]`;
+            filterComplex = `${audioFilters}${amixLabels.join('')}amix=inputs=${mixCount}:normalize=0:duration=longest[outa]`;
           }
         }
       }
 
-      finalPassArgs.push('-map', '0:v'); // Video from input 0
-      
       const actuallyHasAudio = filterComplex.length > 0;
       if (actuallyHasAudio) {
         finalPassArgs.push('-filter_complex', filterComplex);
+      }
+
+      finalPassArgs.push('-map', '0:v'); // Video from input 0
+      
+      if (actuallyHasAudio) {
         finalPassArgs.push('-map', '[outa]');
       }
 
       finalPassArgs.push('-c:v', 'copy');
-      if (actuallyHasAudio) finalPassArgs.push('-c:a', 'aac', '-b:a', '192k');
+      if (actuallyHasAudio) finalPassArgs.push('-c:a', 'aac', '-b:a', '192k', '-shortest');
+      finalPassArgs.push('-t', duration.toFixed(6));
       const finalPassTemp = path.join(RENDER_DIR, `${record.id}_final.mp4`);
       finalPassArgs.push(finalPassTemp);
 
@@ -1120,13 +1294,8 @@ async function renderJob(record: RenderJobRecord) {
           throw new Error('Final pass finished but output file missing');
         }
       } catch (err: any) {
-        console.warn(`[Render ${record.id}] Final pass failed, using fallback: ${err.message}`);
-        if (fs.existsSync(tempOutputPath)) {
-          await moveFile(tempOutputPath, outputPath);
-          console.log(`[Render ${record.id}] FALLBACK SAVED TO: ${outputPath}`);
-        } else {
-          throw err;
-        }
+        console.warn(`[Render ${record.id}] Final pass failed; refusing to save a muted fallback: ${err.message}`);
+        throw err;
       }
     } else {
       console.log(`[Render ${record.id}] No audio/preview needed. Saving to: ${outputPath}`);
@@ -1141,7 +1310,7 @@ async function renderJob(record: RenderJobRecord) {
 
     record.status = 'completed';
     record.progress = 100.00;
-    record.statusText = `?袁⑥┷ (${frameCount}?袁⑥쟿?? ${totalElapsed}?? ${outputSizeMB}MB)`;
+    record.statusText = `완료 (${frameCount}프레임, ${totalElapsed}초, ${outputSizeMB}MB)`;
     record.elapsedSeconds = Number(totalElapsed);
     record.outputSizeMB = Number(outputSizeMB);
     record.downloadUrl = `/api/render-jobs/${record.id}/download`;
@@ -1154,7 +1323,7 @@ async function renderJob(record: RenderJobRecord) {
     }
     record.status = 'failed';
     record.progress = -1;
-    record.statusText = '??쎈솭';
+    record.statusText = '렌더 실패';
     record.error = String(err?.message || err || 'render failed');
     record.updatedAt = nowIso();
     await fsp.writeFile(errorPath, record.error, 'utf8').catch(() => {});
@@ -1387,7 +1556,7 @@ app.post('/api/system/install-chrome', async (_req, res) => {
 app.post('/api/system/browse-folder', async (_req, res) => {
   const psCommand = `
     $shell = New-Object -ComObject Shell.Application;
-    $folder = $shell.BrowseForFolder(0, '???쐭筌띻낯?????館釉????묊몴??醫뤾문??뤾쉭??', 0x00000010 + 0x00000040, 0);
+    $folder = $shell.BrowseForFolder(0, '?????춯?삳궚?????繞③뇡?????臾딅ご???ルㅎ臾??琉얠돪??', 0x00000010 + 0x00000040, 0);
     if ($folder) {
       Write-Output $folder.Self.Path;
     }
@@ -1480,11 +1649,11 @@ app.post('/api/login', async (req, res) => {
     if (successful) {
       res.json({ success: true });
     } else {
-      res.json({ success: false, message: '???앲린?딆깈 ?癒?뮉 ??쑬?甕곕뜇?뉐첎? ??而?몴?? ??녿뮸??덈뼄.' });
+      res.json({ success: false, message: '????뀀┛??녾퉰 ???裕??????뺢퀡???먯쾸? ????紐?? ???용????덈펲.' });
     }
   } catch (err) {
     console.error('Login Proxy Error:', err);
-    res.status(500).json({ success: false, message: '嚥≪뮄?????뺤쒔???臾믩꺗??????곷뮸??덈뼄.' });
+    res.status(500).json({ success: false, message: '?β돦裕?????類ㅼ뮅????얜?爰??????怨룸????덈펲.' });
   }
 });
 
@@ -1567,6 +1736,6 @@ app.listen(APP_PORT, async () => {
   ensureDirs();
   await ensureSystemBins(); // Run installation logic on startup
   console.log(`?? Server running on http://localhost:${APP_PORT}`);
-  console.log(`?猷?Network access: http://${getInternalIP()}:${APP_PORT}`);
-  console.log(`?諭?AE render root: ${AE_RENDER_ROOT}`);
+  console.log(`???Network access: http://${getInternalIP()}:${APP_PORT}`);
+  console.log(`?獄?AE render root: ${AE_RENDER_ROOT}`);
 });

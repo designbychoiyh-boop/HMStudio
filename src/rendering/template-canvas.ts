@@ -12,6 +12,47 @@ function getCachedImage(src?: string) {
   return null;
 }
 
+export async function preloadTemplateImages(layers: any[]) {
+  const promises: Promise<void>[] = [];
+  for (const layer of layers) {
+    if (layer.type !== 'ae_template') continue;
+    const srcs: string[] = [];
+    if (layer.templateKind === 'vector_subtitle' && layer.vectorModel?.imageSrc) srcs.push(layer.vectorModel.imageSrc);
+    if (layer.templateKind === 'multi_png_title' && layer.multiTitleModel?.pairs) {
+      layer.multiTitleModel.pairs.forEach((p: any) => p.imageSrc && srcs.push(p.imageSrc));
+    }
+    if (layer.lottieData?.assets) {
+      layer.lottieData.assets.forEach((asset: any) => {
+        if (asset.p && typeof asset.p === 'string' && (asset.p.startsWith('http') || asset.p.startsWith('data:'))) {
+           // If 'p' is a full URL or data URI
+           srcs.push(asset.p);
+        } else if (asset.u && asset.p && typeof asset.p === 'string') {
+           // If 'u' is the path and 'p' is the filename
+           srcs.push(asset.u + asset.p);
+        }
+      });
+    }
+    for (const src of srcs) {
+      if (!src || typeof Image === 'undefined') continue;
+      const cached = imageCache.get(src);
+      if (cached && cached.complete) continue;
+      
+      const p = new Promise<void>(resolve => {
+        const img = cached || new Image();
+        img.onload = () => resolve();
+        img.onerror = () => resolve();
+        if (!cached) {
+          img.src = src;
+          imageCache.set(src, img);
+        }
+        setTimeout(resolve, 2000);
+      });
+      promises.push(p);
+    }
+  }
+  await Promise.all(promises);
+}
+
 function sampleKeyframes(kfs: Array<{ t: number; v: number }> | undefined, time: number, fallback: number) {
   if (!Array.isArray(kfs) || !kfs.length) return fallback;
   const arr = [...kfs].sort((a, b) => a.t - b.t);
