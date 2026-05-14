@@ -344,14 +344,24 @@ function renderCanvas2D(ctx: CanvasRenderingContext2D, project: any, time: numbe
       const canvas = makeShapeCanvas(layer);
       drawLayerImage(ctx, canvas, canvas.width, canvas.height, comp.w, comp.h, layer, localTime);
     } else if (layer.type === 'ae_template') {
-      if (layer.templateKind === 'vector_subtitle' || layer.templateKind === 'multi_png_title') {
+      if (layer.templateKind === 'multi_png_title') {
+        const lottieCanvas = resources.templates[layer.id];
+        if (lottieCanvas) {
+          drawLayerImage(ctx, lottieCanvas, lottieCanvas.width, lottieCanvas.height, comp.w, comp.h, layer, localTime);
+        }
+        const overlayCanvas = rasterizeTemplateToCanvas(layer, localTime, 1);
+        drawLayerImage(ctx, overlayCanvas, overlayCanvas.width, overlayCanvas.height, comp.w, comp.h, layer, localTime);
+        continue;
+      }
+      if (layer.templateKind === 'vector_subtitle') {
+        const fallback = rasterizeTemplateToCanvas(layer, localTime, 1);
+        drawLayerImage(ctx, fallback, fallback.width, fallback.height, comp.w, comp.h, layer, localTime);
         continue;
       }
       const lottieCanvas = resources.templates[layer.id];
       if (lottieCanvas) {
         drawLayerImage(ctx, lottieCanvas, lottieCanvas.width, lottieCanvas.height, comp.w, comp.h, layer, localTime);
       } else {
-        // Fallback: canvas-based template rasterisation for vector_subtitle / multi_png_title
         const fallback = rasterizeTemplateToCanvas(layer, localTime, 1);
         drawLayerImage(ctx, fallback, fallback.width, fallback.height, comp.w, comp.h, layer, localTime);
       }

@@ -4833,6 +4833,7 @@ export default function HMStudio() {
   }, [graphics]);
   const isTransparent = queryParams.get('transparent') === '1';
   const isFullPageCapture = queryParams.get('fullPageCapture') === '1';
+  const renderDomTemplateOverlay = isFullPageCapture;
   const webglRenderGraphics = isFullPageCapture
     ? processedGraphicsForWebGL.filter(g => !(g?.type === 'ae_template' && (g.templateKind === 'vector_subtitle' || g.templateKind === 'multi_png_title')))
     : processedGraphicsForWebGL;
@@ -4878,7 +4879,7 @@ export default function HMStudio() {
               }
             }}
           />
-          {graphics
+          {renderDomTemplateOverlay && graphics
             .filter(g => (g.templateKind === 'vector_subtitle' || g.templateKind === 'multi_png_title') && g.visible !== false && time >= Number(g.ts || 0) && time < Number(g.ts || 0) + Number(g.dur || 0))
             .map(g => (
               <GraphicEl

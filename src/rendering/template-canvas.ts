@@ -69,6 +69,12 @@ function sampleKeyframes(kfs: Array<{ t: number; v: number }> | undefined, time:
   return fallback;
 }
 
+function normalizeScaleValue(value: number) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 1;
+  return Math.abs(n) > 10 ? n / 100 : n;
+}
+
 function drawField(ctx: CanvasRenderingContext2D, field: TemplateField, boxW: number, boxH: number, alpha = 1) {
   const x = field.x ?? 0;
   const y = field.y ?? 0;
@@ -189,7 +195,7 @@ export function drawData9Template(ctx: CanvasRenderingContext2D, template: AETem
     const targetW = Math.max(baseW + extraLeft + extraRight, textWidth + paddingX * 2);
     const x = baseLeft - extraLeft;
     const y = baseTop;
-    const scaleX = sampleKeyframes(pair.imageScaleX, time, 100) / 100;
+    const scaleX = normalizeScaleValue(sampleKeyframes(pair.imageScaleX, time, 1));
     const imageAlpha = sampleKeyframes(pair.imageOpacity, time, 1);
     const textAlpha = sampleKeyframes(pair.textOpacity, time, 1);
     const originX = x + (Number(pair.scaleOriginXInBar ?? Number(pair.baseWidth || 240) / 2) * sx) + extraLeft;

@@ -454,8 +454,13 @@ async function executeRenderJob(record: RenderJobRecord) {
   const imageClips = clips.filter(isSimpleImage);
   const hasComplexClips = clips.some((c: any) => c.type === 'image' && !isSimpleImage(c));
   const hasGraphics = graphics.some((g: any) => g.visible !== false);
-  const hasAETemplateGraphics = graphics.some((g: any) => g?.visible !== false && g?.type === 'ae_template');
-  const usePageCapture = hasAETemplateGraphics;
+  const requiresDomTemplateCapture = graphics.some((g: any) => (
+    g?.visible !== false
+    && g?.type === 'ae_template'
+    && g?.templateKind !== 'multi_png_title'
+    && g?.templateKind !== 'vector_subtitle'
+  ));
+  const usePageCapture = requiresDomTemplateCapture;
   const canRunHybrid = !hasComplexClips && (videoClips.length > 0 || imageClips.length > 0);
   const lottiePrecacheFrames: { ts: number; layerId: string; frame: number }[] = [];
   const lottiePrecacheSeen = new Set<string>();
@@ -862,6 +867,7 @@ async function executeRenderJob(record: RenderJobRecord) {
               `window.__HM_SET_RENDER_TIME(${ts})`
             );
             if (usePageCapture && session) {
+              await renderWin.webContents.executeJavaScript(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
               const capturedFrame = await captureWindowRgba(renderWin, width, height);
               if (frameKey && !frameKey.startsWith('dynamic:') && !session.frameCache.has(frameKey)) {
                 session.frameCache.set(frameKey, Buffer.from(capturedFrame));
