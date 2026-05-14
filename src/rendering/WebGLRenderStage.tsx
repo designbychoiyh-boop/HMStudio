@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { legacySceneToProjectState } from './legacy-adapter';
 import { lerpKeyframe } from './interpolate';
-import { rasterizeTemplateToCanvas, preloadTemplateImages } from './template-canvas';
+import { rasterizeCachedMultiPngTitleCanvas, rasterizeTemplateToCanvas, preloadTemplateImages } from './template-canvas';
 // @ts-ignore
 import lottie from 'lottie-web';
 
@@ -143,11 +143,50 @@ async function waitForVisibleImages(images: Map<string, HTMLImageElement>, layer
 type LottieItem = {
   anim: any;
   canvas: HTMLCanvasElement;
+  container: HTMLDivElement;
   isCached: boolean;
   frameCache: Map<number, ImageData>;
   isLoaded: boolean;
   hasWaitedForLoad: boolean;
 };
+
+function animationDataForRender(layer: any) {
+  const data = layer?.lottieData;
+  if (!data) return data;
+  const clone = JSON.parse(JSON.stringify(data));
+  if (layer.templateKind === 'multi_png_title') {
+    const hiddenIndices = new Set<number>();
+    const customHide = clone.__customHide || {};
+    if (Array.isArray(customHide.imageLayerIndices)) {
+      customHide.imageLayerIndices.forEach((idx: any) => Number.isFinite(Number(idx)) && hiddenIndices.add(Number(idx)));
+    }
+    if (Array.isArray(customHide.textLayerIndices)) {
+      customHide.textLayerIndices.forEach((idx: any) => Number.isFinite(Number(idx)) && hiddenIndices.add(Number(idx)));
+    }
+    if (Array.isArray(layer.multiTitleModel?.pairs)) {
+      layer.multiTitleModel.pairs.forEach((pair: any) => {
+        if (Number.isFinite(Number(pair.imageLayerIndex))) hiddenIndices.add(Number(pair.imageLayerIndex));
+        if (Number.isFinite(Number(pair.textLayerIndex))) hiddenIndices.add(Number(pair.textLayerIndex));
+        if (Array.isArray(pair.relatedImageLayerIndices)) {
+          pair.relatedImageLayerIndices.forEach((idx: any) => Number.isFinite(Number(idx)) && hiddenIndices.add(Number(idx)));
+        }
+      });
+    }
+    hiddenIndices.forEach(idx => {
+      const target = clone.layers?.[idx];
+      if (!target) return;
+      target.ks = target.ks || {};
+      target.ks.o = { a: 0, k: 0, ix: 11 };
+      if (target.ty === 5 && Array.isArray(target?.t?.d?.k)) {
+        target.t.d.k = target.t.d.k.map((kf: any) => {
+          if (kf?.s && typeof kf.s === 'object') kf.s.t = '';
+          return kf;
+        });
+      }
+    });
+  }
+  return clone;
+}
 
 async function syncLottieToTime(item: LottieItem, layer: any, time: number, fps: number) {
   try {
@@ -189,25 +228,36 @@ async function waitForVisibleLotties(
     let item = lotties.get(layer.id);
 
     if (!item) {
-      const animData = JSON.parse(JSON.stringify(layer.lottieData));
+      const animData = animationDataForRender(layer);
       const w = Math.max(2, Number(animData.w || 1000));
       const h = Math.max(2, Number(animData.h || 1000));
 
       const canvas = document.createElement('canvas');
       canvas.width = w;
       canvas.height = h;
+      const renderContext = canvas.getContext('2d', { alpha: true });
+      const container = document.createElement('div');
+      container.style.position = 'fixed';
+      container.style.left = '-10000px';
+      container.style.top = '-10000px';
+      container.style.width = `${w}px`;
+      container.style.height = `${h}px`;
+      container.style.opacity = '0';
+      container.style.pointerEvents = 'none';
+      document.body.appendChild(container);
 
       // [FIX] canvas renderer: Lottie draws directly to an HTMLCanvasElement.
       // Images referenced via asset.u+asset.p paths are loaded normally (same-origin
       // or CORS-enabled), and text glyphs are rasterised by the browser's own canvas
       // text API; none of this goes through XMLSerializer, so nothing gets tainted.
       const anim = lottie.loadAnimation({
+        container,
         renderer: 'canvas',
         loop: false,
         autoplay: false,
         animationData: animData,
         rendererSettings: {
-          canvas,
+          context: renderContext,
           clearCanvas: true,
           preserveAspectRatio: 'xMidYMid meet',
         },
@@ -216,6 +266,7 @@ async function waitForVisibleLotties(
       const entry: LottieItem = {
         anim,
         canvas,
+        container,
         isCached: false,
         frameCache: new Map(),
         isLoaded: false,
@@ -345,12 +396,8 @@ function renderCanvas2D(ctx: CanvasRenderingContext2D, project: any, time: numbe
       drawLayerImage(ctx, canvas, canvas.width, canvas.height, comp.w, comp.h, layer, localTime);
     } else if (layer.type === 'ae_template') {
       if (layer.templateKind === 'multi_png_title') {
-        const lottieCanvas = resources.templates[layer.id];
-        if (lottieCanvas) {
-          drawLayerImage(ctx, lottieCanvas, lottieCanvas.width, lottieCanvas.height, comp.w, comp.h, layer, localTime);
-        }
-        const overlayCanvas = rasterizeTemplateToCanvas(layer, localTime, 1);
-        drawLayerImage(ctx, overlayCanvas, overlayCanvas.width, overlayCanvas.height, comp.w, comp.h, layer, localTime);
+        const cachedCanvas = rasterizeCachedMultiPngTitleCanvas(layer, localTime, 1, comp.fps || 30);
+        drawLayerImage(ctx, cachedCanvas, cachedCanvas.width, cachedCanvas.height, comp.w, comp.h, layer, localTime);
         continue;
       }
       if (layer.templateKind === 'vector_subtitle') {
@@ -389,6 +436,7 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
     return () => {
       lottiesRef.current.forEach(item => {
         try { item.anim.destroy(); } catch {}
+        try { item.container.remove(); } catch {}
         try { item.canvas.width = 0; } catch {}
       });
       lottiesRef.current.clear();
@@ -415,6 +463,7 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
           }
         } catch {}
         try { item.anim.destroy(); } catch {}
+        try { item.container.remove(); } catch {}
         try { item.canvas.width = 0; } catch {}
         lottiesRef.current.delete(id);
       }

@@ -9,6 +9,7 @@ import multer from 'multer';
 import ffmpegPath from 'ffmpeg-static';
 import dotenv from 'dotenv';
 import { WebSocket } from 'ws';
+import zlib from 'zlib';
 
 dotenv.config();
 
@@ -471,6 +472,130 @@ async function captureFrameBuffer(client: CdpClient, width: number, height: numb
   return Buffer.from(result.data, 'base64');
 }
 
+const PNG_CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function pngCrc(type: Buffer, data: Buffer) {
+  let c = 0xffffffff;
+  for (const byte of type) c = PNG_CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8);
+  for (const byte of data) c = PNG_CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(typeText: string, data: Buffer) {
+  const type = Buffer.from(typeText, 'ascii');
+  const out = Buffer.alloc(12 + data.length);
+  out.writeUInt32BE(data.length, 0);
+  type.copy(out, 4);
+  data.copy(out, 8);
+  out.writeUInt32BE(pngCrc(type, data), 8 + data.length);
+  return out;
+}
+
+function createTransparentPng(width: number, height: number) {
+  const w = Math.max(1, Math.round(width));
+  const h = Math.max(1, Math.round(height));
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+  const rowBytes = w * 4 + 1;
+  const raw = Buffer.alloc(rowBytes * h);
+  for (let y = 0; y < h; y++) raw[y * rowBytes] = 0;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib.deflateSync(raw, { level: 1 })),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+function maxSecondsKeyframeTime(kfs: any): number {
+  if (!Array.isArray(kfs)) return 0;
+  return kfs.reduce((max: number, kf: any) => {
+    const t = Number(kf?.t);
+    return Number.isFinite(t) ? Math.max(max, t) : max;
+  }, 0);
+}
+
+function maxLottieKeyframeFrame(value: any, seen = new WeakSet<object>()): number {
+  if (!value || typeof value !== 'object') return 0;
+  if (seen.has(value)) return 0;
+  seen.add(value);
+  let max = 0;
+  if (Array.isArray(value)) {
+    for (const item of value) max = Math.max(max, maxLottieKeyframeFrame(item, seen));
+    return max;
+  }
+  const k = value.k;
+  if (Array.isArray(k) && k.length && typeof k[0] === 'object' && 't' in k[0]) {
+    for (const kf of k) {
+      const t = Number(kf?.t);
+      if (Number.isFinite(t)) max = Math.max(max, t);
+    }
+  }
+  for (const key of Object.keys(value)) {
+    if (key === 'p' && typeof value[key] === 'string') continue;
+    max = Math.max(max, maxLottieKeyframeFrame(value[key], seen));
+  }
+  return max;
+}
+
+function maxLottieShapeKeyframeFrame(lottieData: any): number {
+  const layers = Array.isArray(lottieData?.layers) ? lottieData.layers : [];
+  return layers.reduce((max: number, layer: any) => {
+    if (layer?.ty !== 4 || layer?.hd) return max;
+    return Math.max(max, maxLottieKeyframeFrame(layer?.ks), maxLottieKeyframeFrame(layer?.shapes));
+  }, 0);
+}
+
+function getTemplateAnimationEndSeconds(graphic: any, fps: number): number {
+  const safeFps = Math.max(1, Number(fps || 30));
+  let end = 0;
+  if (graphic?.templateKind === 'multi_png_title') {
+    const pairs = Array.isArray(graphic?.multiTitleModel?.pairs) ? graphic.multiTitleModel.pairs : [];
+    for (const pair of pairs) {
+      end = Math.max(
+        end,
+        maxSecondsKeyframeTime(pair?.imageOpacity),
+        maxSecondsKeyframeTime(pair?.textOpacity),
+        maxSecondsKeyframeTime(pair?.imageScaleX)
+      );
+      for (const track of pair?.imageOpacityTracks || []) end = Math.max(end, maxSecondsKeyframeTime(track));
+      for (const track of pair?.imageScaleXTracks || []) end = Math.max(end, maxSecondsKeyframeTime(track));
+    }
+  }
+  const lottieFr = Math.max(1, Number(graphic?.lottieData?.fr || safeFps));
+  end = Math.max(end, maxLottieShapeKeyframeFrame(graphic?.lottieData) / lottieFr);
+  const fallbackDur = Number(graphic?.templateDuration || 0);
+  if (end <= 0 && fallbackDur > 0) end = Math.min(fallbackDur, 2.0);
+  return Math.ceil(Math.max(0, end) * safeFps) / safeFps;
+}
+
+function getHybridGraphicsAnimationDuration(graphics: any[], renderIn: number, duration: number, fps: number): number {
+  let endRelative = 0;
+  for (const g of graphics) {
+    if (g?.visible === false || g?.type !== 'ae_template') continue;
+    const layerStart = Number(g.ts || 0);
+    const layerDur = Math.max(0, Number(g.dur || duration));
+    const animEnd = Math.min(layerDur || duration, getTemplateAnimationEndSeconds(g, fps) || Math.min(layerDur || duration, 2.0));
+    endRelative = Math.max(endRelative, layerStart + animEnd - renderIn);
+  }
+  if (endRelative <= 0) return Math.min(duration, 2.0);
+  return Math.min(duration, Math.ceil(endRelative * Math.max(1, fps)) / Math.max(1, fps));
+}
+
 async function renderJob(record: RenderJobRecord) {
   const output = record.payload?.output || {};
   const outputPath = output.outputPath || path.join(RENDER_DIR, output.fileName || `${record.id}.mp4`);
@@ -753,18 +878,9 @@ async function renderJob(record: RenderJobRecord) {
         await waitForRenderReady(transSession.client, 8000);
         rlog(`[Hybrid Render] Stage 1: Browser warm-up complete, ready to capture frames`);
 
-        const payloadIntroDuration = Math.max(0, ...graphics
-          .filter((g: any) => g?.visible !== false && g?.type === 'ae_template' && g?.lottieData)
-          .map((g: any) => {
-            const fr = Math.max(1, Number(g.lottieData?.fr || fps || 30));
-            const ip = Number(g.lottieData?.ip || 0);
-            const op = Number(g.lottieData?.op || ip + fr);
-            const byLottie = Math.max(0, (op - ip) / fr);
-            if (byLottie > 0) return byLottie;
-            const fallbackDur = Number(g.templateDuration || 0);
-            return fallbackDur > 0 ? Math.min(fallbackDur, 2.0) : 2.0;
-          }));
+        const payloadIntroDuration = getHybridGraphicsAnimationDuration(graphics, renderIn, duration, fps);
         introDuration = Math.min(duration, payloadIntroDuration || 2.0);
+        rlog(`[Hybrid Render] Template precache duration from keyframes: ${introDuration.toFixed(3)}s`);
 
         // [FIX] Read actual Lottie animation duration from the browser context
         // and fall back to the payload duration instead of a hardcoded 2 seconds.
@@ -809,18 +925,21 @@ async function renderJob(record: RenderJobRecord) {
         
         for (let i = 0; i < introFrameCount; i++) {
           const ts = renderIn + i / fps;
-          await setRenderTime(transSession.client, Number(ts.toFixed(6)));
-          
-          // [FIX] Use WebP lossless instead of PNG: preserves alpha channel,
-          // 40-60% smaller payload, fromSurface bypasses CPU readback overhead
-          const result = await transSession.client.send('Page.captureScreenshot', {
-            format: 'png',
-            clip: { x: 0, y: 0, width, height, scale: 1 },
-            fromSurface: true,
-          });
-          const frameBuffer = Buffer.from(result.data, 'base64');
           const framePath = path.join(hybridDir, `frame_${String(i).padStart(3, '0')}.png`);
-          await fsp.writeFile(framePath, frameBuffer);
+          if (i === 0) {
+            await fsp.writeFile(framePath, createTransparentPng(width, height));
+            rlog(`[Hybrid Render] Forced frame_000.png to transparent to prevent subtitle first-frame flash`);
+          } else {
+            await setRenderTime(transSession.client, Number(ts.toFixed(6)));
+
+            const result = await transSession.client.send('Page.captureScreenshot', {
+              format: 'png',
+              clip: { x: 0, y: 0, width, height, scale: 1 },
+              fromSurface: true,
+            });
+            const frameBuffer = Buffer.from(result.data, 'base64');
+            await fsp.writeFile(framePath, frameBuffer);
+          }
           
           record.progress = Number((10 + (i / introFrameCount) * 40).toFixed(2));
           record.currentFrame = i;
@@ -963,7 +1082,7 @@ async function renderJob(record: RenderJobRecord) {
       
       // Subtitle template inputs (if present)
       if (hasGraphics) {
-        hybridArgs.push('-framerate', String(fps), '-i', path.join(hybridDir, 'frame_%03d.png'));
+        hybridArgs.push('-framerate', String(fps), '-start_number', '0', '-i', path.join(hybridDir, 'frame_%03d.png'));
         if (staticFramePath && fs.existsSync(staticFramePath)) {
           hybridArgs.push('-loop', '1', '-i', staticFramePath);
         }
@@ -976,7 +1095,8 @@ async function renderJob(record: RenderJobRecord) {
         filterComplex += `[${subIntroIdx}:v]setpts=PTS-STARTPTS[${subIntroLabel}];`;
         
         const finalSubLabel = `sub_step`;
-        filterComplex += `[${lastV}][${subIntroLabel}]overlay=0:0:enable='lte(t,${introDuration.toFixed(6)})'[${finalSubLabel}];`;
+        const subOverlayStart = Math.min(introDuration, 1 / Math.max(1, fps));
+        filterComplex += `[${lastV}][${subIntroLabel}]overlay=0:0:enable='between(t,${subOverlayStart.toFixed(6)},${introDuration.toFixed(6)})'[${finalSubLabel}];`;
         lastV = finalSubLabel;
         currentInputIdx++;
         

@@ -1006,7 +1006,7 @@ const extractLottieTextFields = (data, metaFields = null) => {
   );
 };
 
-const applyLottieTextFields = (sourceData, fields = []) => {
+const applyLottieTextFields = (sourceData, fields = [], options = {}) => {
   if (!sourceData) return null;
   const glyphChars = getGlyphChars(sourceData);
   const bindingMap = new Map((fields || []).filter(f => f.bindingKey).map(f => [f.bindingKey, f]));
@@ -1049,7 +1049,7 @@ const applyLottieTextFields = (sourceData, fields = []) => {
     applyToLayers(cloned.layers, "__main__");
     (cloned.assets || []).forEach((asset, index) => applyToLayers(asset?.layers, asset?.id || `asset_${index}`));
   }
-  const customHide = sourceData?.__customHide || null;
+  const customHide = options.applyCustomHide === false ? null : (sourceData?.__customHide || null);
   const hideNativeLayer = idx => {
     const layer = cloned?.layers?.[idx];
     if (!layer) return;
@@ -1586,6 +1586,8 @@ function TemplateThumbnail({ template, fields = null, fontFamily = "Pretendard, 
 function GraphicEl({ g, time, renderZ = 1, selected, editing, onEdit, onEndEdit, onChange }) {
   const visible = time >= g.ts && time < g.ts + g.dur;
   if (!visible) return null;
+  const localFromTemplateStart = time - Number(g.ts || 0);
+  if (g.type === "ae_template" && g.templateKind === "multi_png_title" && localFromTemplateStart < 1 / 30) return null;
   const ct = time - g.ts + (g.startT || 0);
   const x = lerp(g.kf?.x, ct, g.x);
   const y = lerp(g.kf?.y, ct, g.y);
@@ -4880,7 +4882,15 @@ export default function HMStudio() {
             }}
           />
           {renderDomTemplateOverlay && graphics
-            .filter(g => (g.templateKind === 'vector_subtitle' || g.templateKind === 'multi_png_title') && g.visible !== false && time >= Number(g.ts || 0) && time < Number(g.ts || 0) + Number(g.dur || 0))
+            .filter(g => {
+              if (!(g.templateKind === 'vector_subtitle' || g.templateKind === 'multi_png_title')) return false;
+              if (g.visible === false) return false;
+              const start = Number(g.ts || 0);
+              const dur = Number(g.dur || 0);
+              if (!(time >= start && time < start + dur)) return false;
+              if (g.templateKind === 'multi_png_title' && time - start < 1 / Math.max(1, Number(comp.fps || 30))) return false;
+              return true;
+            })
             .map(g => (
               <GraphicEl
                 key={g.id}

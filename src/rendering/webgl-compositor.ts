@@ -1,6 +1,6 @@
 import type { ProjectState, TimelineLayer, VideoLayer, ImageLayer, TextLayer, ShapeLayer, AETemplateLayer } from './project-types';
 import { lerpKeyframe } from './interpolate';
-import { rasterizeTemplateToCanvas } from './template-canvas';
+import { rasterizeCachedMultiPngTitleCanvas, rasterizeTemplateToCanvas } from './template-canvas';
 
 type TextureSource = HTMLCanvasElement | HTMLVideoElement | HTMLImageElement;
 type VideoResourceMap = Record<string, HTMLVideoElement> | Map<string, HTMLVideoElement>;
@@ -197,9 +197,8 @@ export class WebGLCompositor {
     };
 
     if (layer.templateKind === 'multi_png_title') {
-      const lottieCanvas = templates?.[layer.id];
-      if (lottieCanvas) drawCanvas('lottie', lottieCanvas);
-      drawCanvas('overlay', rasterizeTemplateToCanvas(layer, localTime, 1));
+      const canvas = rasterizeCachedMultiPngTitleCanvas(layer, localTime, 1, comp.fps || 30);
+      drawCanvas((canvas as any).__hmTemplateCacheKey || 'multi-title', canvas);
       return;
     }
 
