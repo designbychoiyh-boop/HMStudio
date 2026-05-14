@@ -1,4 +1,4 @@
-﻿import { app, BrowserWindow, ipcMain, dialog, protocol, net, screen } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, protocol, net, screen } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import fsp from 'fs/promises';
@@ -127,6 +127,7 @@ type ActiveRenderSession = {
   frameCount: number;
   currentFrame: number;
   pendingFrameKey?: string;
+  forceTransparentFirstGraphicsFrame?: boolean;
   frameCache: Map<string, Buffer>;
   resolvePromise: () => void;
   rejectPromise: (err: Error) => void;
@@ -420,6 +421,32 @@ async function executeRenderJob(record: RenderJobRecord) {
     }
     return null;
   };
+  const resolveAssetPathLoose = (clip: any) => {
+    const rawName = String(clip?.name || '');
+    const ext = path.extname(rawName).toLowerCase();
+    const exts = ext ? [ext] : ['.mp4', '.mov', '.mkv', '.avi', '.webm'];
+    const tokens = rawName.match(/\d{3,}/g) || [];
+    if (!tokens.length) return null;
+    const dirs = [
+      ASSET_DIR,
+      path.join(os.homedir(), 'Desktop'),
+      path.join(os.homedir(), 'Downloads'),
+      ROOT,
+    ];
+    for (const dir of dirs) {
+      try {
+        if (!fs.existsSync(dir)) continue;
+        const files = fs.readdirSync(dir);
+        const match = files.find(f => {
+          const lower = f.toLowerCase();
+          if (!exts.some(e => lower.endsWith(e))) return false;
+          return tokens.some(token => lower.includes(token.toLowerCase()));
+        });
+        if (match) return path.join(dir, match);
+      } catch {}
+    }
+    return null;
+  };
   clips = clips.map((c: any) => {
     let resolvedPath = c.storedPath;
     if (!resolvedPath || !fs.existsSync(resolvedPath)) {
@@ -427,6 +454,9 @@ async function executeRenderJob(record: RenderJobRecord) {
     }
     if (!resolvedPath || !fs.existsSync(resolvedPath)) {
       resolvedPath = resolveAssetPathFromName(c.name);
+    }
+    if (!resolvedPath || !fs.existsSync(resolvedPath)) {
+      resolvedPath = resolveAssetPathLoose(c);
     }
     if (!resolvedPath || !fs.existsSync(resolvedPath)) {
       if (fs.existsSync(ASSET_DIR)) {
@@ -599,7 +629,7 @@ async function executeRenderJob(record: RenderJobRecord) {
       filterComplex += `[${currentInputIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2[${dLabel}];[${lastV}][${dLabel}]overlay=0:0:enable='between(t,${relTs.toFixed(6)},${(relTs + overlapDur).toFixed(6)})'[${oLabel}];`;
       lastV = oLabel; currentInputIdx++;
     }
-    if (hasGraphics) filterComplex += `[${lastV}][0:v]overlay=0:0[outv]`;
+    if (hasGraphics) filterComplex += `[${lastV}][0:v]overlay=0:0:enable='gte(t,${(1 / Math.max(1, fps)).toFixed(6)})'[outv]`;
     else filterComplex = filterComplex.replace(/;$/, '');
     
     if (filterComplex) ffmpegArgs.push('-filter_complex', filterComplex, '-map', hasGraphics ? '[outv]' : `[${lastV}]`);
@@ -650,6 +680,7 @@ async function executeRenderJob(record: RenderJobRecord) {
       renderWin,
       frameCount,
       currentFrame: 0,
+      forceTransparentFirstGraphicsFrame: canRunHybrid && hasGraphics,
       frameCache: new Map(),
       resolvePromise: async () => {
         try {
@@ -1210,7 +1241,7 @@ ipcMain.handle('api-request', async (event, { url, init }) => {
           }
         }, 800);
       }
-      return { success: !!successful, message: successful ? undefined : '????뀀┛??녾퉰 ???裕??????뺢퀡???먯쾸? ????紐?? ???용????덈펲.' };
+      return { success: !!successful, message: successful ? undefined : '사번 또는 비밀번호가 일치하지 않습니다.' };
     }
 
     if (cleanUrl === '/render-jobs') {
@@ -1311,7 +1342,7 @@ ipcMain.handle('open-media-dialog', async () => {
 });
 
 // IPC handler to write raw frames into FFmpeg stdin
-ipcMain.handle('frame-captured', async (event, { jobId, width, height, buffer }) => {
+ipcMain.handle('frame-captured', async (event, { jobId, frame, width, height, buffer }) => {
   const session = activeRenders.get(jobId);
   if (!session) return { ok: false, error: 'Render session inactive' };
 
@@ -1320,7 +1351,10 @@ ipcMain.handle('frame-captured', async (event, { jobId, width, height, buffer })
   // ipcRenderer.invoke('frame-captured') call, which in turn allows
   // __HM_SET_RENDER_TIME's Promise to resolve, which unblocks main.ts's
   // await executeJavaScript(...) for that frame. Serial, no deadlock.
-  const nodeBuffer = Buffer.from(buffer);
+  let nodeBuffer = Buffer.from(buffer);
+  if (session.forceTransparentFirstGraphicsFrame && Number(frame || 0) === 0) {
+    nodeBuffer = Buffer.alloc(Math.max(1, Number(width || 0)) * Math.max(1, Number(height || 0)) * 4);
+  }
   const frameKey = session.pendingFrameKey;
   if (frameKey && !frameKey.startsWith('dynamic:') && !session.frameCache.has(frameKey)) {
     session.frameCache.set(frameKey, Buffer.from(nodeBuffer));

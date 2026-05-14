@@ -1,4 +1,4 @@
-﻿import express from 'express';
+import express from 'express';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
@@ -1834,11 +1834,11 @@ app.post('/api/login', async (req, res) => {
     if (successful) {
       res.json({ success: true });
     } else {
-      res.json({ success: false, message: '????뀀┛??녾퉰 ???裕??????뺢퀡???먯쾸? ????紐?? ???용????덈펲.' });
+      res.json({ success: false, message: '사번 또는 비밀번호가 일치하지 않습니다.' });
     }
   } catch (err) {
     console.error('Login Proxy Error:', err);
-    res.status(500).json({ success: false, message: '?β돦裕?????類ㅼ뮅????얜?爰??????怨룸????덈펲.' });
+    res.status(500).json({ success: false, message: '서버와 통신 중 오류가 발생했습니다.' });
   }
 });
 

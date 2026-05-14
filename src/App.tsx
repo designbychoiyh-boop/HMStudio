@@ -5183,9 +5183,6 @@ export default function HMStudio() {
 
         {/* RIGHT: PROJECT ACTIONS */}
         <div style={{ display: "flex", gap: 8, alignItems: "center", flex: 1, justifyContent: "flex-end" }}>
-          <button onClick={() => setShowSystemModal(true)} style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(255,255,255,0.03)', border: `1px solid ${BORDER}`, borderRadius: 6, padding: '6px 12px', color: (systemStatus?.ffmpeg?.found && systemStatus?.browser?.found) ? ACCENT : '#ef4444', cursor: 'pointer', fontSize: 12 }}>
-            <span style={{ fontSize: 14 }}>{(systemStatus?.ffmpeg?.found && systemStatus?.browser?.found) ? "✅" : "⚠️"}</span> 필수 프로그램 설치 확인
-          </button>
           <button onClick={() => projectFileRef.current?.click()} style={{ ...btn(false), fontSize: 13, padding: '6px 14px' }}>📂 프로젝트 불러오기</button>
           <button onClick={saveProject} style={{ ...btn(false), fontSize: 13, padding: '6px 14px' }}>💾 프로젝트 저장</button>
           <input ref={projectFileRef} type="file" accept=".json" style={{ display: "none" }} onChange={loadProject} />

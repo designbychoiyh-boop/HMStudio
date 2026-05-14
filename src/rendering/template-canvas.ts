@@ -539,16 +539,17 @@ export function rasterizeTemplateToCanvas(template: AETemplateLayer, time: numbe
   return canvas;
 }
 
-export function rasterizeCachedMultiPngTitleCanvas(template: AETemplateLayer, time: number, scale = 1, fps = 30) {
+export function rasterizeCachedMultiPngTitleCanvas(template: AETemplateLayer, time: number, scale = 1, fps = 30, options: { includeLottieShapes?: boolean } = {}) {
   const w = Math.max(2, Math.round((template.width || template.templateW || 1000) * scale));
   const h = Math.max(2, Math.round((template.height || template.templateH || 200) * scale));
   const safeFps = Math.max(1, Number(fps || 30));
-  const firstFrameWindow = Math.max(0.0005, 0.5 / safeFps);
+  const firstFrameWindow = Math.max(0.0005, 1 / safeFps);
+  const includeLottieShapes = options.includeLottieShapes !== false;
   const endTime = getMultiPngTitleAnimationEnd(template, safeFps);
   const effectiveTime = time < firstFrameWindow ? 0 : (endTime > 0 && time > endTime ? endTime : time);
   const frameIndex = time < firstFrameWindow ? -1 : Math.max(0, Math.round(effectiveTime * safeFps));
   const signature = multiTitleCacheSignature(template, w, h, safeFps);
-  const cacheKey = `${signature}:${frameIndex}`;
+  const cacheKey = `${signature}:shapes=${includeLottieShapes ? 1 : 0}:${frameIndex}`;
   const cached = multiTitleFrameCache.get(cacheKey);
   if (cached) return cached;
 
@@ -561,7 +562,7 @@ export function rasterizeCachedMultiPngTitleCanvas(template: AETemplateLayer, ti
   if (frameIndex >= 0) {
     const overlayCanvas = rasterizeTemplateToCanvas(template, effectiveTime, scale);
     ctx.drawImage(overlayCanvas, 0, 0);
-    if (template.lottieData) {
+    if (includeLottieShapes && template.lottieData) {
       const shapeCanvas = rasterizeLottieShapesToCanvas(template.lottieData, effectiveTime, scale, w, h);
       ctx.drawImage(shapeCanvas, 0, 0);
     }

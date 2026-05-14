@@ -396,6 +396,7 @@ function renderCanvas2D(ctx: CanvasRenderingContext2D, project: any, time: numbe
       drawLayerImage(ctx, canvas, canvas.width, canvas.height, comp.w, comp.h, layer, localTime);
     } else if (layer.type === 'ae_template') {
       if (layer.templateKind === 'multi_png_title') {
+        if (localTime < 1 / Math.max(1, Number(comp.fps || 30))) continue;
         const cachedCanvas = rasterizeCachedMultiPngTitleCanvas(layer, localTime, 1, comp.fps || 30);
         drawLayerImage(ctx, cachedCanvas, cachedCanvas.width, cachedCanvas.height, comp.w, comp.h, layer, localTime);
         continue;

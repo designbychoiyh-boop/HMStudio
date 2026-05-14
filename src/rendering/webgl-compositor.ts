@@ -197,6 +197,7 @@ export class WebGLCompositor {
     };
 
     if (layer.templateKind === 'multi_png_title') {
+      if (localTime < 1 / Math.max(1, Number(comp.fps || 30))) return;
       const canvas = rasterizeCachedMultiPngTitleCanvas(layer, localTime, 1, comp.fps || 30);
       drawCanvas((canvas as any).__hmTemplateCacheKey || 'multi-title', canvas);
       return;
