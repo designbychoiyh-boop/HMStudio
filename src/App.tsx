@@ -4832,6 +4832,10 @@ export default function HMStudio() {
     });
   }, [graphics]);
   const isTransparent = queryParams.get('transparent') === '1';
+  const isFullPageCapture = queryParams.get('fullPageCapture') === '1';
+  const webglRenderGraphics = isFullPageCapture
+    ? processedGraphicsForWebGL.filter(g => !(g?.type === 'ae_template' && (g.templateKind === 'vector_subtitle' || g.templateKind === 'multi_png_title')))
+    : processedGraphicsForWebGL;
   const renderOnlyStage = (
     <div style={{ position: 'fixed', top: 0, left: 0, width: comp.w, height: comp.h, background: isTransparent ? 'transparent' : '#000', overflow: 'hidden', margin: 0, padding: 0, border: 'none' }}>
       {renderJobLoaded && (
@@ -4839,7 +4843,7 @@ export default function HMStudio() {
           <WebGLRenderStage
             composition={comp}
             clips={clips}
-            graphics={processedGraphicsForWebGL}
+            graphics={webglRenderGraphics}
             time={time}
             onReady={async (canvas) => {
               const isElectronIpcCapture = !!((window as any).electron && (window as any).__onElectronFrameReady);

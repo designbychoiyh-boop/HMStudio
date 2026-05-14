@@ -160,7 +160,7 @@ function nowIso() {
 }
 
 function safeName(name: string) {
-  return name.replace(/[^a-zA-Z0-9._-]+/g, '_');
+  return String(name || '').replace(/[^a-zA-Z0-9._-]+/g, '_');
 }
 
 function jobJsonPath(id: string) {
@@ -544,6 +544,57 @@ async function renderJob(record: RenderJobRecord) {
   const rlog = (msg: string) => { const line = `[${new Date().toISOString()}] ${msg}`; console.log(line); try { fs.appendFileSync(logPath, line + '\n'); } catch {} };
   let hybridRenderSuccess = false;
   let clips = record.payload?.clips || [];
+  const resolveAssetPathFromUrl = (ref: any) => {
+    const raw = typeof ref === 'string' ? ref : '';
+    if (!raw) return null;
+    try {
+      const pathname = raw.startsWith('http://') || raw.startsWith('https://') ? new URL(raw).pathname : raw;
+      const cleanPath = pathname.split('?')[0].split('#')[0].replace(/\\/g, '/');
+      const marker = '/assets/';
+      const lower = cleanPath.toLowerCase();
+      const markerIdx = lower.lastIndexOf(marker);
+      if (markerIdx < 0 && !lower.startsWith(marker)) return null;
+      const filePart = markerIdx >= 0 ? cleanPath.slice(markerIdx + marker.length) : cleanPath.slice(marker.length);
+      const fileName = path.basename(decodeURIComponent(filePart));
+      if (!fileName) return null;
+      const candidate = path.join(ASSET_DIR, fileName);
+      return fs.existsSync(candidate) ? candidate : null;
+    } catch {
+      return null;
+    }
+  };
+  const resolveAssetPathFromName = (name: any) => {
+    const fileName = String(name || '');
+    if (!fileName) return null;
+    const dirs = [
+      ASSET_DIR,
+      path.join(os.homedir(), 'Desktop'),
+      path.join(os.homedir(), 'Downloads'),
+      ROOT,
+    ];
+    const cleanName = safeName(fileName).replace(/\.[^/.]+$/, '').toLowerCase();
+    const ext = path.extname(fileName).toLowerCase();
+    for (const dir of dirs) {
+      try {
+        if (!fs.existsSync(dir)) continue;
+        const direct = path.join(dir, fileName);
+        if (fs.existsSync(direct)) return direct;
+        const files = fs.readdirSync(dir);
+        const exact = files.find(f => f.toLowerCase() === fileName.toLowerCase());
+        if (exact) return path.join(dir, exact);
+        if (ext) {
+          const fuzzy = files.find(f => {
+            const lower = f.toLowerCase();
+            if (!lower.endsWith(ext)) return false;
+            const fClean = safeName(f).replace(/\.[^/.]+$/, '').toLowerCase();
+            return cleanName && fClean.includes(cleanName);
+          });
+          if (fuzzy) return path.join(dir, fuzzy);
+        }
+      } catch {}
+    }
+    return null;
+  };
   
   // Auto-resolve missing or null storedPath / url from ASSET_DIR
   clips = clips.map((c: any) => {
@@ -552,6 +603,20 @@ async function renderJob(record: RenderJobRecord) {
     
     const pathExists = resolvedPath && fs.existsSync(resolvedPath);
     if (!pathExists) {
+      const directAssetPath = resolveAssetPathFromUrl(resolvedUrl || c.src || c.path);
+      if (directAssetPath) {
+        resolvedPath = directAssetPath;
+        resolvedUrl = `/assets/${path.basename(directAssetPath)}`;
+      }
+    }
+    if (!resolvedPath || !fs.existsSync(resolvedPath)) {
+      const directNamePath = resolveAssetPathFromName(c.name);
+      if (directNamePath) {
+        resolvedPath = directNamePath;
+        resolvedUrl = c.serverUrl || c.url || resolvedUrl;
+      }
+    }
+    if (!resolvedPath || !fs.existsSync(resolvedPath)) {
       console.log(`[Auto-Resolve] Clip "${c.name}" has missing/null storedPath. Searching ASSET_DIR: ${ASSET_DIR}`);
       if (fs.existsSync(ASSET_DIR)) {
         const files = fs.readdirSync(ASSET_DIR);

@@ -91,9 +91,10 @@ function mapGraphic(graphic: any): TimelineLayer | null {
       templateH: Number(graphic.templateH || graphic.height || 200),
       cropBounds: graphic.cropBounds || undefined,
       fields: Array.isArray(graphic.fields) ? graphic.fields.map((f: any) => ({
+        ...f,
         id: String(f.id),
         label: String(f.label || ''),
-        value: String(f.value || ''),
+        value: String(f.value ?? f.text ?? ''),
         x: typeof f.x === 'number' ? f.x : undefined,
         y: typeof f.y === 'number' ? f.y : undefined,
         w: typeof f.w === 'number' ? f.w : undefined,

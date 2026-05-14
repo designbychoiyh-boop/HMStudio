@@ -146,6 +146,7 @@ type LottieItem = {
   isCached: boolean;
   frameCache: Map<number, ImageData>;
   isLoaded: boolean;
+  hasWaitedForLoad: boolean;
 };
 
 async function syncLottieToTime(item: LottieItem, layer: any, time: number, fps: number) {
@@ -159,26 +160,11 @@ async function syncLottieToTime(item: LottieItem, layer: any, time: number, fps:
     const ctx = item.canvas.getContext('2d');
     if (!ctx) return;
 
-    // Serve from ImageData cache (faster than re-rendering)
-    if (item.frameCache.has(clampedFrame)) {
-      const cached = item.frameCache.get(clampedFrame)!;
-      ctx.putImageData(cached, 0, 0);
-      return;
-    }
-
     // Seek lottie-web to frame; canvas renderer paints synchronously
     item.anim.goToAndStop(clampedFrame, true);
 
     // Give the canvas renderer one microtask to flush its draw calls
     await new Promise<void>(resolve => setTimeout(resolve, 0));
-
-    // Cache the rendered ImageData for this frame
-    try {
-      const imageData = ctx.getImageData(0, 0, item.canvas.width, item.canvas.height);
-      item.frameCache.set(clampedFrame, imageData);
-    } catch {
-      // getImageData may fail if the canvas is tainted (cross-origin video); skip caching
-    }
   } catch (err) {
     console.warn('[RenderStage] syncLottieToTime failed:', err);
   }
@@ -214,7 +200,7 @@ async function waitForVisibleLotties(
       // [FIX] canvas renderer: Lottie draws directly to an HTMLCanvasElement.
       // Images referenced via asset.u+asset.p paths are loaded normally (same-origin
       // or CORS-enabled), and text glyphs are rasterised by the browser's own canvas
-      // text API — none of this goes through XMLSerializer, so nothing gets tainted.
+      // text API; none of this goes through XMLSerializer, so nothing gets tainted.
       const anim = lottie.loadAnimation({
         renderer: 'canvas',
         loop: false,
@@ -233,11 +219,16 @@ async function waitForVisibleLotties(
         isCached: false,
         frameCache: new Map(),
         isLoaded: false,
+        hasWaitedForLoad: false,
       };
 
-      // lottie-web canvas renderer fires DOMLoaded when the first frame is ready
-      anim.addEventListener('DOMLoaded', () => { entry.isLoaded = true; });
-      anim.addEventListener('data_ready',  () => { entry.isLoaded = true; });
+      // lottie-web canvas renderer event timing varies in headless Chrome.
+      // Mark all known ready signals, then fall back after one bounded wait below.
+      const markLoaded = () => { entry.isLoaded = true; };
+      anim.addEventListener('DOMLoaded', markLoaded);
+      anim.addEventListener('data_ready', markLoaded);
+      anim.addEventListener('loaded_images', markLoaded);
+      anim.addEventListener('config_ready', markLoaded);
 
       lotties.set(layer.id, entry);
       if (typeof window !== 'undefined') {
@@ -247,14 +238,19 @@ async function waitForVisibleLotties(
       item = entry;
     }
 
-    // Wait up to 2 s for the animation to initialise
-    let waitCount = 0;
-    while (!item.isLoaded && waitCount < 200) {
-      await wait(10);
-      waitCount++;
+    if (!item.isLoaded && !item.hasWaitedForLoad) {
+      // Wait once for lottie-web to initialise. Some canvas-renderer builds never
+      // emit DOMLoaded in headless mode, so repeating this per frame costs seconds.
+      let waitCount = 0;
+      while (!item.isLoaded && waitCount < 100) {
+        await wait(10);
+        waitCount++;
+      }
+      item.hasWaitedForLoad = true;
     }
 
     await syncLottieToTime(item, layer, time, fps);
+    item.isLoaded = true;
   }
 }
 
@@ -499,10 +495,10 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
       canvas.height = project.composition.h;
 
       try {
+        await preloadTemplateImages(project.layers);
         await waitForVisibleVideos(videosRef.current, project.layers, time, project.composition.fps);
         await waitForVisibleImages(imagesRef.current, project.layers, time);
         await waitForVisibleLotties(lottiesRef.current, project.layers, time, project.composition.fps);
-        await preloadTemplateImages(project.layers);
       } catch (err) {
         console.warn('[RenderStage] Resource sync failed, rendering available layers:', err);
       }

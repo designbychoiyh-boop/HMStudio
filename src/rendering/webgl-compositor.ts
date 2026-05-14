@@ -189,12 +189,22 @@ export class WebGLCompositor {
   }
 
   private drawTemplateLayer(layer: AETemplateLayer, comp: ProjectState['composition'], localTime: number, templates?: Record<string, HTMLCanvasElement>) {
-    // If we have a pre-rendered Lottie canvas from the render stage, use it for 100% fidelity.
-    // Exclude vector_subtitle and multi_png_title layers from using pre-rendered Lottie canvas, as they require custom dynamic drawing.
-    const lottieCanvas = (layer.templateKind === 'vector_subtitle' || layer.templateKind === 'multi_png_title') ? undefined : templates?.[layer.id];
-    const canvas = lottieCanvas || rasterizeTemplateToCanvas(layer, localTime, 1);
-    const tex = this.getTexture(`template:${layer.id}:${localTime.toFixed(3)}`, canvas);
-    this.drawTexture(tex.texture, canvas.width, canvas.height, comp.w, comp.h, layer, localTime);
+    const drawCanvas = (kind: string, canvas: HTMLCanvasElement) => {
+      const tex = this.getTexture(`template:${layer.id}:${kind}:${localTime.toFixed(3)}`, canvas);
+      const drawW = Math.max(2, Number(layer.width || canvas.width || 2));
+      const drawH = Math.max(2, Number(layer.height || canvas.height || 2));
+      this.drawTexture(tex.texture, drawW, drawH, comp.w, comp.h, layer, localTime);
+    };
+
+    if (layer.templateKind === 'multi_png_title') {
+      const lottieCanvas = templates?.[layer.id];
+      if (lottieCanvas) drawCanvas('lottie', lottieCanvas);
+      drawCanvas('overlay', rasterizeTemplateToCanvas(layer, localTime, 1));
+      return;
+    }
+
+    const lottieCanvas = layer.templateKind === 'vector_subtitle' ? undefined : templates?.[layer.id];
+    drawCanvas(lottieCanvas ? 'lottie' : 'fallback', lottieCanvas || rasterizeTemplateToCanvas(layer, localTime, 1));
   }
 
   render(project: ProjectState, time: number, resources: { videos?: VideoResourceMap; images?: ImageResourceMap; templates?: Record<string, HTMLCanvasElement> } = {}) {

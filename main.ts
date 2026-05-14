@@ -126,10 +126,45 @@ type ActiveRenderSession = {
   renderWin: BrowserWindow;
   frameCount: number;
   currentFrame: number;
+  pendingFrameKey?: string;
+  frameCache: Map<string, Buffer>;
   resolvePromise: () => void;
   rejectPromise: (err: Error) => void;
 };
 const activeRenders = new Map<string, ActiveRenderSession>();
+
+function writeRawFrame(session: ActiveRenderSession, buffer: Buffer) {
+  return new Promise<void>((resolve, reject) => {
+    session.ffmpegProc.stdin.once('error', reject);
+    const done = () => {
+      session.ffmpegProc.stdin.off('error', reject);
+      resolve();
+    };
+    if (!session.ffmpegProc.stdin.write(buffer)) {
+      session.ffmpegProc.stdin.once('drain', done);
+    } else {
+      done();
+    }
+  });
+}
+
+function bgraToRgbaInPlace(buffer: Buffer) {
+  for (let i = 0; i + 3 < buffer.length; i += 4) {
+    const b = buffer[i];
+    buffer[i] = buffer[i + 2];
+    buffer[i + 2] = b;
+  }
+  return buffer;
+}
+
+async function captureWindowRgba(renderWin: BrowserWindow, width: number, height: number) {
+  let image = await renderWin.webContents.capturePage({ x: 0, y: 0, width, height });
+  const size = image.getSize();
+  if (size.width !== width || size.height !== height) {
+    image = image.resize({ width, height, quality: 'best' });
+  }
+  return bgraToRgbaInPlace(Buffer.from(image.toBitmap()));
+}
 
 // Render jobs mapping
 type RenderJobRecord = {
@@ -333,9 +368,66 @@ async function executeRenderJob(record: RenderJobRecord) {
   // [AUTO-RESOLVE] & Hybrid Checks
   let clips = record.payload?.clips || [];
   const graphics = record.payload?.graphics || [];
-  const safeName = (n: string) => n.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+  const safeName = (n: string) => String(n || '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+  const resolveAssetPathFromUrl = (ref: any) => {
+    const raw = typeof ref === 'string' ? ref : '';
+    if (!raw) return null;
+    try {
+      const pathname = raw.startsWith('http://') || raw.startsWith('https://') ? new URL(raw).pathname : raw;
+      const cleanPath = pathname.split('?')[0].split('#')[0].replace(/\\/g, '/');
+      const marker = '/assets/';
+      const lower = cleanPath.toLowerCase();
+      const markerIdx = lower.lastIndexOf(marker);
+      if (markerIdx < 0 && !lower.startsWith(marker)) return null;
+      const filePart = markerIdx >= 0 ? cleanPath.slice(markerIdx + marker.length) : cleanPath.slice(marker.length);
+      const fileName = path.basename(decodeURIComponent(filePart));
+      if (!fileName) return null;
+      const candidate = path.join(ASSET_DIR, fileName);
+      return fs.existsSync(candidate) ? candidate : null;
+    } catch {
+      return null;
+    }
+  };
+  const resolveAssetPathFromName = (name: any) => {
+    const fileName = String(name || '');
+    if (!fileName) return null;
+    const dirs = [
+      ASSET_DIR,
+      path.join(os.homedir(), 'Desktop'),
+      path.join(os.homedir(), 'Downloads'),
+      ROOT,
+    ];
+    const cleanName = safeName(fileName).replace(/\.[^/.]+$/, '').toLowerCase();
+    const ext = path.extname(fileName).toLowerCase();
+    for (const dir of dirs) {
+      try {
+        if (!fs.existsSync(dir)) continue;
+        const direct = path.join(dir, fileName);
+        if (fs.existsSync(direct)) return direct;
+        const files = fs.readdirSync(dir);
+        const exact = files.find(f => f.toLowerCase() === fileName.toLowerCase());
+        if (exact) return path.join(dir, exact);
+        if (ext) {
+          const fuzzy = files.find(f => {
+            const lower = f.toLowerCase();
+            if (!lower.endsWith(ext)) return false;
+            const fClean = safeName(f).replace(/\.[^/.]+$/, '').toLowerCase();
+            return cleanName && fClean.includes(cleanName);
+          });
+          if (fuzzy) return path.join(dir, fuzzy);
+        }
+      } catch {}
+    }
+    return null;
+  };
   clips = clips.map((c: any) => {
     let resolvedPath = c.storedPath;
+    if (!resolvedPath || !fs.existsSync(resolvedPath)) {
+      resolvedPath = resolveAssetPathFromUrl(c.serverUrl || c.url || c.src || c.path);
+    }
+    if (!resolvedPath || !fs.existsSync(resolvedPath)) {
+      resolvedPath = resolveAssetPathFromName(c.name);
+    }
     if (!resolvedPath || !fs.existsSync(resolvedPath)) {
       if (fs.existsSync(ASSET_DIR)) {
         const files = fs.readdirSync(ASSET_DIR);
@@ -361,8 +453,10 @@ async function executeRenderJob(record: RenderJobRecord) {
   const isSimpleImage = (c: any) => c.type === 'image' && c.storedPath && fs.existsSync(c.storedPath) && (!c.kf || Object.keys(c.kf).length === 0) && !c.rotation;
   const imageClips = clips.filter(isSimpleImage);
   const hasComplexClips = clips.some((c: any) => c.type === 'image' && !isSimpleImage(c));
-  const canRunHybrid = !hasComplexClips && (videoClips.length > 0 || imageClips.length > 0);
   const hasGraphics = graphics.some((g: any) => g.visible !== false);
+  const hasAETemplateGraphics = graphics.some((g: any) => g?.visible !== false && g?.type === 'ae_template');
+  const usePageCapture = hasAETemplateGraphics;
+  const canRunHybrid = !hasComplexClips && (videoClips.length > 0 || imageClips.length > 0);
   const lottiePrecacheFrames: { ts: number; layerId: string; frame: number }[] = [];
   const lottiePrecacheSeen = new Set<string>();
   const getLottieFrameInfo = (layer: any) => {
@@ -398,9 +492,12 @@ async function executeRenderJob(record: RenderJobRecord) {
         return `dynamic:${frameIndex}`;
       }
 
-      const { lottieFps, animationFrameCount } = getLottieFrameInfo(layer);
+      const { lottieFps, animationFrameCount, animationDuration } = getLottieFrameInfo(layer);
       const local = Math.max(0, ts - layerStart);
-      const lottieFrame = Math.min(Math.round(local * lottieFps), animationFrameCount - 1);
+      if (local < animationDuration - 0.0001) {
+        return `dynamic:${frameIndex}`;
+      }
+      const lottieFrame = Math.min(Math.floor(local * lottieFps), animationFrameCount - 1);
       parts.push(`${layer.id}:${lottieFrame}`);
     }
 
@@ -418,12 +515,14 @@ async function executeRenderJob(record: RenderJobRecord) {
     if (overlapOut <= overlapIn) continue;
 
     const { lottieFps, animationFrameCount, animationDuration } = getLottieFrameInfo(layer);
-
-    const firstFrame = Math.max(0, Math.floor((overlapIn - layerStart) * lottieFps));
-    const animatedOverlapEnd = Math.min(overlapOut, layerStart + animationDuration);
+    const firstFrame = Math.min(
+      animationFrameCount - 1,
+      Math.max(0, Math.floor((overlapIn - layerStart) * lottieFps))
+    );
+    const animatedOverlapOut = Math.min(overlapOut, layerStart + animationDuration);
     const lastAnimatedFrame = Math.min(
       animationFrameCount - 1,
-      Math.max(0, Math.ceil((animatedOverlapEnd - layerStart) * lottieFps) - 1)
+      Math.max(0, Math.ceil((animatedOverlapOut - layerStart) * lottieFps) - 1)
     );
 
     for (let frame = firstFrame; frame <= lastAnimatedFrame; frame++) {
@@ -546,6 +645,7 @@ async function executeRenderJob(record: RenderJobRecord) {
       renderWin,
       frameCount,
       currentFrame: 0,
+      frameCache: new Map(),
       resolvePromise: async () => {
         try {
           renderWin.close();
@@ -692,7 +792,10 @@ async function executeRenderJob(record: RenderJobRecord) {
 
     try {
       // Load the app render stage in the background window
-      const url = `http://localhost:${APP_PORT}/?renderJob=${jobId}&renderTs=${encodeURIComponent(renderIn.toFixed(6))}` + (canRunHybrid ? '&transparent=1&onlyGraphics=1' : '');
+      const captureGraphicsOnly = canRunHybrid && hasGraphics;
+      const url = `http://localhost:${APP_PORT}/?renderJob=${jobId}&renderTs=${encodeURIComponent(renderIn.toFixed(6))}`
+        + (captureGraphicsOnly ? '&transparent=1&onlyGraphics=1' : '')
+        + (usePageCapture ? '&fullPageCapture=1' : '');
       await renderWin.loadURL(url);
 
       record.status = 'rendering';
@@ -731,11 +834,13 @@ async function executeRenderJob(record: RenderJobRecord) {
 
       // Step 2: Send start-client-render so App.tsx registers __onElectronFrameReady
       // before the frame loop begins.
-      renderWin.webContents.send('start-client-render', {
-        jobId,
-        fps,
-        totalFrames: frameCount,
-      });
+      if (!usePageCapture) {
+        renderWin.webContents.send('start-client-render', {
+          jobId,
+          fps,
+          totalFrames: frameCount,
+        });
+      }
 
       // Start the FFmpeg capture loop
       record.progress = 20.00;
@@ -745,14 +850,31 @@ async function executeRenderJob(record: RenderJobRecord) {
       let lastSavedAt = 0;
       for (let i = 0; i < frameCount; i++) {
         const ts = renderIn + i / fps;
-        try {
-          await renderWin.webContents.executeJavaScript(
-            `window.__HM_SET_RENDER_TIME(${ts})`
-          );
-        } catch (frameErr) {
-          // executeJavaScript can throw if the window is destroyed mid-render
-          console.error(`[Render ${jobId}] Frame ${i} executeJavaScript error:`, frameErr);
-          throw frameErr;
+        const frameKey = graphicsFrameKey(ts, i);
+        const session = activeRenders.get(jobId);
+        const cachedFrame = session?.frameCache.get(frameKey);
+        if (session && cachedFrame && frameKey !== `dynamic:${i}`) {
+          await writeRawFrame(session, cachedFrame);
+        } else {
+          if (session) session.pendingFrameKey = frameKey;
+          try {
+            await renderWin.webContents.executeJavaScript(
+              `window.__HM_SET_RENDER_TIME(${ts})`
+            );
+            if (usePageCapture && session) {
+              const capturedFrame = await captureWindowRgba(renderWin, width, height);
+              if (frameKey && !frameKey.startsWith('dynamic:') && !session.frameCache.has(frameKey)) {
+                session.frameCache.set(frameKey, Buffer.from(capturedFrame));
+              }
+              await writeRawFrame(session, capturedFrame);
+            }
+          } catch (frameErr) {
+            // executeJavaScript can throw if the window is destroyed mid-render
+            console.error(`[Render ${jobId}] Frame ${i} executeJavaScript error:`, frameErr);
+            throw frameErr;
+          } finally {
+            if (session) session.pendingFrameKey = undefined;
+          }
         }
 
         record.currentFrame = i + 1;
@@ -1192,14 +1314,12 @@ ipcMain.handle('frame-captured', async (event, { jobId, width, height, buffer })
   // ipcRenderer.invoke('frame-captured') call, which in turn allows
   // __HM_SET_RENDER_TIME's Promise to resolve, which unblocks main.ts's
   // await executeJavaScript(...) for that frame. Serial, no deadlock.
-  await new Promise<void>((resolve, reject) => {
-    const nodeBuffer = Buffer.from(buffer);
-    if (!session.ffmpegProc.stdin.write(nodeBuffer)) {
-      session.ffmpegProc.stdin.once('drain', resolve);
-    } else {
-      resolve();
-    }
-  });
+  const nodeBuffer = Buffer.from(buffer);
+  const frameKey = session.pendingFrameKey;
+  if (frameKey && !frameKey.startsWith('dynamic:') && !session.frameCache.has(frameKey)) {
+    session.frameCache.set(frameKey, Buffer.from(nodeBuffer));
+  }
+  await writeRawFrame(session, nodeBuffer);
 
   return { ok: true };
 });
