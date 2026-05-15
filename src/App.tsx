@@ -30,7 +30,7 @@ const upsertKeyframe = (item, prop, time, value) => {
   const next = { ...(item.kf || {}) };
   const arr = [...(next[prop] || [])];
   const idx = arr.findIndex(k => Math.abs(k.t - time) < 0.001);
-  const kf = { t: time, v: value };
+  const kf = { ...(idx >= 0 ? arr[idx] : {}), t: time, v: value };
   if (idx >= 0) arr[idx] = kf; else arr.push(kf);
   arr.sort((a, b) => a.t - b.t);
   next[prop] = arr;
@@ -361,6 +361,54 @@ const scaleLayerX = (layer, factor) => {
     }));
   }
 };
+const scalePointXAround = (value, centerX, factor) => {
+  if (!Array.isArray(value)) return value;
+  return [centerX + (Number(value[0] || 0) - centerX) * factor, value[1], ...(value.length > 2 ? [value[2]] : [])];
+};
+const scaleDeltaX = (value, factor) => {
+  if (!Array.isArray(value)) return value;
+  return [Number(value[0] || 0) * factor, value[1], ...(value.length > 2 ? [value[2]] : [])];
+};
+const scaleLayerPositionX = (layer, centerX, factor) => {
+  const pos = layer?.ks?.p;
+  if (!pos || pos.s) return;
+  const key = pos.k;
+  if (Array.isArray(key) && key.length && typeof key[0] === "number") {
+    pos.k = scalePointXAround(key, centerX, factor);
+    return;
+  }
+  if (Array.isArray(key) && key.length && typeof key[0] === "object") {
+    pos.k = key.map(frame => ({
+      ...frame,
+      s: scalePointXAround(frame?.s, centerX, factor),
+      e: scalePointXAround(frame?.e, centerX, factor),
+      to: scaleDeltaX(frame?.to, factor),
+      ti: scaleDeltaX(frame?.ti, factor),
+    }));
+  }
+};
+const getAnimatedPositionXRange = layer => {
+  const key = layer?.ks?.p?.k;
+  if (!Array.isArray(key) || !key.length || typeof key[0] !== "object") return null;
+  const xs = key.flatMap(frame => [frame?.s, frame?.e])
+    .filter(value => Array.isArray(value))
+    .map(value => Number(value[0]))
+    .filter(value => Number.isFinite(value));
+  if (xs.length < 2) return null;
+  const min = Math.min(...xs);
+  const max = Math.max(...xs);
+  if (max - min <= 1) return null;
+  return { min, max, span: max - min, center: (min + max) / 2 };
+};
+const getLayerPositionSamples = layer => {
+  const key = layer?.ks?.p?.k;
+  if (Array.isArray(key) && key.length && typeof key[0] === "number") return [key];
+  if (Array.isArray(key) && key.length && typeof key[0] === "object") {
+    return key.flatMap(frame => [frame?.s, frame?.e]).filter(value => Array.isArray(value));
+  }
+  const point = readTransformValueForLayout(layer?.ks?.p, null);
+  return Array.isArray(point) ? [point] : [];
+};
 const getLayerTimingSec = (layer, data) => {
   const fr = Math.max(1, Number(data?.fr || 30));
   return { ip: Number(layer?.ip ?? data?.ip ?? 0) / fr, op: Number(layer?.op ?? data?.op ?? 0) / fr };
@@ -554,6 +602,8 @@ const collectResizeTargets = data => {
     const imageCenterY = Number(pos?.[1] || 0) - Number(anc?.[1] || 0) * scaleY + (Number(bbox.y || 0) + Number(bbox.h || 0) / 2) * scaleY;
     const visibleW = Math.max(1, Number(bbox.w || asset?.w || 1) * scaleX);
     const visibleH = Math.max(1, Number(bbox.h || asset?.h || 1) * scaleY);
+    const imageLeft = imageCenterX - visibleW / 2;
+    const imageTop = imageCenterY - visibleH / 2;
     
     // 이미 사용된 텍스트는 제외하고 가장 적합한 대상을 찾음 (1대1 매칭 지향)
     const candidates = texts.filter(t => !usedTextKeys.has(t.bindingKey)).map(txt => {
@@ -582,6 +632,10 @@ const collectResizeTargets = data => {
       visibleH,
       imageCenterX,
       imageCenterY,
+      imageLeft,
+      imageRight: imageLeft + visibleW,
+      imageTop,
+      imageBottom: imageTop + visibleH,
       bbox,
       ip: timing.ip,
       op: timing.op,
@@ -590,10 +644,31 @@ const collectResizeTargets = data => {
   }).filter(Boolean);
 };
 
+const shapeLayerMatchesResizeTarget = (layer, target, data) => {
+  if (layer?.ty !== 4 || layer?.hd) return false;
+  const timing = getLayerTimingSec(layer, data);
+  const overlap = Math.max(0, Math.min(timing.op, target.op) - Math.max(timing.ip, target.ip));
+  if (overlap <= 0) return false;
+  const samples = getLayerPositionSamples(layer);
+  if (!samples.length) return false;
+  const xs = samples.map(point => Number(point?.[0] || 0));
+  const ys = samples.map(point => Number(point?.[1] || 0));
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const avgY = ys.reduce((sum, y) => sum + y, 0) / Math.max(1, ys.length);
+  const horizontalPad = Math.max(80, target.visibleW * 0.25);
+  const verticalPad = Math.max(40, target.visibleH * 0.75);
+  return maxX >= target.imageLeft - horizontalPad
+    && minX <= target.imageRight + horizontalPad
+    && avgY >= target.imageTop - verticalPad
+    && avgY <= target.imageBottom + verticalPad;
+};
+
 const autoFitLottieBackground = (data, sourceData, fields = []) => {
   if (!data || !sourceData) return data;
   const bindingMap = new Map((fields || []).filter(f => f.bindingKey).map(f => [f.bindingKey, f]));
   const targets = collectResizeTargets(sourceData);
+  const scaledShapeLayerIndices = new Set();
   targets.forEach(target => {
     const layer = data?.layers?.[target.layerIndex];
     const field = bindingMap.get(target.bindingKey);
@@ -605,6 +680,16 @@ const autoFitLottieBackground = (data, sourceData, fields = []) => {
     const desiredVisibleW = Math.max(target.visibleW, newWidth + innerPad * 2);
     const factor = Math.max(1, desiredVisibleW / Math.max(1, target.visibleW));
     scaleLayerX(layer, factor);
+    (data?.layers || []).forEach((candidate, index) => {
+      if (scaledShapeLayerIndices.has(index)) return;
+      if (!shapeLayerMatchesResizeTarget(candidate, target, sourceData)) return;
+      const animatedRange = getAnimatedPositionXRange(candidate);
+      if (!animatedRange) return;
+      const shapeFactor = Math.max(factor, desiredVisibleW / Math.max(1, animatedRange.span));
+      if (shapeFactor <= 1.0001) return;
+      scaleLayerPositionX(candidate, animatedRange.center, shapeFactor);
+      scaledShapeLayerIndices.add(index);
+    });
   });
   return data;
 };
@@ -1179,16 +1264,17 @@ function VectorSubtitleTemplate({ model, fields = [], time = 999, selected = fal
     const rightW = leftW;
     const centerSrcW = Math.max(1, srcW - capSrc * 2);
     const centerDestW = Math.max(1, barWidth - leftW - rightW);
+    const sourceBleed = Math.min(2, capSrc - 1, centerSrcW / 2);
 
     bgEls = (
       <g transform={`translate(${barWidth / 2} ${barHeight / 2}) scale(${reveal} 1) translate(${-barWidth / 2} ${-barHeight / 2})`}>
-        <svg x={0} y={0} width={leftW} height={barHeight} viewBox={`0 0 ${capSrc} ${srcH}`} preserveAspectRatio="none">
+        <svg x={0} y={0} width={leftW} height={barHeight} viewBox={`0 0 ${capSrc + sourceBleed} ${srcH}`} preserveAspectRatio="none">
           <image href={imgMeta.src} x={0} y={0} width={srcW} height={srcH} preserveAspectRatio="none" />
         </svg>
-        <svg x={leftW} y={0} width={centerDestW} height={barHeight} viewBox={`${capSrc} 0 ${centerSrcW} ${srcH}`} preserveAspectRatio="none">
+        <svg x={leftW} y={0} width={centerDestW} height={barHeight} viewBox={`${capSrc - sourceBleed} 0 ${centerSrcW + sourceBleed * 2} ${srcH}`} preserveAspectRatio="none">
           <image href={imgMeta.src} x={0} y={0} width={srcW} height={srcH} preserveAspectRatio="none" />
         </svg>
-        <svg x={leftW + centerDestW} y={0} width={rightW} height={barHeight} viewBox={`${srcW - capSrc} 0 ${capSrc} ${srcH}`} preserveAspectRatio="none">
+        <svg x={leftW + centerDestW} y={0} width={rightW} height={barHeight} viewBox={`${srcW - capSrc - sourceBleed} 0 ${capSrc + sourceBleed} ${srcH}`} preserveAspectRatio="none">
           <image href={imgMeta.src} x={0} y={0} width={srcW} height={srcH} preserveAspectRatio="none" />
         </svg>
       </g>
@@ -1269,18 +1355,19 @@ function MultiPngTitlePair({ pair, field, model, time = 0, drawBackground = true
     const rightW = leftW;
     const centerSrcW = Math.max(1, srcW - capSrc * 2);
     const centerDestW = Math.max(1, barWidth - leftW - rightW);
+    const sourceBleed = Math.min(2, capSrc - 1, centerSrcW / 2);
     const originX = Number(pair.scaleOriginXInBar ?? baseWidth / 2) + extraLeft;
     const originY = Number(pair.scaleOriginYInBar ?? barHeight / 2);
 
     bgEls = (
       <g opacity={imageOpacity} filter={imageTintMatrix ? `url(#${tintFilterId})` : undefined} transform={`translate(${originX} ${originY}) scale(${imageScaleX} 1) translate(${-originX} ${-originY})`}>
-        <svg x={0} y={0} width={leftW} height={barHeight} viewBox={`${srcX} ${srcY} ${capSrc} ${srcH}`} preserveAspectRatio="none">
+        <svg x={0} y={0} width={leftW} height={barHeight} viewBox={`${srcX} ${srcY} ${capSrc + sourceBleed} ${srcH}`} preserveAspectRatio="none">
           <image href={imgMeta.src} x={0} y={0} width={imgMeta.width} height={imgMeta.height} preserveAspectRatio="none" />
         </svg>
-        <svg x={leftW} y={0} width={centerDestW} height={barHeight} viewBox={`${srcX + capSrc} ${srcY} ${centerSrcW} ${srcH}`} preserveAspectRatio="none">
+        <svg x={leftW} y={0} width={centerDestW} height={barHeight} viewBox={`${srcX + capSrc - sourceBleed} ${srcY} ${centerSrcW + sourceBleed * 2} ${srcH}`} preserveAspectRatio="none">
           <image href={imgMeta.src} x={0} y={0} width={imgMeta.width} height={imgMeta.height} preserveAspectRatio="none" />
         </svg>
-        <svg x={leftW + centerDestW} y={0} width={rightW} height={barHeight} viewBox={`${srcX + srcW - capSrc} ${srcY} ${capSrc} ${srcH}`} preserveAspectRatio="none">
+        <svg x={leftW + centerDestW} y={0} width={rightW} height={barHeight} viewBox={`${srcX + srcW - capSrc - sourceBleed} ${srcY} ${capSrc + sourceBleed} ${srcH}`} preserveAspectRatio="none">
           <image href={imgMeta.src} x={0} y={0} width={imgMeta.width} height={imgMeta.height} preserveAspectRatio="none" />
         </svg>
       </g>
@@ -2138,12 +2225,14 @@ export default function HMStudio() {
     setExpandedLayers(next);
   };
   const [clips, setClips] = useState([]);
+  const [mediaAssets, setMediaAssets] = useState([]);
   const [graphics, setGraphics] = useState([]);
   const [time, setTime] = useState(0);
   const [totalDur, setTotalDur] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [selClipId, setSelClipId] = useState(null);
   const [selGfxId, setSelGfxId] = useState(null);
+  const [selectedMediaAssetId, setSelectedMediaAssetId] = useState(null);
   const [selectedTimelineItems, setSelectedTimelineItems] = useState<Set<string>>(new Set());
   const [selectedKeyframes, setSelectedKeyframes] = useState<Set<string>>(new Set());
   const [keyframeSelectBox, setKeyframeSelectBox] = useState<any>(null);
@@ -2271,8 +2360,8 @@ export default function HMStudio() {
   .catch(err => console.error("Failed to fetch templates list:", err));
   }, []);
   const [editingTemplateId, setEditingTemplateId] = useState(null);
-  const [history, setHistory] = useState([]);
-  const [redo, setRedo] = useState([]);
+  const [history, setHistory] = useState<any[]>([]);
+  const [redo, setRedo] = useState<any[]>([]);
   const [interact, setInteract] = useState(null);
   const [timelineDrag, setTimelineDrag] = useState(null);
   const [timelineResize, setTimelineResize] = useState(null);
@@ -2349,6 +2438,7 @@ export default function HMStudio() {
     const projectData = {
       version: "1.0",
       composition: comp,
+      mediaAssets: mediaAssets,
       clips: clips,
       graphics: graphics,
       exportSettings: exportSettings
@@ -2414,7 +2504,7 @@ export default function HMStudio() {
 
           const isElectron = !!(window as any).electron;
 
-          const processed = data.clips.map(c => {
+          const relinkMediaItem = c => {
             let resolvedUrl = c.serverUrl || c.url;
             let resolvedPath = c.storedPath;
 
@@ -2457,8 +2547,12 @@ export default function HMStudio() {
               serverUrl: resolvedUrl,
               storedPath: resolvedPath
             };
-          });
+          };
+
+          const processed = data.clips.map(relinkMediaItem);
           setClips(processed);
+          const sourceAssets = Array.isArray(data.mediaAssets) ? data.mediaAssets : data.clips;
+          setMediaAssets(sourceAssets.map(relinkMediaItem));
         }
         
         if (data.graphics) setGraphics(data.graphics);
@@ -2943,24 +3037,75 @@ export default function HMStudio() {
 
 
   // ── History ────────────────────────────────────────────────────────────
+  const cloneUndoValue = useCallback((value: any) => JSON.parse(JSON.stringify(value)), []);
+  const makeUndoState = useCallback(() => ({
+    clips: cloneUndoValue(clips),
+    mediaAssets: cloneUndoValue(mediaAssets),
+    graphics: cloneUndoValue(graphics),
+    comp: cloneUndoValue(comp),
+    renderIn,
+    renderOut,
+    time,
+  }), [clips, mediaAssets, graphics, comp, renderIn, renderOut, time, cloneUndoValue]);
+  const undoStateKey = useCallback((state: any) => JSON.stringify({
+    clips: state.clips,
+    mediaAssets: state.mediaAssets,
+    graphics: state.graphics,
+    comp: state.comp,
+    renderIn: state.renderIn,
+    renderOut: state.renderOut,
+    time: state.time,
+  }), []);
+  const applyUndoState = useCallback((state: any) => {
+    setClips(cloneUndoValue(state.clips || []));
+    if (Array.isArray(state.mediaAssets)) setMediaAssets(cloneUndoValue(state.mediaAssets));
+    setGraphics(cloneUndoValue(state.graphics || []));
+    if (state.comp) setComp(cloneUndoValue(state.comp));
+    setRenderIn(Number(state.renderIn || 0));
+    setRenderOut(state.renderOut == null ? null : Number(state.renderOut));
+    setTime(Number(state.time || 0));
+  }, [cloneUndoValue]);
   const snap = useCallback(() => {
-    setHistory(h => [...h, { clips, graphics }].slice(-40));
+    const state = makeUndoState();
+    const key = undoStateKey(state);
+    setHistory(h => {
+      if (h[h.length - 1]?.__key === key) return h;
+      return [...h, { ...state, __key: key }].slice(-80);
+    });
     setRedo([]);
-  }, [clips, graphics]);
-  const undoFn = () => setHistory(h => {
-    if (!h.length) return h;
-    const prev = h[h.length - 1];
-    setRedo(r => [...r, { clips, graphics }]);
-    setClips(prev.clips); setGraphics(prev.graphics);
-    return h.slice(0, -1);
-  });
-  const redoFn = () => setRedo(r => {
-    if (!r.length) return r;
-    const next = r[r.length - 1];
-    setHistory(h => [...h, { clips, graphics }]);
-    setClips(next.clips); setGraphics(next.graphics);
-    return r.slice(0, -1);
-  });
+  }, [makeUndoState, undoStateKey]);
+  const undoFn = useCallback(() => {
+    const current = makeUndoState();
+    const currentKey = undoStateKey(current);
+    setHistory(h => {
+      let idx = h.length - 1;
+      while (idx >= 0 && h[idx]?.__key === currentKey) idx -= 1;
+      if (idx < 0) return h.filter(entry => entry?.__key !== currentKey);
+      const prev = h[idx];
+      setRedo(r => {
+        if (r[r.length - 1]?.__key === currentKey) return r;
+        return [...r, { ...current, __key: currentKey }].slice(-80);
+      });
+      applyUndoState(prev);
+      return h.slice(0, idx);
+    });
+  }, [makeUndoState, undoStateKey, applyUndoState]);
+  const redoFn = useCallback(() => {
+    const current = makeUndoState();
+    const currentKey = undoStateKey(current);
+    setRedo(r => {
+      let idx = r.length - 1;
+      while (idx >= 0 && r[idx]?.__key === currentKey) idx -= 1;
+      if (idx < 0) return r.filter(entry => entry?.__key !== currentKey);
+      const next = r[idx];
+      setHistory(h => {
+        if (h[h.length - 1]?.__key === currentKey) return h;
+        return [...h, { ...current, __key: currentKey }].slice(-80);
+      });
+      applyUndoState(next);
+      return r.slice(0, idx);
+    });
+  }, [makeUndoState, undoStateKey, applyUndoState]);
   const getStageEl = useCallback(() => ((previewPopout && previewHostRef.current) ? (popupStageRef.current || stageRef.current) : stageRef.current), [previewPopout]);
   const layerKey = useCallback(layer => `${layer.__kind || (layer.url ? 'clip' : 'graphic')}:${layer.id}`, []);
   const applyLayerOrder = useCallback((orderedLayers) => {
@@ -3333,7 +3478,7 @@ export default function HMStudio() {
         try { popupWin.document.removeEventListener("keydown", onKey, true); } catch (_) {}
       }
     };
-  }, [selGfxId, selClipId, clips, graphics, copiedItem, time, previewPopout, selectedKeyframes]);
+  }, [selGfxId, selClipId, selectedMediaAssetId, clips, graphics, copiedItem, time, previewPopout, selectedKeyframes, undoFn, redoFn, snap]);
   // ── Canvas Interaction Mouse ────────────────────────────────────────────
   useEffect(() => {
     if (!interact) return;
@@ -3366,7 +3511,7 @@ export default function HMStudio() {
         else updateGfx(interact.gid, { rotation: next });
       }
     };
-    const onUp = () => { snap(); setInteract(null); };
+    const onUp = () => { setInteract(null); };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     const popupWin = previewWinRef.current;
@@ -3549,6 +3694,7 @@ export default function HMStudio() {
   }, [isResizingPanel, rightPanelWidth, leftPanelWidth]);
   // ── Helpers ────────────────────────────────────────────────────────────
   const beginInteract = useCallback((e, g, mode, kind = "graphic") => {
+    if (e.button !== 0) return;
     e.stopPropagation();
     const rect = getStageEl()?.getBoundingClientRect();
     if (!rect) return;
@@ -3563,9 +3709,12 @@ export default function HMStudio() {
     const sa = Math.atan2(e.clientY - cy, e.clientX - cx);
     if (kind === "clip") { setSelClipId(g.id); setSelGfxId(null); }
     else { setSelGfxId(g.id); setSelClipId(null); }
+    setSelectedMediaAssetId(null);
+    snap();
     setInteract({ mode, kind, gid: g.id, px: e.clientX, py: e.clientY, sx, sy, ss, sr, sd, sa });
-  }, [time, getStageEl]);
+  }, [time, getStageEl, snap]);
   const handleCanvasDown = e => {
+    if (e.button !== 0) return;
     if (editingGfxId) return;
     const rect = getStageEl()?.getBoundingClientRect();
     if (!rect) return;
@@ -3583,7 +3732,7 @@ export default function HMStudio() {
       return xp >= gx - hw && xp <= gx + hw && yp >= gy - hh && yp <= gy + hh;
     });
     if (hit) {
-      setSelGfxId(hit.id); setSelClipId(null);
+      setSelGfxId(hit.id); setSelClipId(null); setSelectedMediaAssetId(null);
       if ((hit.type === "text") && e.detail >= 2) { setEditingGfxId(hit.id); return; }
       if (tool === "select") beginInteract(e, hit, "move");
       return;
@@ -3613,11 +3762,11 @@ export default function HMStudio() {
       return xp >= cx - hw && xp <= cx + hw && yp >= cy - hh && yp <= cy + hh;
     });
     if (clipHit) {
-      setSelClipId(clipHit.id); setSelGfxId(null);
+        setSelClipId(clipHit.id); setSelGfxId(null); setSelectedMediaAssetId(null);
       if (tool === "select") beginInteract(e, clipHit, "move", "clip");
       return;
     }
-    setSelGfxId(null); setSelClipId(null);
+    setSelGfxId(null); setSelClipId(null); setSelectedMediaAssetId(null);
   };
   const fitAllLayers = () => {
     snap();
@@ -3648,6 +3797,7 @@ export default function HMStudio() {
 
     const startAt = time;
     const newClips = [];
+    const newAssets = [];
     let firstVisualMeta: { w: number; h: number } | null = null;
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
@@ -3709,8 +3859,10 @@ export default function HMStudio() {
       }
       
       const dur = meta.dur;
+      const assetId = uid();
       const clip = { 
         id: uid(), 
+        assetId,
         type: isAudio ? 'audio' : (isImage ? 'image' : 'video'),
         file, url, serverUrl, storedPath, 
         name: file.name, 
@@ -3725,6 +3877,17 @@ export default function HMStudio() {
         layerOrder: Date.now() + i 
       };
       newClips.push(clip);
+      newAssets.push({
+        ...clip,
+        id: assetId,
+        assetId,
+        ts: 0,
+        startT: 0,
+        endT: dur,
+        kf: null,
+        visible: true,
+        layerOrder: 0,
+      });
     }
 
     // Auto-set canvas resolution to match the first visual media file
@@ -3733,6 +3896,7 @@ export default function HMStudio() {
     }
 
     snap();
+    setMediaAssets(as => [...as, ...newAssets]);
     setClips(cs => [...cs, ...newClips]);
     const minNewTs = Math.min(...newClips.map(c => c.ts));
     const maxNewEnd = Math.max(...newClips.map(c => c.ts + c.dur));
@@ -3939,6 +4103,36 @@ export default function HMStudio() {
     setGraphics(gs => [...gs, g]);
     setSelGfxId(g.id); setSelClipId(null); setSelectedTimelineItems(new Set([`graphic:${g.id}`])); setShowAEPanel(false); setTool("select");
   };
+  const insertMediaAsset = useCallback((asset) => {
+    requestPreviewFullscreenNow();
+    setTimeout(requestPreviewFullscreenNow, 80);
+    setTimeout(requestPreviewFullscreenNow, 300);
+    snap();
+    const dur = Math.max(0.1, Number(asset.dur || asset.endT || 5));
+    const id = uid();
+    const clip = {
+      ...asset,
+      id,
+      assetId: asset.assetId || asset.id,
+      ts: time,
+      dur,
+      startT: 0,
+      endT: dur,
+      kf: null,
+      visible: true,
+      layerOrder: Date.now(),
+    };
+    setClips(cs => [...cs, clip]);
+    setSelClipId(id);
+    setSelGfxId(null);
+    setSelectedMediaAssetId(null);
+    setSelectedTimelineItems(new Set([`clip:${id}`]));
+    setTool("select");
+    const end = time + dur;
+    setTotalDur(prev => Math.max(prev, end));
+    setRenderIn(prev => Math.min(prev ?? time, time));
+    setRenderOut(prev => prev == null ? end : Math.max(prev, end));
+  }, [requestPreviewFullscreenNow, snap, time]);
   const selGfx = graphics.find(g => g.id === selGfxId);
   const selClip = clips.find(c => c.id === selClipId);
   const timelineLayers = useMemo(() => ([
@@ -4145,7 +4339,16 @@ export default function HMStudio() {
       }
     }
   };
-  const deleteSelected = () => { if (selGfxId) { snap(); setGraphics(gs => gs.filter(g => g.id !== selGfxId)); setSelGfxId(null); } if (selClipId) { snap(); setClips(cs => cs.filter(c => c.id !== selClipId)); setSelClipId(null); } };
+  const deleteSelected = () => {
+    if (selectedMediaAssetId) {
+      snap();
+      setMediaAssets(as => as.filter(asset => asset.id !== selectedMediaAssetId));
+      setSelectedMediaAssetId(null);
+      return;
+    }
+    if (selGfxId) { snap(); setGraphics(gs => gs.filter(g => g.id !== selGfxId)); setSelGfxId(null); }
+    if (selClipId) { snap(); setClips(cs => cs.filter(c => c.id !== selClipId)); setSelClipId(null); }
+  };
   const createGraphicAtPoint = (kind, clientX, clientY) => {
     const rect = getStageEl()?.getBoundingClientRect();
     if (!rect) return;
@@ -4414,20 +4617,23 @@ export default function HMStudio() {
 
   const markRenderIn = useCallback(() => {
     const nextIn = clamp(time, 0, Math.max(0, totalDur));
+    snap();
     setRenderIn(nextIn);
     setRenderOut(prev => prev != null && prev < nextIn ? nextIn : prev);
-  }, [time, totalDur]);
+  }, [time, totalDur, snap]);
 
   const markRenderOut = useCallback(() => {
     const nextOut = clamp(time, 0.1, Math.max(0.1, totalDur));
+    snap();
     setRenderOut(nextOut);
     setRenderIn(prev => prev > nextOut ? nextOut : prev);
-  }, [time, totalDur]);
+  }, [time, totalDur, snap]);
 
   const clearRenderRange = useCallback(() => {
+    snap();
     setRenderIn(0);
     setRenderOut(Math.max(totalDur, 0.1));
-  }, [totalDur]);
+  }, [totalDur, snap]);
 
   const saveRemoteJobLocally = async (job: any) => {
     try {
@@ -4505,6 +4711,22 @@ export default function HMStudio() {
     }
   };
 
+  const deleteRenderJob = async (id: string) => {
+    if (!window.confirm("선택한 렌더 기록과 실제 대기열 파일을 삭제하시겠습니까?")) return;
+    try {
+      await fetch('/api/render-jobs/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id })
+      });
+      setRenderQueue(q => q.filter(item => item.id !== id));
+      setRenderStatus('idle');
+    } catch (err) {
+      console.error(err);
+      alert("항목을 삭제하는 데 실패했습니다.");
+    }
+  };
+
   const startActualRender = async () => {
     console.log("startActualRender called (Server Mode)", { clips: clips.length, graphics: graphics.length, totalDur });
     
@@ -4521,6 +4743,38 @@ export default function HMStudio() {
     const payload = buildRenderProjectPayload();
     const outputFileName = `${exportSettings.filename || 'Untitled_Project'}.mp4`;
     
+    const resolveOutputPath = (basePath, fileName) => {
+      if (!basePath) return "";
+      const isWindows = basePath.includes('\\') || basePath.includes(':');
+      const separator = isWindows ? '\\' : '/';
+      const looksLikeFile = basePath.toLowerCase().endsWith('.mp4');
+      return looksLikeFile
+        ? basePath
+        : basePath.endsWith(separator)
+          ? `${basePath}${fileName}`
+          : `${basePath}${separator}${fileName}`;
+    };
+    const finalOutputPath = resolveOutputPath(exportSettings.path, outputFileName);
+
+    if (finalOutputPath) {
+      try {
+        const existsRes = await fetch('/api/file-exists', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: finalOutputPath }),
+        });
+        if (existsRes.ok) {
+          const existsData = await existsRes.json();
+          if (existsData.exists) {
+            const overwrite = window.confirm(`이미 같은 이름의 파일이 있습니다.\n\n${finalOutputPath}\n\n덮어쓰시겠습니까?`);
+            if (!overwrite) return;
+          }
+        }
+      } catch (err) {
+        console.warn('Output file overwrite check failed:', err);
+      }
+    }
+
     // Override with export view settings
     payload.output = {
       fileName: outputFileName,
@@ -4533,26 +4787,11 @@ export default function HMStudio() {
     payload.renderRange = { in: renderIn, out: outPoint };
 
     // Set absolute output path if manual path is provided
-    if (exportSettings.path) {
-      const isWindows = exportSettings.path.includes('\\') || exportSettings.path.includes(':');
-      const separator = isWindows ? '\\' : '/';
-      
-      // Check if path already includes the filename
-      const looksLikeFile = exportSettings.path.toLowerCase().endsWith('.mp4');
-      
-      if (looksLikeFile) {
-        payload.output = {
-          ...payload.output,
-          outputPath: exportSettings.path
-        };
-      } else {
-        payload.output = {
-          ...payload.output,
-          outputPath: exportSettings.path.endsWith(separator) 
-            ? `${exportSettings.path}${outputFileName}` 
-            : `${exportSettings.path}${separator}${outputFileName}`
-        };
-      }
+    if (finalOutputPath) {
+      payload.output = {
+        ...payload.output,
+        outputPath: finalOutputPath
+      };
     }
 
 
@@ -5205,15 +5444,26 @@ export default function HMStudio() {
               </div>
               <div style={{ maxHeight: 320, overflowY: "auto", marginBottom: 12, paddingRight: 4 }}>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 10 }}>
-                  {clips.map(c => (
-                    <div key={c.id} onClick={() => { setSelClipId(c.id); setSelGfxId(null); }}
+                  {mediaAssets.map(c => {
+                    const assetKey = c.assetId || c.id;
+                    const isInTimeline = clips.some(clip => (clip.assetId || clip.id) === assetKey);
+                    const isSelected = selectedMediaAssetId === c.id;
+                    return (
+                    <div key={c.id}
+                      onClick={() => {
+                        setSelectedMediaAssetId(c.id);
+                        setSelClipId(null);
+                        setSelGfxId(null);
+                        setSelectedTimelineItems(new Set());
+                        setSelectedKeyframes(new Set());
+                      }}
                       style={{ 
                         padding: 8, 
                         borderRadius: 8, 
-                        background: selClipId === c.id ? ACCENT + "22" : "#141414", 
-                        border: `1px solid ${selClipId === c.id ? ACCENT : BORDER}`, 
-                        color: selClipId === c.id ? "#fff" : "#a1a1aa", 
-                        cursor: "pointer", 
+                        background: isSelected ? ACCENT + "22" : (isInTimeline ? ACCENT + "14" : "#141414"), 
+                        border: `1px solid ${isSelected ? ACCENT : (isInTimeline ? ACCENT + "88" : BORDER)}`, 
+                        color: isSelected ? "#fff" : "#a1a1aa", 
+                        cursor: "pointer",
                         display: "flex", 
                         flexDirection: "column", 
                         gap: 8, 
@@ -5227,8 +5477,13 @@ export default function HMStudio() {
                         🎬
                       </div>
                       <span style={{ fontSize: 11, fontWeight: "normal", width: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</span>
+                      <button onClick={(e) => { e.stopPropagation(); insertMediaAsset(c); }}
+                        style={{ width: "100%", padding: "7px 8px", background: ACCENT, color: "#000", border: "none", borderRadius: 6, fontSize: 11, fontWeight: 800, cursor: "pointer" }}>
+                        삽입
+                      </button>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
               <button onClick={() => { openVideoPicker(); }}
@@ -5576,16 +5831,17 @@ export default function HMStudio() {
                             });
                             if (layer.__kind === 'clip') { setSelClipId(layer.id); setSelGfxId(null); }
                             else { setSelGfxId(layer.id); setSelClipId(null); }
+                            setSelectedMediaAssetId(null);
                             return;
                           }
                           const dragSelection = selectedTimelineItems.has(timelineItemKey) ? new Set(selectedTimelineItems) : new Set([timelineItemKey]);
                           setSelectedTimelineItems(dragSelection);
                           if (layer.__kind === 'clip') {
                             if (tool === 'razor') { handleSplit(layer.id); return; }
-                            snap(); setSelClipId(layer.id); setSelGfxId(null); setTimelineDrag(layer.id); setDragStart({ x: e.clientX, y: e.clientY, ts: layer.ts, dur: layer.dur, rowIndex: rowIdx, kind: 'clip', groupTs: buildTimelineGroupTs(dragSelection) });
+                            snap(); setSelClipId(layer.id); setSelGfxId(null); setSelectedMediaAssetId(null); setTimelineDrag(layer.id); setDragStart({ x: e.clientX, y: e.clientY, ts: layer.ts, dur: layer.dur, rowIndex: rowIdx, kind: 'clip', groupTs: buildTimelineGroupTs(dragSelection) });
                           } else {
                             if (tool === 'razor') { handleGraphicSplit(layer.id); return; }
-                            snap(); setSelGfxId(layer.id); setSelClipId(null); setTimelineDrag(layer.id); setDragStart({ x: e.clientX, y: e.clientY, ts: layer.ts, dur: layer.dur, rowIndex: rowIdx, kind: 'graphic', groupTs: buildTimelineGroupTs(dragSelection) });
+                            snap(); setSelGfxId(layer.id); setSelClipId(null); setSelectedMediaAssetId(null); setTimelineDrag(layer.id); setDragStart({ x: e.clientX, y: e.clientY, ts: layer.ts, dur: layer.dur, rowIndex: rowIdx, kind: 'graphic', groupTs: buildTimelineGroupTs(dragSelection) });
                           }
                         }}>
                         {layer.__kind === 'clip' && layer.__type === 'video' && layer.url && (
@@ -6507,6 +6763,7 @@ export default function HMStudio() {
                         const track = e.currentTarget.parentElement;
                         if (!track || totalDur <= 0) return;
                         const rect = track.getBoundingClientRect();
+                        snap();
                         const move = (mv) => {
                           const next = clamp(((mv.clientX - rect.left) / rect.width) * totalDur, 0, renderOut == null ? totalDur : renderOut);
                           setRenderIn(next);
@@ -6527,6 +6784,7 @@ export default function HMStudio() {
                         const track = e.currentTarget.parentElement;
                         if (!track || totalDur <= 0) return;
                         const rect = track.getBoundingClientRect();
+                        snap();
                         const move = (mv) => {
                           const next = clamp(((mv.clientX - rect.left) / rect.width) * totalDur, renderIn || 0, totalDur);
                           setRenderOut(next);
@@ -6686,6 +6944,7 @@ export default function HMStudio() {
                               </>
                             )}
                             <span style={{ fontSize: 10, color: isDone ? "#22c55e" : isFailed ? "#ef4444" : "#3b82f6", fontWeight: 700 }}>{statusLabel}</span>
+                            <button onClick={() => deleteRenderJob(item.id)} title="작업 삭제" style={{ background: "none", border: "none", color: "#ef4444", fontSize: 14, fontWeight: 900, cursor: "pointer", marginLeft: 8, padding: 0, lineHeight: 1 }}>✕</button>
                           </div>
                         </div>
                         {item.statusText && <div style={{ fontSize: 9, color: "#71717a", marginBottom: 4 }}>{item.statusText}</div>}

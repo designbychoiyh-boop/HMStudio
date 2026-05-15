@@ -203,8 +203,9 @@ function refreshJobFromDisk(job: RenderJobRecord) {
   const mp4 = output.outputPath || path.join(RENDER_DIR, output.fileName || `${job.id}.mp4`);
   const previewJpg = output.previewPath || path.join(PREVIEW_DIR, `${job.id}.jpg`);
   const errorLog = output.errorPath || path.join(LOG_DIR, `${job.id}.error.txt`);
+  const isActiveStatus = job.status === 'queued' || job.status === 'preparing' || job.status === 'rendering';
 
-  if (fs.existsSync(mp4)) {
+  if (!isActiveStatus && fs.existsSync(mp4)) {
     job.status = 'completed';
     job.progress = 100;
     job.downloadUrl = `local-file://${mp4.replace(/\\/g, '/')}`;
@@ -297,6 +298,79 @@ function hasAudioStream(filePath: string): boolean {
   }
 }
 
+function isLottieKeyframeArray(value: any): value is any[] {
+  return Array.isArray(value)
+    && value.length > 0
+    && value.some(item => item && typeof item === 'object' && Number.isFinite(Number(item.t)) && ('s' in item || 'e' in item));
+}
+
+function stableRenderValue(value: any): any {
+  if (value === undefined) return null;
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(stableRenderValue);
+  const out: any = {};
+  for (const key of Object.keys(value).sort()) {
+    if (key === 'i' || key === 'o' || key === 'n' || key === 'mn') continue;
+    out[key] = stableRenderValue(value[key]);
+  }
+  return out;
+}
+
+function renderValuesDiffer(a: any, b: any): boolean {
+  return JSON.stringify(stableRenderValue(a)) !== JSON.stringify(stableRenderValue(b));
+}
+
+function keyframeStartValue(kf: any): any {
+  if (!kf || typeof kf !== 'object') return null;
+  if ('s' in kf) return kf.s;
+  if ('e' in kf) return kf.e;
+  return null;
+}
+
+function keyframeEndValue(kf: any, nextKf?: any): any {
+  if (!kf || typeof kf !== 'object') return null;
+  if ('e' in kf) return kf.e;
+  if (nextKf && typeof nextKf === 'object' && 's' in nextKf) return nextKf.s;
+  if ('s' in kf) return kf.s;
+  return null;
+}
+
+function maxLottieChangingKeyframeFrame(value: any, seen = new WeakSet<object>()): number {
+  if (!value || typeof value !== 'object') return 0;
+  if (seen.has(value)) return 0;
+  seen.add(value);
+  let max = 0;
+  if (Array.isArray(value)) {
+    for (const item of value) max = Math.max(max, maxLottieChangingKeyframeFrame(item, seen));
+    return max;
+  }
+  const k = value.k;
+  if (isLottieKeyframeArray(k)) {
+    const frames = [...k].filter(kf => Number.isFinite(Number(kf?.t))).sort((a, b) => Number(a.t) - Number(b.t));
+    for (let i = 0; i < frames.length; i++) {
+      const current = frames[i];
+      const next = frames[i + 1];
+      const currentT = Number(current.t);
+      if (i > 0 && renderValuesDiffer(keyframeStartValue(frames[i - 1]), keyframeStartValue(current))) {
+        max = Math.max(max, currentT);
+      }
+      if (!next) continue;
+      const nextT = Number(next.t);
+      const startValue = keyframeStartValue(current);
+      const endValue = keyframeEndValue(current, next);
+      const nextValue = keyframeStartValue(next);
+      const segmentChanges = renderValuesDiffer(startValue, endValue);
+      const holdJumpChanges = Number(current.h) === 1 && renderValuesDiffer(startValue, nextValue);
+      if (segmentChanges || holdJumpChanges) max = Math.max(max, nextT);
+    }
+  }
+  for (const key of Object.keys(value)) {
+    if (key === 'p' && typeof value[key] === 'string') continue;
+    max = Math.max(max, maxLottieChangingKeyframeFrame(value[key], seen));
+  }
+  return max;
+}
+
 async function moveFile(src: string, dest: string) {
   try {
     const destDir = path.dirname(dest);
@@ -345,7 +419,7 @@ async function executeRenderJob(record: RenderJobRecord) {
 
   record.status = 'preparing';
   record.progress = 2.00;
-  record.statusText = `?뚮뜑留??붿쭊 以鍮?以?.. (${frameCount} ?꾨젅??`;
+  record.statusText = `렌더링 준비 중... (${frameCount} 프레임)`;
   record.totalFrames = frameCount;
   record.currentFrame = 0;
   record.updatedAt = nowIso();
@@ -353,13 +427,13 @@ async function executeRenderJob(record: RenderJobRecord) {
 
   const bin = ffmpegBin();
   if (!bin) {
-    throw new Error('FFmpeg ?ㅽ뻾 ?뚯씪??李얠쓣 ???놁뒿?덈떎.');
+    throw new Error('FFmpeg 실행 파일을 찾을 수 없습니다.');
   }
 
-  let encoder = 'hevc_nvenc';
+  let encoder = 'h264_nvenc';
   try {
     const encoders = execSync(`"${bin}" -encoders`, { encoding: 'utf8' });
-    if (!encoders.includes('hevc_nvenc')) {
+    if (!encoders.includes('h264_nvenc')) {
       encoder = 'libx264';
     }
   } catch (e) {
@@ -479,10 +553,36 @@ async function executeRenderJob(record: RenderJobRecord) {
   });
   if (record.payload) record.payload.clips = clips;
 
-  const videoClips = clips.filter((c: any) => (c.type === 'video' || c.type === 'clip' || !c.type) && c.storedPath && fs.existsSync(c.storedPath));
-  const isSimpleImage = (c: any) => c.type === 'image' && c.storedPath && fs.existsSync(c.storedPath) && (!c.kf || Object.keys(c.kf).length === 0) && !c.rotation;
+  const hasClipKeyframes = (clip: any) => !!(clip?.kf && Object.values(clip.kf).some((value: any) => Array.isArray(value) && value.length > 0));
+  const isDefaultOpacity = (clip: any) => {
+    const opacity = Number(clip?.opacity ?? 1);
+    return Math.abs(opacity - 1) <= 0.0001 || Math.abs(opacity - 100) <= 0.0001;
+  };
+  const isDefaultTransform = (clip: any) => (
+    Math.abs(Number(clip.rotation || 0)) <= 0.0001
+    && Math.abs(Number(clip.scale ?? 100) - 100) <= 0.0001
+    && Math.abs(Number(clip.x ?? 50) - 50) <= 0.0001
+    && Math.abs(Number(clip.y ?? 50) - 50) <= 0.0001
+    && isDefaultOpacity(clip)
+  );
+  const isVideoClip = (c: any) => c?.type === 'video' || c?.type === 'clip' || !c?.type;
+  const videoClips = clips.filter((c: any) => isVideoClip(c) && c.storedPath && fs.existsSync(c.storedPath));
+  const isSimpleImage = (c: any) => c.type === 'image' && c.storedPath && fs.existsSync(c.storedPath) && !hasClipKeyframes(c) && !Number(c.rotation || 0) && isDefaultOpacity(c);
   const imageClips = clips.filter(isSimpleImage);
-  const hasComplexClips = clips.some((c: any) => c.type === 'image' && !isSimpleImage(c));
+  const isBasicVideoForHybrid = (clip: any) => {
+    if (clip.visible === false || !isVideoClip(clip)) return false;
+    if (!clip.storedPath || !fs.existsSync(clip.storedPath)) return false;
+    if (hasClipKeyframes(clip) || !isDefaultTransform(clip)) return false;
+    const srcW = Math.round(Number(clip.sourceW || width));
+    const srcH = Math.round(Number(clip.sourceH || height));
+    return srcW === Math.round(width) && srcH === Math.round(height);
+  };
+  const hasComplexClips = clips.some((c: any) => {
+    if (c.visible === false || c.type === 'audio') return false;
+    if (c.type === 'image') return !isSimpleImage(c);
+    if (isVideoClip(c)) return !isBasicVideoForHybrid(c);
+    return false;
+  });
   const hasGraphics = graphics.some((g: any) => g.visible !== false);
   const requiresDomTemplateCapture = graphics.some((g: any) => (
     g?.visible !== false
@@ -501,7 +601,8 @@ async function executeRenderJob(record: RenderJobRecord) {
     const framesFromOp = op > ip ? Math.ceil(op - ip) : 0;
     const framesFromDuration = Math.ceil(Math.max(0, Number(layer.templateDuration || 0)) * lottieFps);
     const framesFromLayer = Math.ceil(Math.max(0, Number(layer.dur || 0)) * lottieFps);
-    const animationFrameCount = Math.max(1, framesFromOp || framesFromDuration || framesFromLayer);
+    const fullFrameCount = Math.max(1, framesFromOp || framesFromDuration || framesFromLayer);
+    const animationFrameCount = fullFrameCount;
     return {
       lottieFps,
       animationFrameCount,
@@ -639,7 +740,7 @@ async function executeRenderJob(record: RenderJobRecord) {
   }
 
   ffmpegArgs.push('-c:v', encoder);
-  if (encoder === 'hevc_nvenc') {
+  if (encoder === 'h264_nvenc') {
     ffmpegArgs.push('-preset', 'p3', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '50M', '-bufsize', '100M');
   } else {
     ffmpegArgs.push('-preset', 'veryfast', '-crf', '18', '-threads', '0');
@@ -689,7 +790,7 @@ async function executeRenderJob(record: RenderJobRecord) {
           
           // Audio mixing and thumbnail generation
           record.progress = 96.00;
-          record.statusText = '3?④퀎. ?ㅻ뵒??誘뱀떛 吏꾪뻾 以?..';
+          record.statusText = '3단계. 오디오 믹싱 진행 중...';
           await saveJob(record);
 
           // Extract single thumbnail JPG using FFmpeg
@@ -767,6 +868,7 @@ async function executeRenderJob(record: RenderJobRecord) {
               finalPassArgs.push('-map', '[outa]');
               finalPassArgs.push('-c:v', 'copy');
               finalPassArgs.push('-c:a', 'aac', '-b:a', '192k');
+              finalPassArgs.push('-movflags', '+faststart');
               
               const finalPassTemp = path.join(RENDER_DIR, `${jobId}_final.mp4`);
               finalPassArgs.push(finalPassTemp);
@@ -797,7 +899,7 @@ async function executeRenderJob(record: RenderJobRecord) {
 
           record.status = 'completed';
           record.progress = 100.00;
-          record.statusText = `?꾨즺 (${frameCount}?꾨젅?? ${totalElapsed}珥? ${outputSizeMB}MB)`;
+          record.statusText = `완료 (${frameCount}프레임, ${totalElapsed}초, ${outputSizeMB}MB)`;
           record.elapsedSeconds = Number(totalElapsed);
           record.outputSizeMB = Number(outputSizeMB);
           record.downloadUrl = `local-file://${outputPath.replace(/\\/g, '/')}`;
@@ -816,7 +918,7 @@ async function executeRenderJob(record: RenderJobRecord) {
         try { renderWin.close(); } catch {}
         record.status = 'failed';
         record.progress = -1;
-        record.statusText = '?뚮뜑 ?ㅽ뙣';
+        record.statusText = '렌더링 실패';
         record.error = String(err.message || err);
         record.updatedAt = nowIso();
         await fsp.writeFile(errorPath, record.error, 'utf8').catch(() => {});
@@ -836,7 +938,7 @@ async function executeRenderJob(record: RenderJobRecord) {
 
       record.status = 'rendering';
       record.progress = 5.00;
-      record.statusText = `1?④퀎. Lottie ?먮쭑 ?쒗뵆由??꾨━罹먯떛 以?.. (0/${lottiePrecacheFrames.length})`;
+      record.statusText = `1단계. Lottie 자막 템플릿 프리캐싱 중... (0/${lottiePrecacheFrames.length})`;
       await saveJob(record);
 
       // Wait for precaching to finish (Lottie files, fonts, images loaded)
@@ -862,7 +964,7 @@ async function executeRenderJob(record: RenderJobRecord) {
           console.error(`[Render ${jobId}] Lottie precache ${precacheFrame.layerId}:${precacheFrame.frame} error:`, precacheErr);
         }
         record.progress = Number((5 + ((i + 1) / Math.max(1, lottiePrecacheFrames.length)) * 15).toFixed(2)); // 5% to 20%
-        record.statusText = `1?④퀎. Lottie ?먮쭑 ?쒗뵆由??꾨━罹먯떛 以?.. (${i + 1}/${lottiePrecacheFrames.length})`;
+        record.statusText = `1단계. Lottie 자막 템플릿 프리캐싱 중... (${i + 1}/${lottiePrecacheFrames.length})`;
         record.updatedAt = nowIso();
         await saveJob(record);
       }
@@ -1265,6 +1367,27 @@ ipcMain.handle('api-request', async (event, { url, init }) => {
         }
       }
       return { ok: true };
+    }
+
+    if (cleanUrl === '/render-jobs/delete') {
+      const { id } = body || {};
+      if (id && renderJobs.has(id)) {
+        const active = activeRenders.get(id);
+        if (active) {
+          await active.rejectPromise(new Error('cancelled'));
+        }
+        renderJobs.delete(id);
+        const jobFile = path.join(JOB_DIR, `${id}.json`);
+        if (fs.existsSync(jobFile)) {
+          try { fs.unlinkSync(jobFile); } catch {}
+        }
+      }
+      return { ok: true };
+    }
+
+    if (cleanUrl === '/file-exists') {
+      const targetPath = typeof body?.path === 'string' ? body.path : '';
+      return { exists: !!targetPath && fs.existsSync(targetPath) };
     }
 
     if (cleanUrl === '/render-jobs/start') {

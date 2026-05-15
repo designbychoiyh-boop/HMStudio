@@ -224,10 +224,11 @@ function drawThreeSlice(ctx: CanvasRenderingContext2D, img: HTMLImageElement | n
   const mid = Math.max(1, sw - cap * 2);
   const dCap = Math.min(dw / 2, cap * (dh / sh));
   const dMid = Math.max(1, dw - dCap * 2);
+  const bleed = Math.min(2, cap - 1, mid / 2);
 
-  ctx.drawImage(img, sx, sy, cap, sh, dx, dy, dCap, dh);
-  ctx.drawImage(img, sx + cap, sy, mid, sh, dx + dCap, dy, dMid, dh);
-  ctx.drawImage(img, sx + cap + mid, sy, cap, sh, dx + dCap + dMid, dy, dCap, dh);
+  ctx.drawImage(img, sx, sy, cap + bleed, sh, dx, dy, dCap, dh);
+  ctx.drawImage(img, sx + cap - bleed, sy, mid + bleed * 2, sh, dx + dCap, dy, dMid, dh);
+  ctx.drawImage(img, sx + cap + mid - bleed, sy, cap + bleed, sh, dx + dCap + dMid, dy, dCap, dh);
   ctx.restore();
 }
 
