@@ -265,6 +265,31 @@ function ffmpegBin() {
   }
 }
 
+function getAvailableEncoders(bin: string | null): string {
+  if (!bin) return '';
+  try {
+    return execFileSync(bin, ['-encoders'], { encoding: 'utf8' });
+  } catch {
+    return '';
+  }
+}
+
+function selectVideoEncoder(bin: string | null, width: number, height: number): string {
+  const encoders = getAvailableEncoders(bin);
+  const needsWideEncoder = Math.max(Number(width || 0), Number(height || 0)) > 4096;
+  if (needsWideEncoder && encoders.includes('hevc_nvenc')) return 'hevc_nvenc';
+  if (encoders.includes('h264_nvenc')) return 'h264_nvenc';
+  if (encoders.includes('hevc_nvenc')) return 'hevc_nvenc';
+  return 'libx264';
+}
+
+function encoderArgs(encoder: string): string[] {
+  if (encoder.endsWith('_nvenc')) {
+    return ['-preset', 'p3', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '80M', '-bufsize', '160M'];
+  }
+  return ['-preset', 'veryfast', '-crf', '18', '-threads', '0'];
+}
+
 
 function hasAudioStream(filePath: string): boolean {
   try {
@@ -1056,15 +1081,8 @@ async function renderJob(record: RenderJobRecord) {
       await saveJob(record);
       
       const bin = ffmpegBin();
-      let encoder = 'h264_nvenc';
-      try {
-        const encoders = execFileSync(bin, ['-encoders'], { encoding: 'utf8' });
-        if (!encoders.includes('h264_nvenc')) {
-          encoder = 'libx264';
-        }
-      } catch (e) {
-        encoder = 'libx264';
-      }
+      const encoder = selectVideoEncoder(bin, width, height);
+      rlog(`[Hybrid Render] Stage 2: selected encoder=${encoder} for ${width}x${height}`);
       
       const hybridArgs = ['-y'];
       let filterComplex = '';
@@ -1198,13 +1216,7 @@ async function renderJob(record: RenderJobRecord) {
       }
       
       hybridArgs.push('-c:v', encoder);
-      // [FIX] NVENC uses p1~p7 preset scale, not libx264's slow/medium/fast strings.
-      // Using 'slow' on nvenc causes unpredictable fallback behavior.
-      if (encoder.endsWith('_nvenc')) {
-        hybridArgs.push('-preset', 'p3', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '50M', '-bufsize', '100M');
-      } else {
-        hybridArgs.push('-preset', 'veryfast', '-crf', '18', '-threads', '0');
-      }
+      hybridArgs.push(...encoderArgs(encoder));
       hybridArgs.push('-pix_fmt', 'yuv420p');
       hybridArgs.push('-t', duration.toFixed(6));
       hybridArgs.push('-movflags', '+faststart');
@@ -1340,16 +1352,8 @@ async function renderJob(record: RenderJobRecord) {
       await saveJob(record);
 
       const bin = ffmpegBin();
-      let encoder = 'h264_nvenc';
-      try {
-        const encoders = execFileSync(bin, ['-encoders'], { encoding: 'utf8' });
-        if (!encoders.includes('h264_nvenc')) {
-          console.warn('[Render] h264_nvenc not supported, falling back to libx264');
-          encoder = 'libx264';
-        }
-      } catch (e) {
-        encoder = 'libx264';
-      }
+      const encoder = selectVideoEncoder(bin, width, height);
+      console.log(`[Render ${record.id}] selected encoder=${encoder} for ${width}x${height}`);
 
       const ffmpegArgs = [
         '-y',
@@ -1358,11 +1362,7 @@ async function renderJob(record: RenderJobRecord) {
         '-framerate', String(fps),
         '-i', '-',
         '-c:v', encoder,
-        // [FIX] NVENC preset system: p1(fast)~p7(quality). 'slow' is a libx264 term,
-        // not valid for nvenc and causes undefined fallback behavior.
-        ...(encoder.endsWith('_nvenc')
-          ? ['-preset', 'p3', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '50M', '-bufsize', '100M']
-          : ['-preset', 'veryfast', '-crf', '18', '-threads', '0']),
+        ...encoderArgs(encoder),
         '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart',
         tempOutputPath,
@@ -1722,10 +1722,10 @@ app.get('/api/system-status', async (_req, res) => {
   let hasGpu = false;
   let encoder = 'libx264';
   try {
-    const encoders = execFileSync(bin, ['-encoders'], { encoding: 'utf8' });
-    if (encoders.includes('h264_nvenc')) {
+    const encoders = getAvailableEncoders(bin);
+    if (encoders.includes('h264_nvenc') || encoders.includes('hevc_nvenc')) {
       hasGpu = true;
-      encoder = 'h264_nvenc';
+      encoder = encoders.includes('hevc_nvenc') ? 'hevc_nvenc' : 'h264_nvenc';
     }
   } catch (e) {}
 

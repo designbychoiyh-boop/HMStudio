@@ -271,6 +271,31 @@ function ffmpegBin() {
   }
 }
 
+function getAvailableEncoders(bin: string | null): string {
+  if (!bin) return '';
+  try {
+    return execSync(`"${bin}" -encoders`, { encoding: 'utf8' });
+  } catch {
+    return '';
+  }
+}
+
+function selectVideoEncoder(bin: string | null, width: number, height: number): string {
+  const encoders = getAvailableEncoders(bin);
+  const needsWideEncoder = Math.max(Number(width || 0), Number(height || 0)) > 4096;
+  if (needsWideEncoder && encoders.includes('hevc_nvenc')) return 'hevc_nvenc';
+  if (encoders.includes('h264_nvenc')) return 'h264_nvenc';
+  if (encoders.includes('hevc_nvenc')) return 'hevc_nvenc';
+  return 'libx264';
+}
+
+function encoderArgs(encoder: string): string[] {
+  if (encoder.endsWith('_nvenc')) {
+    return ['-preset', 'p3', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '80M', '-bufsize', '160M'];
+  }
+  return ['-preset', 'veryfast', '-crf', '18', '-threads', '0'];
+}
+
 function browserBin() {
   const candidates = [
     process.env.CHROME_PATH,
@@ -430,15 +455,8 @@ async function executeRenderJob(record: RenderJobRecord) {
     throw new Error('FFmpeg 실행 파일을 찾을 수 없습니다.');
   }
 
-  let encoder = 'h264_nvenc';
-  try {
-    const encoders = execSync(`"${bin}" -encoders`, { encoding: 'utf8' });
-    if (!encoders.includes('h264_nvenc')) {
-      encoder = 'libx264';
-    }
-  } catch (e) {
-    encoder = 'libx264';
-  }
+  const encoder = selectVideoEncoder(bin, width, height);
+  console.log(`[Render ${jobId}] selected encoder=${encoder} for ${width}x${height}`);
 
   // [AUTO-RESOLVE] & Hybrid Checks
   let clips = record.payload?.clips || [];
@@ -740,11 +758,7 @@ async function executeRenderJob(record: RenderJobRecord) {
   }
 
   ffmpegArgs.push('-c:v', encoder);
-  if (encoder === 'h264_nvenc') {
-    ffmpegArgs.push('-preset', 'p3', '-tune', 'hq', '-rc', 'vbr', '-cq', '18', '-b:v', '0', '-maxrate', '50M', '-bufsize', '100M');
-  } else {
-    ffmpegArgs.push('-preset', 'veryfast', '-crf', '18', '-threads', '0');
-  }
+  ffmpegArgs.push(...encoderArgs(encoder));
   ffmpegArgs.push('-pix_fmt', 'yuv420p', '-movflags', '+faststart', tempOutputPath);
 
   const logStream = fs.createWriteStream(logPath, { flags: 'a' });
@@ -1235,10 +1249,10 @@ ipcMain.handle('api-request', async (event, { url, init }) => {
       let hasGpu = false;
       let encoder = 'libx264';
       try {
-        const encoders = execSync(`"${bin}" -encoders`, { encoding: 'utf8' });
-        if (encoders.includes('hevc_nvenc')) {
+        const encoders = getAvailableEncoders(bin);
+        if (encoders.includes('h264_nvenc') || encoders.includes('hevc_nvenc')) {
           hasGpu = true;
-          encoder = 'hevc_nvenc';
+          encoder = encoders.includes('hevc_nvenc') ? 'hevc_nvenc' : 'h264_nvenc';
         }
       } catch (e) {}
 

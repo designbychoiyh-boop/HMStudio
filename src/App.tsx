@@ -387,18 +387,14 @@ const scaleLayerPositionX = (layer, centerX, factor) => {
     }));
   }
 };
-const getAnimatedPositionXRange = layer => {
+const hasAnimatedPositionX = layer => {
   const key = layer?.ks?.p?.k;
-  if (!Array.isArray(key) || !key.length || typeof key[0] !== "object") return null;
+  if (!Array.isArray(key) || !key.length || typeof key[0] !== "object") return false;
   const xs = key.flatMap(frame => [frame?.s, frame?.e])
     .filter(value => Array.isArray(value))
     .map(value => Number(value[0]))
     .filter(value => Number.isFinite(value));
-  if (xs.length < 2) return null;
-  const min = Math.min(...xs);
-  const max = Math.max(...xs);
-  if (max - min <= 1) return null;
-  return { min, max, span: max - min, center: (min + max) / 2 };
+  return xs.length >= 2 && Math.max(...xs) - Math.min(...xs) > 1;
 };
 const getLayerPositionSamples = layer => {
   const key = layer?.ks?.p?.k;
@@ -647,6 +643,7 @@ const collectResizeTargets = data => {
 const shapeLayerMatchesResizeTarget = (layer, target, data) => {
   if (layer?.ty !== 4 || layer?.hd) return false;
   const timing = getLayerTimingSec(layer, data);
+  if (Math.abs(timing.ip - target.ip) > 0.35) return false;
   const overlap = Math.max(0, Math.min(timing.op, target.op) - Math.max(timing.ip, target.ip));
   if (overlap <= 0) return false;
   const samples = getLayerPositionSamples(layer);
@@ -683,11 +680,9 @@ const autoFitLottieBackground = (data, sourceData, fields = []) => {
     (data?.layers || []).forEach((candidate, index) => {
       if (scaledShapeLayerIndices.has(index)) return;
       if (!shapeLayerMatchesResizeTarget(candidate, target, sourceData)) return;
-      const animatedRange = getAnimatedPositionXRange(candidate);
-      if (!animatedRange) return;
-      const shapeFactor = Math.max(factor, desiredVisibleW / Math.max(1, animatedRange.span));
-      if (shapeFactor <= 1.0001) return;
-      scaleLayerPositionX(candidate, animatedRange.center, shapeFactor);
+      if (!hasAnimatedPositionX(candidate)) return;
+      if (factor <= 1.0001) return;
+      scaleLayerPositionX(candidate, target.imageCenterX, factor);
       scaledShapeLayerIndices.add(index);
     });
   });
@@ -2435,11 +2430,19 @@ export default function HMStudio() {
     { id: "CUSTOM1", type: "custom", baseName: "사용자 설정 1", label: "3840×1080(사용자 설정 1)", w: 3840, h: 1080, icon: "⚙️" },
   ]);
   const saveProject = async () => {
+    const serializeMediaItem = item => {
+      const { file, ...rest } = item || {};
+      const storedPath = rest.storedPath || null;
+      const url = typeof rest.url === "string" && rest.url.startsWith("blob:") && storedPath ? "" : rest.url;
+      const serverUrl = typeof rest.serverUrl === "string" && rest.serverUrl.startsWith("blob:") && storedPath ? "" : rest.serverUrl;
+      return { ...rest, url, serverUrl, storedPath };
+    };
+
     const projectData = {
       version: "1.0",
       composition: comp,
-      mediaAssets: mediaAssets,
-      clips: clips,
+      mediaAssets: mediaAssets.map(serializeMediaItem),
+      clips: clips.map(serializeMediaItem),
       graphics: graphics,
       exportSettings: exportSettings
     };
@@ -2503,10 +2506,27 @@ export default function HMStudio() {
           }
 
           const isElectron = !!(window as any).electron;
+          const isBlobUrl = url => typeof url === "string" && url.startsWith("blob:");
+          const pathToLocalFileUrl = filePath => `local-file://${String(filePath || "").replace(/\\/g, "/")}`;
+          const isAbsoluteFilePath = filePath => /^[a-zA-Z]:[\\/]/.test(String(filePath || "")) || /^\\\\/.test(String(filePath || "")) || String(filePath || "").startsWith("/");
+          const basenameFromPath = filePath => String(filePath || "").split(/[\\/]/).filter(Boolean).pop() || "";
+          const localFileUrlToPath = url => {
+            if (typeof url !== "string" || !url.startsWith("local-file://")) return "";
+            const rawPath = url.replace("local-file://", "");
+            try {
+              return decodeURIComponent(rawPath).replace(/\//g, "\\");
+            } catch {
+              return rawPath.replace(/\//g, "\\");
+            }
+          };
 
           const relinkMediaItem = c => {
-            let resolvedUrl = c.serverUrl || c.url;
-            let resolvedPath = c.storedPath;
+            let resolvedUrl = !isBlobUrl(c.serverUrl) ? c.serverUrl : "";
+            if (!resolvedUrl && !isBlobUrl(c.url)) resolvedUrl = c.url;
+            let resolvedPath = c.storedPath || "";
+            let matchedAssetUrl = typeof resolvedUrl === "string" && resolvedUrl.startsWith("/assets/");
+            const pathFromUrl = localFileUrlToPath(resolvedUrl);
+            if (!resolvedPath && pathFromUrl) resolvedPath = pathFromUrl;
 
             const getSafeName = (name: string) => name.replace(/[^a-zA-Z0-9._-]+/g, '_');
 
@@ -2526,6 +2546,7 @@ export default function HMStudio() {
 
               if (match) {
                 resolvedUrl = `/assets/${match}`;
+                matchedAssetUrl = true;
                 console.log(`[Frontend Relinking] Relinked "${c.name}" to url: "${resolvedUrl}"`);
               } else {
                 // Suffix fallback
@@ -2535,10 +2556,20 @@ export default function HMStudio() {
                   const match2 = assetFiles.find(f => f.toLowerCase().endsWith(lastPart.toLowerCase()));
                   if (match2) {
                     resolvedUrl = `/assets/${match2}`;
+                    matchedAssetUrl = true;
                     console.log(`[Frontend Relinking] Suffix fallback relinked "${c.name}" to url: "${resolvedUrl}"`);
                   }
                 }
               }
+            }
+
+            if (!resolvedUrl && resolvedPath && !isAbsoluteFilePath(resolvedPath)) {
+              const basename = basenameFromPath(resolvedPath);
+              if (basename) resolvedUrl = `/assets/${basename}`;
+            }
+
+            if (isElectron && resolvedPath && isAbsoluteFilePath(resolvedPath) && !matchedAssetUrl) {
+              resolvedUrl = pathToLocalFileUrl(resolvedPath);
             }
 
             return {
@@ -3798,7 +3829,6 @@ export default function HMStudio() {
     const startAt = time;
     const newClips = [];
     const newAssets = [];
-    let firstVisualMeta: { w: number; h: number } | null = null;
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const isElectron = !!(window as any).electron && typeof (file as any).path === 'string';
@@ -3836,11 +3866,6 @@ export default function HMStudio() {
           };
           v.onerror = () => res({ dur: 5, w: 1920, h: 1080 });
         });
-      }
-
-      // Track first visual (non-audio) media for auto canvas sizing
-      if (!isAudio && !firstVisualMeta && meta.w > 0 && meta.h > 0) {
-        firstVisualMeta = { w: meta.w, h: meta.h };
       }
 
       let storedPath = isElectron ? (file as any).path : null;
@@ -3890,11 +3915,6 @@ export default function HMStudio() {
       });
     }
 
-    // Auto-set canvas resolution to match the first visual media file
-    if (firstVisualMeta) {
-      setComp(prev => ({ ...prev, w: firstVisualMeta.w, h: firstVisualMeta.h }));
-    }
-
     snap();
     setMediaAssets(as => [...as, ...newAssets]);
     setClips(cs => [...cs, ...newClips]);
@@ -3923,6 +3943,19 @@ export default function HMStudio() {
     await ingestFiles(files);
   };
   const openVideoPicker = useCallback(async () => {
+    const electronInvoke = (window as any).electron?.ipcRenderer?.invoke;
+    if (typeof electronInvoke === 'function') {
+      try {
+        const files = await electronInvoke('open-media-dialog');
+        if (Array.isArray(files) && files.length) {
+          await ingestFiles(files);
+        }
+        return;
+      } catch (err) {
+        console.warn("Could not open native media dialog:", err);
+      }
+    }
+
     const picker = (window as any).showOpenFilePicker;
     if (typeof picker === 'function') {
       try {
@@ -4342,8 +4375,13 @@ export default function HMStudio() {
   const deleteSelected = () => {
     if (selectedMediaAssetId) {
       snap();
+      const asset = mediaAssets.find(item => item.id === selectedMediaAssetId);
+      const assetKey = asset?.assetId || asset?.id || selectedMediaAssetId;
+      const removeIds = new Set([selectedMediaAssetId, assetKey]);
       setMediaAssets(as => as.filter(asset => asset.id !== selectedMediaAssetId));
+      setClips(cs => cs.filter(clip => !removeIds.has(clip.id) && !removeIds.has(clip.assetId || clip.id)));
       setSelectedMediaAssetId(null);
+      setSelClipId(null);
       return;
     }
     if (selGfxId) { snap(); setGraphics(gs => gs.filter(g => g.id !== selGfxId)); setSelGfxId(null); }
@@ -6086,6 +6124,10 @@ export default function HMStudio() {
                               transition: "all 0.15s ease-in-out"
                             }} 
                           />
+                          <div style={{ display: "grid", gridTemplateColumns: "1fr 50px", gap: 6, marginBottom: 10 }}>
+                            <input type="text" value={f.highlightText || ""} onChange={e => updateFieldProps(selGfx.id, f.id, { highlightText: e.target.value })} onBlur={snap} placeholder="↑ 위의 텍스트에서 강조하고 싶은 부분을 복사/붙여넣기 하세요" style={{ background: "#18181b", border: `1px solid ${BORDER}`, borderRadius: 6, color: "#fff", padding: "6px 8px", fontSize: 12, outline: "none" }} />
+                            <input type="color" value={f.highlightColor || "#ffea00"} onChange={e => { updateFieldProps(selGfx.id, f.id, { highlightColor: e.target.value }); snap(); }} style={{ width: "100%", height: 32, background: "#27272a", border: "1px solid #52525b", borderRadius: 6, outline: "none", cursor: "pointer" }} />
+                          </div>
                           <div style={{ display: "grid", gridTemplateColumns: "1fr 90px", gap: 6, marginBottom: 6 }}>
                             <select value={selectedFontKey} onChange={e => {
                               const selected = (selGfx.fontOptions || []).find(option => option.key === e.target.value);
@@ -6113,10 +6155,6 @@ export default function HMStudio() {
                               <option value="center">기본 획</option>
                               {!internalMode && <option value="inside">안쪽 획</option>}
                             </select>
-                          </div>
-                          <div style={{ display: "grid", gridTemplateColumns: "1fr 50px", gap: 6, marginBottom: internalMode ? 0 : 6 }}>
-                            <input type="text" value={f.highlightText || ""} onChange={e => updateFieldProps(selGfx.id, f.id, { highlightText: e.target.value })} onBlur={snap} placeholder="↑ 위의 텍스트에서 강조하고 싶은 부분을 복사/붙여넣기 하세요" style={{ background: "#18181b", border: `1px solid ${BORDER}`, borderRadius: 6, color: "#fff", padding: "6px 8px", fontSize: 12, outline: "none" }} />
-                            <input type="color" value={f.highlightColor || "#ffea00"} onChange={e => { updateFieldProps(selGfx.id, f.id, { highlightColor: e.target.value }); snap(); }} style={{ width: "100%", height: 32, background: "#27272a", border: "1px solid #52525b", borderRadius: 6, outline: "none", cursor: "pointer" }} />
                           </div>
                           {!internalMode && (
                             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6 }}>
