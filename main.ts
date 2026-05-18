@@ -685,7 +685,11 @@ async function executeRenderJob(record: RenderJobRecord) {
     const framesFromDuration = Math.ceil(Math.max(0, Number(layer.templateDuration || 0)) * lottieFps);
     const framesFromLayer = Math.ceil(Math.max(0, Number(layer.dur || 0)) * lottieFps);
     const fullFrameCount = Math.max(1, framesFromOp || framesFromDuration || framesFromLayer);
-    const animationFrameCount = fullFrameCount;
+    const changingFrame = maxLottieChangingKeyframeFrame(layer.lottieData);
+    const relativeChangingFrame = Number.isFinite(changingFrame) && changingFrame > 0
+      ? Math.max(0, Math.ceil(changingFrame - ip))
+      : 0;
+    const animationFrameCount = Math.max(1, Math.min(fullFrameCount, relativeChangingFrame + 1));
     return {
       lottieFps,
       animationFrameCount,

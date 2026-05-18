@@ -649,10 +649,19 @@ function getTemplateAnimationEndSeconds(graphic: any, fps: number): number {
   const lottieFr = Math.max(1, Number(graphic?.lottieData?.fr || safeFps));
   const ip = Number(graphic?.lottieData?.ip || 0);
   const op = Number(graphic?.lottieData?.op || 0);
-  const lottieFrames = op > ip
+  const fullFrameCount = op > ip
     ? Math.ceil(op - ip)
     : Math.ceil(Math.max(0, Number(graphic?.templateDuration || graphic?.dur || 0)) * lottieFr);
-  if (lottieFrames > 0) end = Math.max(end, lottieFrames / lottieFr);
+  const changingFrame = maxLottieChangingKeyframeFrame(graphic?.lottieData);
+  if (Number.isFinite(changingFrame) && changingFrame > 0) {
+    const relativeChangingFrame = Math.max(0, Math.ceil(changingFrame - ip));
+    const neededFrameCount = fullFrameCount > 0
+      ? Math.min(fullFrameCount, relativeChangingFrame + 1)
+      : relativeChangingFrame + 1;
+    end = Math.max(end, Math.max(1, neededFrameCount) / lottieFr);
+  } else if (graphic?.lottieData) {
+    end = Math.max(end, 1 / lottieFr);
+  }
   const fallbackDur = Number(graphic?.templateDuration || 0);
   if (end <= 0 && fallbackDur > 0) end = Math.min(fallbackDur, 2.0);
   return Math.ceil(Math.max(0, end) * safeFps) / safeFps;
@@ -669,6 +678,83 @@ function getHybridGraphicsAnimationDuration(graphics: any[], renderIn: number, d
   }
   if (endRelative <= 0) return Math.min(duration, 2.0);
   return Math.min(duration, Math.ceil(endRelative * Math.max(1, fps)) / Math.max(1, fps));
+}
+
+function numericKeyframeValues(layer: any, prop: string, fallback: number): number[] {
+  const values = [Number(fallback)];
+  const frames = layer?.kf?.[prop];
+  if (Array.isArray(frames)) {
+    for (const frame of frames) {
+      const value = Number(frame?.v);
+      if (Number.isFinite(value)) values.push(value);
+    }
+  }
+  return values.filter(Number.isFinite);
+}
+
+function computeGraphicsCaptureBounds(graphics: any[], width: number, height: number, renderIn: number, renderOut: number) {
+  const pad = 24;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+
+  for (const graphic of graphics) {
+    if (!graphic || graphic.visible === false) continue;
+    const start = Number(graphic.ts || 0);
+    const dur = Math.max(0, Number(graphic.dur || 0));
+    if (dur <= 0 || start >= renderOut || start + dur <= renderIn) continue;
+
+    const layerW = Math.max(1, Number(graphic.width || graphic.templateW || width));
+    const layerH = Math.max(1, Number(graphic.height || graphic.templateH || height));
+    const xValues = numericKeyframeValues(graphic, 'x', Number(graphic.x ?? 50));
+    const yValues = numericKeyframeValues(graphic, 'y', Number(graphic.y ?? 50));
+    const scaleValues = numericKeyframeValues(graphic, 'scale', Number(graphic.scale ?? 100));
+    const rotationValues = numericKeyframeValues(graphic, 'rotation', Number(graphic.rotation || 0));
+
+    const centersX = xValues.map(v => (v / 100) * width);
+    const centersY = yValues.map(v => (v / 100) * height);
+    let maxHalfW = 0;
+    let maxHalfH = 0;
+
+    for (const scaleValue of scaleValues) {
+      const scale = Math.max(0, scaleValue) / 100;
+      const scaledW = layerW * scale;
+      const scaledH = layerH * scale;
+      for (const rotationValue of rotationValues) {
+        const rad = Math.abs(rotationValue) * Math.PI / 180;
+        const cos = Math.abs(Math.cos(rad));
+        const sin = Math.abs(Math.sin(rad));
+        maxHalfW = Math.max(maxHalfW, (scaledW * cos + scaledH * sin) / 2);
+        maxHalfH = Math.max(maxHalfH, (scaledW * sin + scaledH * cos) / 2);
+      }
+    }
+
+    const cxMin = Math.min(...centersX);
+    const cxMax = Math.max(...centersX);
+    const cyMin = Math.min(...centersY);
+    const cyMax = Math.max(...centersY);
+
+    minX = Math.min(minX, cxMin - maxHalfW - pad);
+    maxX = Math.max(maxX, cxMax + maxHalfW + pad);
+    minY = Math.min(minY, cyMin - maxHalfH - pad);
+    maxY = Math.max(maxY, cyMax + maxHalfH + pad);
+  }
+
+  if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+    return { x: 0, y: 0, width, height };
+  }
+
+  const x = Math.max(0, Math.floor(minX));
+  const y = Math.max(0, Math.floor(minY));
+  const right = Math.min(width, Math.ceil(maxX));
+  const bottom = Math.min(height, Math.ceil(maxY));
+  return {
+    x,
+    y,
+    width: Math.max(1, right - x),
+    height: Math.max(1, bottom - y),
+  };
 }
 
 async function renderJob(record: RenderJobRecord) {
@@ -965,6 +1051,7 @@ async function renderJob(record: RenderJobRecord) {
       let staticFramePath = null;
       let introFrameCount = 0;
       let introDuration = 0;
+      let graphicsCaptureBounds = { x: 0, y: 0, width, height };
 
       if (hasGraphics) {
         rlog(`[Hybrid Render] Stage 1: Launching transparent browser session for graphics capture...`);
@@ -1016,6 +1103,11 @@ async function renderJob(record: RenderJobRecord) {
         }
 
         introFrameCount = Math.max(1, Math.ceil(introDuration * fps));
+        graphicsCaptureBounds = computeGraphicsCaptureBounds(graphics, width, height, renderIn, renderOut);
+        rlog(
+          `[Hybrid Render] Graphics capture bounds: x=${graphicsCaptureBounds.x}, y=${graphicsCaptureBounds.y}, ` +
+          `size=${graphicsCaptureBounds.width}x${graphicsCaptureBounds.height} (full=${width}x${height})`
+        );
 
         record.statusText = `1단계. 자막 템플릿 캐시 생성 중... (0/${introFrameCount})`;
         record.updatedAt = nowIso();
@@ -1028,14 +1120,14 @@ async function renderJob(record: RenderJobRecord) {
           const ts = renderIn + i / fps;
           const framePath = path.join(hybridDir, `frame_${String(i).padStart(3, '0')}.png`);
           if (i === 0) {
-            await fsp.writeFile(framePath, createTransparentPng(width, height));
+            await fsp.writeFile(framePath, createTransparentPng(graphicsCaptureBounds.width, graphicsCaptureBounds.height));
             rlog(`[Hybrid Render] Forced frame_000.png to transparent to prevent subtitle first-frame flash`);
           } else {
             await setRenderTime(transSession.client, Number(ts.toFixed(6)));
 
             const result = await transSession.client.send('Page.captureScreenshot', {
               format: 'png',
-              clip: { x: 0, y: 0, width, height, scale: 1 },
+              clip: { ...graphicsCaptureBounds, scale: 1 },
               fromSurface: true,
             });
             const frameBuffer = Buffer.from(result.data, 'base64');
@@ -1061,7 +1153,7 @@ async function renderJob(record: RenderJobRecord) {
           // [FIX] WebP lossless + fromSurface for static hold frame
           const result = await transSession.client.send('Page.captureScreenshot', {
             format: 'png',
-            clip: { x: 0, y: 0, width, height, scale: 1 },
+            clip: { ...graphicsCaptureBounds, scale: 1 },
             fromSurface: true,
           });
           const staticBuffer = Buffer.from(result.data, 'base64');
@@ -1190,7 +1282,7 @@ async function renderJob(record: RenderJobRecord) {
         
         const finalSubLabel = `sub_step`;
         const subOverlayStart = Math.min(introDuration, 1 / Math.max(1, fps));
-        filterComplex += `[${lastV}][${subIntroLabel}]overlay=0:0:enable='between(t,${subOverlayStart.toFixed(6)},${introDuration.toFixed(6)})'[${finalSubLabel}];`;
+        filterComplex += `[${lastV}][${subIntroLabel}]overlay=${graphicsCaptureBounds.x}:${graphicsCaptureBounds.y}:enable='between(t,${subOverlayStart.toFixed(6)},${introDuration.toFixed(6)})'[${finalSubLabel}];`;
         lastV = finalSubLabel;
         currentInputIdx++;
         
@@ -1200,7 +1292,7 @@ async function renderJob(record: RenderJobRecord) {
           filterComplex += `[${subStaticIdx}:v]setpts=PTS-STARTPTS[${subStaticLabel}];`;
           
           const lastOutLabel = `outv`;
-          filterComplex += `[${lastV}][${subStaticLabel}]overlay=0:0:enable='gt(t,${introDuration.toFixed(6)})'[${lastOutLabel}];`;
+          filterComplex += `[${lastV}][${subStaticLabel}]overlay=${graphicsCaptureBounds.x}:${graphicsCaptureBounds.y}:enable='gt(t,${introDuration.toFixed(6)})'[${lastOutLabel}];`;
           lastV = lastOutLabel;
         }
       }

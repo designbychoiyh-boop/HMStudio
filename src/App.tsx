@@ -1119,6 +1119,7 @@ const applyLottieTextFields = (sourceData, fields = [], options = {}) => {
   if (!sourceData) return null;
   const glyphChars = getGlyphChars(sourceData);
   const bindingMap = new Map((fields || []).filter(f => f.bindingKey).map(f => [f.bindingKey, f]));
+  const labelMap = new Map((fields || []).filter(f => f.label).map(f => [f.label, f]));
 
   const cloned = JSON.parse(JSON.stringify(sourceData));
   const applyToLayers = (layers, scope) => {
@@ -1127,8 +1128,8 @@ const applyLottieTextFields = (sourceData, fields = [], options = {}) => {
       if (layer?.ty !== 5 || !Array.isArray(layer?.t?.d?.k)) return;
       const layerName = layer.nm || "";
       const bindingKey = `${scope}::${layerName}`;
-      if (!bindingMap.has(bindingKey)) return;
-      const field = bindingMap.get(bindingKey);
+      const field = bindingMap.get(bindingKey) || labelMap.get(layerName);
+      if (!field) return;
       const useOverlay = typeof field?.useOverlay === "boolean" ? field.useOverlay : shouldUseOverlayForField(field, glyphChars);
       layer.t.d.k = layer.t.d.k.map(kf => {
         if (kf?.s && typeof kf.s === "object") {
@@ -1173,6 +1174,7 @@ const applyLottieTextFields = (sourceData, fields = [], options = {}) => {
   };
   if (customHide?.imageLayerIndices?.length) customHide.imageLayerIndices.forEach(hideNativeLayer);
   if (customHide?.textLayerIndices?.length) customHide.textLayerIndices.forEach(hideNativeLayer);
+  if (Array.isArray(options.hideLayerIndices)) options.hideLayerIndices.forEach(hideNativeLayer);
   autoFitLottieBackground(cloned, sourceData, fields);
 
   // After applying text, check if any text layer contains characters not in chars.
@@ -1419,15 +1421,33 @@ function MultiPngTitlePair({ pair, field, model, time = 0, drawBackground = true
   );
 }
 
+function getMultiPngTitleFieldForPair(fields = [], pair, index = 0) {
+  const list = Array.isArray(fields) ? fields : [];
+  return list.find(f => f?.bindingKey && f.bindingKey === pair?.bindingKey)
+    || list.find(f => f?.label && pair?.label && f.label === pair.label)
+    || list[index]
+    || {};
+}
+
+function getMultiPngTitleNativeHideIndices(model) {
+  const indices = [];
+  (model?.pairs || []).forEach(pair => {
+    [pair?.imageLayerIndex, pair?.textLayerIndex, ...(pair?.relatedImageLayerIndices || [])].forEach(idx => {
+      const n = Number(idx);
+      if (Number.isFinite(n)) indices.push(n);
+    });
+  });
+  return [...new Set(indices)];
+}
+
 function MultiPngTitleTemplate({ model, fields = [], time = 0 }) {
-  const fieldMap = new Map((fields || []).map(f => [f.bindingKey, f]));
   const seenImages = new Set();
   return (
     <div style={{ position: 'absolute', inset: 0, overflow: 'visible', pointerEvents: 'none' }}>
-      {(model?.pairs || []).map(pair => {
+      {(model?.pairs || []).map((pair, index) => {
         const drawBackground = !seenImages.has(pair.imageLayerIndex);
         seenImages.add(pair.imageLayerIndex);
-        return <MultiPngTitlePair key={pair.bindingKey} pair={pair} field={fieldMap.get(pair.bindingKey)} model={model} time={time} drawBackground={drawBackground} />;
+        return <MultiPngTitlePair key={pair.bindingKey || pair.label || index} pair={pair} field={getMultiPngTitleFieldForPair(fields, pair, index)} model={model} time={time} drawBackground={drawBackground} />;
       })}
     </div>
   );
@@ -1598,7 +1618,11 @@ function TemplateThumbnail({ template, fields = null, fontFamily = "Pretendard, 
     ...field,
     useOverlay: shouldUseOverlayForField(field, template?.glyphChars || []),
   })), [resolvedFields, template?.glyphChars]);
-  const resolvedLottieData = useMemo(() => applyLottieTextFields(template?.lottieData, normalizedFields), [template?.lottieData, normalizedFields]);
+  const multiHideIndices = useMemo(() => getMultiPngTitleNativeHideIndices(template?.multiTitleModel), [template?.multiTitleModel]);
+  const resolvedLottieData = useMemo(
+    () => applyLottieTextFields(template?.lottieData, normalizedFields, { hideLayerIndices: multiHideIndices }),
+    [template?.lottieData, normalizedFields, multiHideIndices]
+  );
 
   // Auto-compute the visible content bounding box to zoom/fit thumbnails for any template size
   const contentBounds = useMemo(() => {
@@ -1725,7 +1749,11 @@ function GraphicEl({ g, time, renderZ = 1, selected, editing, onEdit, onEndEdit,
       ...field,
       useOverlay: shouldUseOverlayForField(field, g.glyphChars || []),
     })), [g.fields, g.glyphChars]);
-    const resolvedLottieData = useMemo(() => applyLottieTextFields(g.lottieData, normalizedFields), [g.lottieData, normalizedFields]);
+    const multiHideIndices = useMemo(() => getMultiPngTitleNativeHideIndices(g.multiTitleModel), [g.multiTitleModel]);
+    const resolvedLottieData = useMemo(
+      () => applyLottieTextFields(g.lottieData, normalizedFields, { hideLayerIndices: multiHideIndices }),
+      [g.lottieData, normalizedFields, multiHideIndices]
+    );
     const overlayFields = normalizedFields.filter(field => field.useOverlay);
     return (
       <div style={{ ...base }}>
@@ -1874,6 +1902,66 @@ function ColorPicker({ value, onChange }) {
       <input type="text" value={value || "#ffffff"} onChange={e => onChange(e.target.value)}
         style={{ flex: 1, background: "#18181b", border: "1px solid #3f3f46", borderRadius: 4, color: "#fff", fontSize: 11, padding: "3px 6px", outline: "none", fontFamily: "monospace" }} />
     </div>
+  );
+}
+
+function StableTextInput({ value = "", onChange, onCommit, placeholder = "", style = {}, inputStyle = {} }) {
+  const [draft, setDraft] = useState(value || "");
+  const composingRef = useRef(false);
+
+  useEffect(() => {
+    if (!composingRef.current) setDraft(value || "");
+  }, [value]);
+
+  const baseStyle = {
+    width: "100%",
+    background: "#0d0e12",
+    border: "1.5px solid #52525b",
+    borderRadius: 6,
+    color: "#ffffff",
+    fontSize: 13,
+    padding: "10px 12px",
+    outline: "none",
+    boxSizing: "border-box",
+    boxShadow: "inset 0 2px 5px rgba(0,0,0,0.8)",
+    transition: "border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease",
+    ...inputStyle,
+  };
+
+  const commit = next => {
+    const text = next ?? "";
+    setDraft(text);
+    onChange?.(text);
+  };
+
+  return (
+    <input
+      type="text"
+      value={draft}
+      placeholder={placeholder}
+      onCompositionStart={() => { composingRef.current = true; }}
+      onCompositionEnd={e => {
+        composingRef.current = false;
+        commit(e.currentTarget.value);
+      }}
+      onChange={e => {
+        const next = e.target.value;
+        setDraft(next);
+        if (!composingRef.current) onChange?.(next);
+      }}
+      onFocus={e => {
+        e.currentTarget.style.borderColor = "#f97316";
+        e.currentTarget.style.boxShadow = "inset 0 2px 5px rgba(0,0,0,0.8), 0 0 0 3px rgba(249, 115, 22, 0.25)";
+      }}
+      onBlur={e => {
+        composingRef.current = false;
+        e.currentTarget.style.borderColor = "#52525b";
+        e.currentTarget.style.boxShadow = String(baseStyle.boxShadow);
+        commit(e.currentTarget.value);
+        onCommit?.();
+      }}
+      style={{ ...baseStyle, ...style }}
+    />
   );
 }
 // ── ScrubbableNumberInput ──────────────────────────────────────────────────
@@ -2711,6 +2799,7 @@ export default function HMStudio() {
   const latestPreviewPayloadRef = useRef<any>(null);
   const previewPayloadSignatureRef = useRef('');
   const previewPublishSignatureRef = useRef('');
+  const previewEditSignatureRef = useRef('');
   const applyingPreviewStateRef = useRef(false);
   const previewHasParentStateRef = useRef(false);
   
@@ -2868,6 +2957,12 @@ export default function HMStudio() {
       ts: g.ts, dur: g.dur, startT: g.startT, x: g.x, y: g.y, scale: g.scale, rotation: g.rotation,
       opacity: g.opacity, visible: g.visible, layerOrder: g.layerOrder, content: g.content,
       subContent: g.subContent, textFields: g.textFields, style: g.style, width: g.width, height: g.height,
+      fields: (g.fields || []).map(f => ({
+        id: f.id, value: f.value, label: f.label, bindingKey: f.bindingKey, layerName: f.layerName,
+        fontFamily: f.fontFamily, fontSize: f.fontSize, color: f.color, strokeColor: f.strokeColor,
+        strokeWidth: f.strokeWidth, align: f.align, valign: f.valign, highlightText: f.highlightText,
+        highlightColor: f.highlightColor, useOverlay: f.useOverlay, fontMode: f.fontMode, fontKey: f.fontKey,
+      })),
     })),
     mediaAssets: (payload.mediaAssets || []).map(a => ({
       id: a.id, name: a.name, type: a.type, url: a.url, serverUrl: a.serverUrl, storedPath: a.storedPath,
@@ -2903,7 +2998,16 @@ export default function HMStudio() {
 
     channel.onmessage = event => {
       const message = event.data || {};
-      if (!isPreviewWindow && message.type === 'edit-state') return;
+      if (!isPreviewWindow && message.type === 'edit-state' && message.payload) {
+        const payload = message.payload;
+        if (Array.isArray(payload.clips)) {
+          setClips(prev => prev.map(item => payload.clips.find(next => next.id === item.id) || item));
+        }
+        if (Array.isArray(payload.graphics)) {
+          setGraphics(prev => prev.map(item => payload.graphics.find(next => next.id === item.id) || item));
+        }
+        return;
+      }
       if (isPreviewWindow) {
         if (message.type === 'tick' && message.payload) {
           setTime(Number(message.payload.time || 0));
@@ -2953,10 +3057,19 @@ export default function HMStudio() {
 
   useEffect(() => {
     if (!isPreviewWindow || isRenderMode || typeof BroadcastChannel === 'undefined') return;
-    // The monitor preview must not push its local state back into the editor.
-    // It can briefly be empty while waiting for the parent state; sending that
-    // back would erase newly inserted media/templates from the timeline.
-  }, [isPreviewWindow, isRenderMode, makePreviewEditPayload]);
+    if (!previewHasParentStateRef.current || applyingPreviewStateRef.current) return;
+    const payload = makePreviewEditPayload();
+    const signature = makePreviewSignature(payload);
+    if (previewEditSignatureRef.current === signature) return;
+    previewEditSignatureRef.current = signature;
+    try {
+      const channel = previewChannelRef.current || new BroadcastChannel('hmstudio-preview-state');
+      previewChannelRef.current = channel;
+      channel.postMessage({ type: 'edit-state', payload });
+    } catch (err) {
+      console.warn('[Preview] Failed to publish edit state:', err);
+    }
+  }, [clips, graphics, isPreviewWindow, isRenderMode, makePreviewEditPayload, makePreviewSignature]);
 
   useEffect(() => {
     if (isPreviewWindow || isRenderMode) return;
@@ -5629,7 +5742,8 @@ export default function HMStudio() {
           ...field,
           useOverlay: shouldUseOverlayForField(field, g.glyphChars || []),
         }));
-        const resolvedLottieData = applyLottieTextFields(g.lottieData, normalizedFields);
+        const multiHideIndices = getMultiPngTitleNativeHideIndices(g.multiTitleModel);
+        const resolvedLottieData = applyLottieTextFields(g.lottieData, normalizedFields, { hideLayerIndices: multiHideIndices });
         return { ...g, lottieData: resolvedLottieData };
       }
       return g;
@@ -6649,17 +6763,9 @@ export default function HMStudio() {
                             </div>
                           </div>
                           {!internalMode && <div style={{ fontSize: 9, color: "#f59e0b", marginBottom: 6 }}>현재 JSON 글리프로는 이 문자를 못 그려서 웹폰트 오버레이로 표시합니다.</div>}
-                          <input type="text" value={f.value} 
-                            onChange={e => updateField(selGfx.id, f.id, e.target.value)} 
-                            onFocus={e => {
-                              e.target.style.borderColor = "#f97316";
-                              e.target.style.boxShadow = "inset 0 2px 5px rgba(0,0,0,0.8), 0 0 0 3px rgba(249, 115, 22, 0.25)";
-                            }}
-                            onBlur={e => {
-                              e.target.style.borderColor = "#52525b";
-                              e.target.style.boxShadow = "inset 0 2px 5px rgba(0,0,0,0.8)";
-                              snap();
-                            }}
+                          <StableTextInput value={f.value} 
+                            onChange={value => updateField(selGfx.id, f.id, value)} 
+                            onCommit={snap}
                             style={{ 
                               width: "100%", 
                               background: "#0d0e12", 
@@ -6676,8 +6782,14 @@ export default function HMStudio() {
                             }} 
                           />
                           <div style={{ display: "grid", gridTemplateColumns: "1fr 50px", gap: 6, marginBottom: 10 }}>
-                            <input type="text" value={f.highlightText || ""} onChange={e => updateFieldProps(selGfx.id, f.id, { highlightText: e.target.value })} onBlur={snap} placeholder="↑ 위의 텍스트에서 강조하고 싶은 부분을 복사/붙여넣기 하세요" style={{ background: "#18181b", border: `1px solid ${BORDER}`, borderRadius: 6, color: "#fff", padding: "6px 8px", fontSize: 12, outline: "none" }} />
-                            <input type="color" value={f.highlightColor || "#ffea00"} onChange={e => { updateFieldProps(selGfx.id, f.id, { highlightColor: e.target.value }); snap(); }} style={{ width: "100%", height: 32, background: "#27272a", border: "1px solid #52525b", borderRadius: 6, outline: "none", cursor: "pointer" }} />
+                            <StableTextInput
+                              value={f.highlightText || ""}
+                              onChange={value => updateFieldProps(selGfx.id, f.id, { highlightText: value })}
+                              onCommit={snap}
+                              placeholder="↑ 위의 텍스트에서 강조하고 싶은 부분을 복사/붙여넣기 하세요"
+                              style={{ background: "#0d0e12", border: "1.5px solid #52525b", borderRadius: 6, color: "#fff", padding: "9px 10px", fontSize: 12, outline: "none", height: 38, boxSizing: "border-box", boxShadow: "inset 0 2px 5px rgba(0,0,0,0.65)" }}
+                            />
+                            <input type="color" value={f.highlightColor || "#ffea00"} onChange={e => { updateFieldProps(selGfx.id, f.id, { highlightColor: e.target.value }); snap(); }} style={{ width: "100%", height: 38, background: "#27272a", border: "1.5px solid #52525b", borderRadius: 6, outline: "none", cursor: "pointer" }} />
                           </div>
                           <div style={{ display: "grid", gridTemplateColumns: "1fr 90px", gap: 6, marginBottom: 6 }}>
                             <select value={selectedFontKey} onChange={e => {
