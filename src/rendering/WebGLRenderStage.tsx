@@ -16,7 +16,19 @@ function nextPaint() {
 }
 
 function resolveMediaSrc(clip: any) {
-  return clip?.serverUrl || clip?.url || '';
+  const storedPath = String(clip?.storedPath || '').replace(/\\/g, '/');
+  if (storedPath) {
+    return `file:///${storedPath.split('/').map((part, index) => index === 0 ? part : encodeURIComponent(part)).join('/')}`;
+  }
+  const src = clip?.serverUrl || clip?.url || '';
+  if (typeof src === 'string' && src.startsWith('local-file://')) {
+    const raw = decodeURIComponent(src.replace('local-file://', ''));
+    let filePath = raw;
+    if (/^\/[a-zA-Z]:/.test(filePath)) filePath = filePath.slice(1);
+    else if (/^[a-zA-Z]\//.test(filePath)) filePath = `${filePath[0].toUpperCase()}:/${filePath.slice(2)}`;
+    return `file:///${filePath.split('/').map((part, index) => index === 0 ? part : encodeURIComponent(part)).join('/')}`;
+  }
+  return src;
 }
 
 function fallbackMediaSrc(clip: any, currentSrc: string) {
@@ -501,7 +513,7 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
         videoMap.delete(clip.id);
       }
       const video = document.createElement('video');
-      video.crossOrigin = 'anonymous';
+      if (/^https?:\/\//i.test(src)) video.crossOrigin = 'anonymous';
       video.muted = true;
       video.defaultMuted = true;
       video.playsInline = true;
@@ -528,7 +540,7 @@ export function WebGLRenderStage({ composition, clips, graphics, time, onReady }
       if (existing && existing.dataset.src === src) return;
       if (existing) imageMap.delete(clip.id);
       const img = new Image();
-      img.crossOrigin = 'anonymous';
+      if (/^https?:\/\//i.test(src)) img.crossOrigin = 'anonymous';
       img.onload = () => setImageLoadTick(t => t + 1);
       img.onerror = () => {
         const fallback = fallbackMediaSrc(clip, img.dataset.src || '');

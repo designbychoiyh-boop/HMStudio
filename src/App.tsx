@@ -24,6 +24,35 @@ const clamp = (v, mn, mx) => Math.max(mn, Math.min(mx, v));
 const fmt = s => [Math.floor(s / 3600), Math.floor((s % 3600) / 60), Math.floor(s % 60), Math.floor((s % 1) * 30)]
   .map(n => String(n).padStart(2, "0")).join(":");
 const uid = () => Math.random().toString(36).slice(2);
+const pathToPlaybackUrl = filePath => {
+  const normalized = String(filePath || "").replace(/\\/g, "/");
+  if (!normalized) return "";
+  return `file:///${normalized.split("/").map((part, index) => index === 0 ? part : encodeURIComponent(part)).join("/")}`;
+};
+const localFileUrlToPath = url => {
+  if (typeof url !== "string" || !url.startsWith("local-file://")) return "";
+  const rawPath = url.replace("local-file://", "");
+  try {
+    const decoded = decodeURIComponent(rawPath);
+    if (/^\/[a-zA-Z]:/.test(decoded)) return decoded.slice(1).replace(/\//g, "\\");
+    if (/^[a-zA-Z]\//.test(decoded)) return `${decoded[0].toUpperCase()}:\\${decoded.slice(2).replace(/\//g, "\\")}`;
+    return decoded.replace(/\//g, "\\");
+  } catch {
+    if (/^\/[a-zA-Z]:/.test(rawPath)) return rawPath.slice(1).replace(/\//g, "\\");
+    if (/^[a-zA-Z]\//.test(rawPath)) return `${rawPath[0].toUpperCase()}:\\${rawPath.slice(2).replace(/\//g, "\\")}`;
+    return rawPath.replace(/\//g, "\\");
+  }
+};
+const resolvePlaybackUrl = item => {
+  if (!item) return "";
+  if (item.storedPath) return pathToPlaybackUrl(item.storedPath);
+  const primary = item.serverUrl || item.url || "";
+  if (typeof primary === "string" && primary.startsWith("local-file://")) {
+    const filePath = localFileUrlToPath(primary);
+    if (filePath) return pathToPlaybackUrl(filePath);
+  }
+  return primary;
+};
 const KEYFRAME_PROPS = ["x", "y", "scale", "rotation", "opacity"];
 const hasKeyframeAt = (item, prop, time) => !!(item?.kf?.[prop] || []).find(k => Math.abs(k.t - time) < 0.001);
 const upsertKeyframe = (item, prop, time, value) => {
@@ -2225,6 +2254,7 @@ export default function HMStudio() {
   const [time, setTime] = useState(0);
   const [totalDur, setTotalDur] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [playRestartNonce, setPlayRestartNonce] = useState(0);
   const [selClipId, setSelClipId] = useState(null);
   const [selGfxId, setSelGfxId] = useState(null);
   const [selectedMediaAssetId, setSelectedMediaAssetId] = useState(null);
@@ -2507,18 +2537,8 @@ export default function HMStudio() {
 
           const isElectron = !!(window as any).electron;
           const isBlobUrl = url => typeof url === "string" && url.startsWith("blob:");
-          const pathToLocalFileUrl = filePath => `local-file:///${String(filePath || "").replace(/\\/g, "/").replace(/^\/+/, "")}`;
           const isAbsoluteFilePath = filePath => /^[a-zA-Z]:[\\/]/.test(String(filePath || "")) || /^\\\\/.test(String(filePath || "")) || String(filePath || "").startsWith("/");
           const basenameFromPath = filePath => String(filePath || "").split(/[\\/]/).filter(Boolean).pop() || "";
-          const localFileUrlToPath = url => {
-            if (typeof url !== "string" || !url.startsWith("local-file://")) return "";
-            const rawPath = url.replace("local-file://", "");
-            try {
-              return decodeURIComponent(rawPath).replace(/^\/([a-zA-Z]:)/, "$1").replace(/\//g, "\\");
-            } catch {
-              return rawPath.replace(/^\/([a-zA-Z]:)/, "$1").replace(/\//g, "\\");
-            }
-          };
           const fileExistsAtPath = async filePath => {
             if (!isElectron || !isAbsoluteFilePath(filePath)) return null;
             try {
@@ -2550,13 +2570,13 @@ export default function HMStudio() {
             const getSafeName = (name: string) => name.replace(/[^a-zA-Z0-9._-]+/g, '_');
 
             if (savedPathExists) {
-              resolvedUrl = pathToLocalFileUrl(resolvedPath);
+              resolvedUrl = pathToPlaybackUrl(resolvedPath);
               matchedAssetUrl = false;
             } else if (savedPathMissing) {
               resolvedUrl = "";
               matchedAssetUrl = false;
             } else if (savedPathUnchecked) {
-              resolvedUrl = pathToLocalFileUrl(resolvedPath);
+              resolvedUrl = pathToPlaybackUrl(resolvedPath);
               matchedAssetUrl = false;
             } else if (assetFiles.length > 0) {
               const cleanName = getSafeName(c.name).replace(/\.[^/.]+$/, "");
@@ -2597,7 +2617,7 @@ export default function HMStudio() {
             }
 
             if (isElectron && hasSavedAbsolutePath && !savedPathMissing && !matchedAssetUrl) {
-              resolvedUrl = pathToLocalFileUrl(resolvedPath);
+              resolvedUrl = pathToPlaybackUrl(resolvedPath);
             }
 
             return {
@@ -2618,6 +2638,11 @@ export default function HMStudio() {
         if (data.graphics) setGraphics(data.graphics);
         if (data.exportSettings) setExportSettings(data.exportSettings);
         setSelClipId(null); setSelGfxId(null); setTime(0);
+        if (!isPreviewWindow && !isRenderMode) {
+          setTimeout(() => {
+            openPreviewPopout({ fullscreen: true, focusWindow: true, hasUserGesture: false, skipScreenDetails: true });
+          }, 0);
+        }
       } catch (err) {
         alert("올바른 프로젝트 파일이 아닙니다.");
       }
@@ -2676,11 +2701,18 @@ export default function HMStudio() {
   };
 
   const videoRefs = useRef({});
+  const lastMediaRestartNonceRef = useRef(0);
   const stageRef = useRef(null);
   const popupStageRef = useRef(null);
   const timelineBodyRef = useRef(null);
   const previewWinRef = useRef(null);
   const previewHostRef = useRef(null);
+  const previewChannelRef = useRef<any>(null);
+  const latestPreviewPayloadRef = useRef<any>(null);
+  const previewPayloadSignatureRef = useRef('');
+  const previewPublishSignatureRef = useRef('');
+  const applyingPreviewStateRef = useRef(false);
+  const previewHasParentStateRef = useRef(false);
   
   useEffect(() => {
     const closePreviewPopup = () => {
@@ -2771,7 +2803,9 @@ export default function HMStudio() {
   const queryParams = useMemo(() => new URLSearchParams(window.location.search), []);
   const renderJobId = queryParams.get('renderJob');
   const renderTsParam = Number(queryParams.get('renderTs') || 0);
+  const isPreviewWindow = queryParams.get('previewWindow') === '1';
   const isRenderMode = !!renderJobId;
+  const isTransparentGraphicsCapture = queryParams.get('transparent') === '1' && queryParams.get('onlyGraphics') === '1';
   const [renderJobLoaded, setRenderJobLoaded] = useState(!isRenderMode);
   const renderReadyResolverRef = useRef(null);
   const isPrecachingRef = useRef(false);
@@ -2784,6 +2818,150 @@ export default function HMStudio() {
       delete (window as any).isPrecachingRef;
     };
   }, []);
+
+  const makePreviewPayload = useCallback(() => {
+    const stripRuntimeFile = item => {
+      if (!item) return item;
+      const { file, ...rest } = item;
+      return rest;
+    };
+    return {
+      comp,
+      clips: clips.map(stripRuntimeFile),
+      graphics,
+      mediaAssets: mediaAssets.map(stripRuntimeFile),
+      time,
+      playing,
+      totalDur,
+      previewZoom,
+      previewPan,
+      isExportView,
+    };
+  }, [clips, comp, graphics, isExportView, mediaAssets, playing, previewPan, previewZoom, time, totalDur]);
+
+  const makePreviewEditPayload = useCallback(() => {
+    const stripRuntimeFile = item => {
+      if (!item) return item;
+      const { file, ...rest } = item;
+      return rest;
+    };
+    return {
+      comp,
+      clips: clips.map(stripRuntimeFile),
+      graphics,
+      mediaAssets: mediaAssets.map(stripRuntimeFile),
+      totalDur,
+      isExportView,
+    };
+  }, [clips, comp, graphics, isExportView, mediaAssets, totalDur]);
+
+  const makePreviewSignature = useCallback((payload) => JSON.stringify({
+    comp: payload.comp || null,
+    clips: (payload.clips || []).map(c => ({
+      id: c.id, assetId: c.assetId, type: c.type, url: c.url, serverUrl: c.serverUrl, storedPath: c.storedPath,
+      ts: c.ts, dur: c.dur, startT: c.startT, endT: c.endT, x: c.x, y: c.y, scale: c.scale,
+      rotation: c.rotation, opacity: c.opacity, visible: c.visible, layerOrder: c.layerOrder,
+      sourceW: c.sourceW, sourceH: c.sourceH, track: c.track,
+    })),
+    graphics: (payload.graphics || []).map(g => ({
+      id: g.id, type: g.type, templateKind: g.templateKind, sourceName: g.sourceName, compName: g.compName,
+      ts: g.ts, dur: g.dur, startT: g.startT, x: g.x, y: g.y, scale: g.scale, rotation: g.rotation,
+      opacity: g.opacity, visible: g.visible, layerOrder: g.layerOrder, content: g.content,
+      subContent: g.subContent, textFields: g.textFields, style: g.style, width: g.width, height: g.height,
+    })),
+    mediaAssets: (payload.mediaAssets || []).map(a => ({
+      id: a.id, name: a.name, type: a.type, url: a.url, serverUrl: a.serverUrl, storedPath: a.storedPath,
+      dur: a.dur, w: a.w, h: a.h,
+    })),
+    totalDur: payload.totalDur || 0,
+    isExportView: !!payload.isExportView,
+  }), []);
+
+  const publishPreviewState = useCallback(() => {
+    if (isRenderMode || isPreviewWindow || typeof BroadcastChannel === 'undefined') return;
+    const payload = makePreviewPayload();
+    latestPreviewPayloadRef.current = payload;
+    try {
+      const channel = previewChannelRef.current || new BroadcastChannel('hmstudio-preview-state');
+      previewChannelRef.current = channel;
+      const signature = makePreviewSignature(payload);
+      if (previewPublishSignatureRef.current !== signature) {
+        previewPublishSignatureRef.current = signature;
+        channel.postMessage({ type: 'state', payload });
+      } else {
+        channel.postMessage({ type: 'tick', payload: { time: payload.time, playing: payload.playing } });
+      }
+    } catch (err) {
+      console.warn('[Preview] Failed to publish state:', err);
+    }
+  }, [isPreviewWindow, isRenderMode, makePreviewPayload, makePreviewSignature]);
+
+  useEffect(() => {
+    if (isRenderMode || typeof BroadcastChannel === 'undefined') return;
+    const channel = new BroadcastChannel('hmstudio-preview-state');
+    previewChannelRef.current = channel;
+
+    channel.onmessage = event => {
+      const message = event.data || {};
+      if (!isPreviewWindow && message.type === 'edit-state') return;
+      if (isPreviewWindow) {
+        if (message.type === 'tick' && message.payload) {
+          setTime(Number(message.payload.time || 0));
+          setPlaying(!!message.payload.playing);
+          return;
+        }
+        if (message.type !== 'state' || !message.payload) return;
+        const payload = message.payload;
+        previewHasParentStateRef.current = true;
+        const signature = makePreviewSignature(payload);
+        if (previewPayloadSignatureRef.current !== signature) {
+          applyingPreviewStateRef.current = true;
+          previewPayloadSignatureRef.current = signature;
+          if (payload.comp) setComp(payload.comp);
+          setClips(Array.isArray(payload.clips) ? payload.clips : []);
+          setGraphics(Array.isArray(payload.graphics) ? payload.graphics : []);
+          setMediaAssets(Array.isArray(payload.mediaAssets) ? payload.mediaAssets : []);
+          setTotalDur(Number(payload.totalDur || 0));
+          setIsExportView(!!payload.isExportView);
+          setTimeout(() => { applyingPreviewStateRef.current = false; }, 0);
+        }
+        setTime(Number(payload.time || 0));
+        setPlaying(!!payload.playing);
+        setRenderJobLoaded(true);
+        setIsLoggedIn(true);
+        return;
+      }
+
+      if (message.type === 'ready') {
+        const payload = latestPreviewPayloadRef.current || makePreviewPayload();
+        latestPreviewPayloadRef.current = payload;
+        channel.postMessage({ type: 'state', payload });
+      }
+    };
+
+    if (isPreviewWindow) {
+      channel.postMessage({ type: 'ready' });
+    } else {
+      latestPreviewPayloadRef.current = makePreviewPayload();
+    }
+
+    return () => {
+      channel.close();
+      if (previewChannelRef.current === channel) previewChannelRef.current = null;
+    };
+  }, [isPreviewWindow, isRenderMode, makePreviewPayload, makePreviewSignature]);
+
+  useEffect(() => {
+    if (!isPreviewWindow || isRenderMode || typeof BroadcastChannel === 'undefined') return;
+    // The monitor preview must not push its local state back into the editor.
+    // It can briefly be empty while waiting for the parent state; sending that
+    // back would erase newly inserted media/templates from the timeline.
+  }, [isPreviewWindow, isRenderMode, makePreviewEditPayload]);
+
+  useEffect(() => {
+    if (isPreviewWindow || isRenderMode) return;
+    publishPreviewState();
+  }, [clips, comp, graphics, isExportView, isPreviewWindow, isRenderMode, mediaAssets, playing, previewPan, previewZoom, publishPreviewState, time, totalDur]);
   
   useEffect(() => {
     // @ts-ignore
@@ -2857,7 +3035,7 @@ export default function HMStudio() {
         const job = await res.json();
         if (cancelled) return;
         const payload = job.payload || {};
-        const loadedClips = Array.isArray(payload.clips) ? payload.clips.map((clip) => ({ ...clip, url: clip.serverUrl || clip.url })) : [];
+        const loadedClips = Array.isArray(payload.clips) ? payload.clips.map((clip) => ({ ...clip, url: resolvePlaybackUrl(clip), serverUrl: resolvePlaybackUrl(clip) })) : [];
         const loadedGraphics = Array.isArray(payload.graphics) ? payload.graphics : [];
         
         const isTransparent = queryParams.get('transparent') === '1';
@@ -2925,6 +3103,14 @@ export default function HMStudio() {
           if (!ctx) throw new Error('Could not get 2D context from canvas');
 
           const imgData = ctx.getImageData(0, 0, width, height);
+          if (isTransparentGraphicsCapture) {
+            const pixels = imgData.data;
+            for (let p = 0; p < pixels.length; p += 4) {
+              if (pixels[p] === 0 && pixels[p + 1] === 0 && pixels[p + 2] === 0 && pixels[p + 3] === 255) {
+                pixels[p + 3] = 0;
+              }
+            }
+          }
 
           // invoke (not send) so we await the write + backpressure in main.ts.
           // This also triggers the per-frame latch release in executeRenderJob.
@@ -3212,7 +3398,10 @@ export default function HMStudio() {
       return r.slice(0, idx);
     });
   }, [makeUndoState, undoStateKey, applyUndoState]);
-  const getStageEl = useCallback(() => ((previewPopout && previewHostRef.current) ? (popupStageRef.current || stageRef.current) : stageRef.current), [previewPopout]);
+  const getStageEl = useCallback(() => {
+    if (isPreviewWindow) return popupStageRef.current || stageRef.current;
+    return (previewPopout && previewHostRef.current) ? (popupStageRef.current || stageRef.current) : stageRef.current;
+  }, [isPreviewWindow, previewPopout]);
   const layerKey = useCallback(layer => `${layer.__kind || (layer.url ? 'clip' : 'graphic')}:${layer.id}`, []);
   const applyLayerOrder = useCallback((orderedLayers) => {
     const orderMap = new Map();
@@ -3336,6 +3525,29 @@ export default function HMStudio() {
 
       console.log(`[Preview] Final: left=${targetLeft} top=${targetTop} ${targetWidth}x${targetHeight}`);
 
+      const electronInvoke = (window as any).electron?.ipcRenderer?.invoke;
+      if (typeof electronInvoke === 'function') {
+        const result = await electronInvoke('open-preview-window', {
+          bounds: { x: targetLeft, y: targetTop, width: targetWidth, height: targetHeight },
+          fullscreen: true,
+        });
+        if (!result?.ok) return null;
+        const electronPreviewHandle = {
+          __electronPreview: true,
+          closed: false,
+          close: () => electronInvoke('close-preview-window'),
+          focus: () => electronInvoke('focus-preview-window'),
+          moveTo: () => {},
+          resizeTo: () => {},
+        };
+        previewWinRef.current = electronPreviewHandle as any;
+        previewHostRef.current = null;
+        popupStageRef.current = null;
+        setTimeout(publishPreviewState, 100);
+        setTimeout(publishPreviewState, 500);
+        return electronPreviewHandle as any;
+      }
+
       const features = `popup=yes,fullscreen=yes,width=${targetWidth},height=${targetHeight},left=${targetLeft},top=${targetTop},screenX=${targetLeft},screenY=${targetTop}`;
       win = window.open('about:blank', 'hmstudio-preview-monitor', features);
       if (!win) {
@@ -3432,20 +3644,26 @@ export default function HMStudio() {
       });
     }
     return win;
-  }, []);
+  }, [publishPreviewState]);
   const requestPreviewFullscreenNow = useCallback(() => {
     try {
       const win = previewWinRef.current;
       if (!win || win.closed) return;
+      if ((win as any).__electronPreview) {
+        (window as any).electron?.ipcRenderer?.invoke?.('focus-preview-window');
+        publishPreviewState();
+        return;
+      }
       win.focus();
       const el = win.document.documentElement;
       const req = el.requestFullscreen || (el as any).webkitRequestFullscreen || (el as any).mozRequestFullScreen || (el as any).msRequestFullscreen;
       req?.call(el)?.catch?.(() => {});
     } catch (_) {}
-  }, []);
+  }, [publishPreviewState]);
   // ── Media Sync (Video & Audio) ─────────────────────────────────────────
   useEffect(() => {
     const visibleClips = clips.filter(c => time >= c.ts && time < c.ts + c.dur);
+    const forceRestart = playing && playRestartNonce !== lastMediaRestartNonceRef.current;
     Object.entries(videoRefs.current || {}).forEach(([refId, el]) => {
       if (!el) return;
       const isExportRef = refId.startsWith("export-");
@@ -3456,16 +3674,12 @@ export default function HMStudio() {
         try { el.pause(); } catch {}
         return;
       }
-      const ct = Math.max(0, time - clip.ts + clip.startT);
+      const ct = Math.max(0, time - clip.ts + (clip.startT || 0));
       
-      if (isExportRef) {
-        el.muted = isRenderMode;
-      } else {
-        el.muted = isRenderMode || isExportView;
-      }
+      el.muted = false;
       el.playsInline = true;
       
-      const targetSrc = clip.serverUrl || clip.url;
+      const targetSrc = resolvePlaybackUrl(clip);
       if (el.getAttribute("data-cid") !== refId || el.getAttribute("data-src") !== targetSrc) {
         el.src = targetSrc;
         el.setAttribute("data-cid", refId);
@@ -3485,7 +3699,7 @@ export default function HMStudio() {
         else (el as any).onloadedmetadata = applyTime;
       } else if (playing) {
         // During playback, only seek if drift is large (>0.5s) to avoid choppy interruptions
-        if (Math.abs((el.currentTime || 0) - ct) > 0.5) {
+        if (forceRestart || Math.abs((el.currentTime || 0) - ct) > 0.5) {
           try { el.currentTime = ct; } catch {}
         }
       } else {
@@ -3509,8 +3723,34 @@ export default function HMStudio() {
         if (!el.paused) el.pause();
       }
     });
-  }, [time, clips, playing, isRenderMode, isExportView]);
+    if (forceRestart) lastMediaRestartNonceRef.current = playRestartNonce;
+  }, [time, clips, playing, playRestartNonce, isRenderMode, isExportView, isPreviewWindow]);
   // ── Playback RAF ────────────────────────────────────────────────────────
+  const registerMediaElement = useCallback((refId: string, el: any) => {
+    if (el) {
+      videoRefs.current[refId] = el;
+      el.dataset.clipId = refId.startsWith("export-") ? refId.slice(7) : refId;
+      el.playsInline = true;
+      el.muted = false;
+    } else {
+      delete videoRefs.current[refId];
+    }
+  }, []);
+  const mediaRefCallbacks = useRef({});
+  const getMediaElementRef = useCallback((refId: string) => {
+    if (!mediaRefCallbacks.current[refId]) {
+      mediaRefCallbacks.current[refId] = (el: any) => registerMediaElement(refId, el);
+    }
+    return mediaRefCallbacks.current[refId];
+  }, [registerMediaElement]);
+  const togglePlayback = useCallback(() => {
+    setPlaying(prev => {
+      const next = !prev;
+      if (next) setPlayRestartNonce(n => n + 1);
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     if (!playing) { cancelAnimationFrame(rafRef.current); return; }
     playStartRef.current = { wallTime: performance.now(), editTime: time };
@@ -3523,7 +3763,7 @@ export default function HMStudio() {
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [playing]);
+  }, [playing, totalDur]);
   // ── Keyboard ───────────────────────────────────────────────────────────
   useEffect(() => {
     const onKey = e => {
@@ -3569,7 +3809,7 @@ export default function HMStudio() {
         return;
       }
       if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); if (!deleteSelectedKeyframes()) deleteSelected(); return; }
-      if (e.key === " ") { e.preventDefault(); setPlaying(p => !p); }
+      if (e.key === " ") { e.preventDefault(); togglePlayback(); }
       if (e.key === "v" || e.key === "V") setTool("select");
       if (e.key === "c" || e.key === "C") setTool("razor");
       if (e.key === "t" || e.key === "T") setTool("text");
@@ -3585,7 +3825,7 @@ export default function HMStudio() {
         try { popupWin.document.removeEventListener("keydown", onKey, true); } catch (_) {}
       }
     };
-  }, [selGfxId, selClipId, selectedMediaAssetId, clips, graphics, copiedItem, time, previewPopout, selectedKeyframes, undoFn, redoFn, snap]);
+  }, [selGfxId, selClipId, selectedMediaAssetId, clips, graphics, copiedItem, time, previewPopout, selectedKeyframes, undoFn, redoFn, snap, togglePlayback]);
   // ── Canvas Interaction Mouse ────────────────────────────────────────────
   useEffect(() => {
     if (!interact) return;
@@ -3908,7 +4148,7 @@ export default function HMStudio() {
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const isElectron = !!(window as any).electron && typeof (file as any).path === 'string';
-      const url = isElectron ? `local-file:///${(file as any).path.replace(/\\/g, '/').replace(/^\/+/, '')}` : URL.createObjectURL(file);
+      const url = isElectron ? pathToPlaybackUrl((file as any).path) : URL.createObjectURL(file);
       const isAudio = file.type.startsWith('audio/') || /\.(mp3|wav|m4a|aac|ogg)$/i.test(file.name);
       const isImage = file.type.startsWith('image/') || /\.(jpg|jpeg|png|webp|gif)$/i.test(file.name);
       
@@ -4129,7 +4369,7 @@ export default function HMStudio() {
     if (!file) return;
 
     const isElectronFile = !!(window as any).electron && typeof file.path === 'string';
-    const localUrl = isElectronFile ? `local-file:///${file.path.replace(/\\/g, '/').replace(/^\/+/, '')}` : URL.createObjectURL(file);
+    const localUrl = isElectronFile ? pathToPlaybackUrl(file.path) : URL.createObjectURL(file);
     let storedPath = isElectronFile ? file.path : null;
     let serverUrl = isElectronFile ? localUrl : null;
 
@@ -4354,6 +4594,10 @@ export default function HMStudio() {
     };
     setGraphics(gs => [...gs, g]);
     setSelGfxId(g.id); setSelClipId(null); setSelectedTimelineItems(new Set([`graphic:${g.id}`])); setShowAEPanel(false); setTool("select");
+    const end = time + g.dur;
+    setTotalDur(prev => Math.max(prev, end));
+    setRenderIn(prev => Math.min(prev ?? time, time));
+    setRenderOut(prev => prev == null ? end : Math.max(prev, end));
   };
   const insertMediaAsset = useCallback((asset) => {
     requestPreviewFullscreenNow();
@@ -4630,6 +4874,12 @@ export default function HMStudio() {
     const win = await preparePreviewPopout(hasUserGesture, skipScreenDetails);
     if (!win) return;
     if (activate) setPreviewPopout(true);
+    if ((win as any).__electronPreview) {
+      (window as any).electron?.ipcRenderer?.invoke?.('focus-preview-window');
+      setTimeout(publishPreviewState, 100);
+      setTimeout(publishPreviewState, 500);
+      return;
+    }
 
     // Re-apply moveTo multiple times to ensure the window is on the right monitor
     // before requesting fullscreen. Browsers may delay honoring moveTo.
@@ -4674,7 +4924,7 @@ export default function HMStudio() {
       ensurePosition();
       tryFullscreen();
     }, 800);
-  }, [preparePreviewPopout]);
+  }, [preparePreviewPopout, publishPreviewState]);
   const closePreviewPopout = () => {
     try { previewWinRef.current?.close(); } catch {}
     previewWinRef.current = null;
@@ -4683,11 +4933,22 @@ export default function HMStudio() {
     setPreviewPopout(false);
   };
   useEffect(() => () => { try { previewWinRef.current?.close(); } catch {} }, []);
+  useEffect(() => {
+    const on = (window as any).electron?.ipcRenderer?.on;
+    if (typeof on !== 'function') return;
+    return on('preview-window-closed', () => {
+      previewWinRef.current = null;
+      previewHostRef.current = null;
+      popupStageRef.current = null;
+      setPreviewPopout(false);
+    });
+  }, []);
 
   // Auto-fit preview zoom to the window dimensions when the popout is opened or composition size changes
   useEffect(() => {
     if (previewPopout && previewWinRef.current) {
       const win = previewWinRef.current;
+      if ((win as any).__electronPreview) return;
       const fitZoom = () => {
         const w = win.innerWidth || 1280;
         const h = win.innerHeight || 720;
@@ -4714,15 +4975,35 @@ export default function HMStudio() {
     }
   }, [previewPopout, comp.w, comp.h]);
 
+  useEffect(() => {
+    if (!isPreviewWindow) return;
+    const fitZoom = () => {
+      const scaleX = window.innerWidth / Math.max(1, comp.w);
+      const controlsHeight = 56;
+      const scaleY = Math.max(1, window.innerHeight - controlsHeight) / Math.max(1, comp.h);
+      const scale = Math.min(scaleX, scaleY) * 0.95;
+      setPreviewZoom(Math.max(0.1, Math.min(5, scale)));
+      setPreviewPan({ x: 0, y: 0 });
+    };
+    fitZoom();
+    const timer = setTimeout(fitZoom, 300);
+    window.addEventListener('resize', fitZoom);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener('resize', fitZoom);
+    };
+  }, [isPreviewWindow, comp.w, comp.h]);
+
   // On first user click: request Window Management permission and move popup to other monitor
   useEffect(() => {
-    if (!isLoggedIn || isRenderMode) return;
+    if (!isLoggedIn || isRenderMode || isPreviewWindow) return;
     const isMultiMonitor = (window.screen as any).isExtended === true;
     if (!isMultiMonitor) return;  // Skip for single monitor
 
     const movePopupToOtherMonitor = async () => {
       const win = previewWinRef.current;
       if (!win || win.closed) return;
+      if ((win as any).__electronPreview) return;
 
       try {
         if (!('getScreenDetails' in window)) return;
@@ -4778,7 +5059,7 @@ export default function HMStudio() {
       clearTimeout(timer);
       document.removeEventListener('click', handler);
     };
-  }, [isLoggedIn, isRenderMode, openPreviewPopout]);
+  }, [isLoggedIn, isPreviewWindow, isRenderMode, openPreviewPopout]);
 
   useEffect(() => {
     if (totalDur <= 0.1) return;
@@ -5191,16 +5472,16 @@ export default function HMStudio() {
                   <div key={clip.id} style={{ position: 'absolute', left: `${clipLeft}%`, top: `${clipTop}%`, width: `${assetWPct}%`, height: `${assetHPct}%`, transform: `translate(-50%,-50%) scale(${clipScale}) rotate(${clipRot}deg)`, transformOrigin: 'center center', zIndex: layerZMap.get(layerKey(layer)) || 1, display: clip.type === 'audio' ? 'none' : 'block' }}>
                     {clip.type === 'image' ? (
                       <img 
-                        src={clip.serverUrl || clip.url}
+                        src={resolvePlaybackUrl(clip)}
                         style={{ width: '100%', height: '100%', objectFit: 'fill', opacity: clipOpacity, pointerEvents: 'none', display: 'block' }} 
                       />
                     ) : (
                     <video 
-                      src={clip.serverUrl || clip.url}
-                      ref={el => { if (el) { videoRefs.current[clip.id] = el; el.dataset.clipId = clip.id; } else delete videoRefs.current[clip.id]; }} 
-                      playsInline 
-                      muted={isRenderMode} 
-                      preload='auto' 
+                      src={resolvePlaybackUrl(clip)}
+                      ref={getMediaElementRef(clip.id)}
+                      playsInline
+                      muted={false}
+                      preload='auto'
                       style={{ width: '100%', height: '100%', objectFit: 'fill', opacity: clipOpacity, pointerEvents: 'none', display: 'block' }} 
                     />
                     )}
@@ -5209,15 +5490,52 @@ export default function HMStudio() {
                 );
               }
               const g = layer;
-              return <GraphicEl key={g.id} g={g} time={time} renderZ={layerZMap.get(layerKey(layer)) || 1} selected={selGfxId === g.id} editing={editingGfxId === g.id} onEdit={() => setEditingGfxId(g.id)} onEndEdit={() => setEditingGfxId(null)} onChange={content => { updateGfx(g.id, { content }); snap(); }} />;
+              const gCt = time - g.ts + (g.startT || 0);
+              const gLeft = lerp(g.kf?.x, gCt, g.x);
+              const gTop = lerp(g.kf?.y, gCt, g.y);
+              const gScale = lerp(g.kf?.scale, gCt, g.scale) / 100;
+              const gRot = lerp(g.kf?.rotation, gCt, g.rotation ?? 0);
+              const gZ = layerZMap.get(layerKey(layer)) || 1;
+              return (
+                <React.Fragment key={g.id}>
+                  <GraphicEl g={g} time={time} renderZ={gZ} selected={selGfxId === g.id} editing={editingGfxId === g.id} onEdit={() => setEditingGfxId(g.id)} onEndEdit={() => setEditingGfxId(null)} onChange={content => { updateGfx(g.id, { content }); snap(); }} />
+                  {!editingGfxId && (
+                    <div
+                      onMouseDown={ev => {
+                        if (ev.button === 1) return;
+                        ev.stopPropagation();
+                        setSelGfxId(g.id);
+                        setSelClipId(null);
+                        if (tool === 'select') beginInteract(ev, g, 'move', 'graphic');
+                      }}
+                      onDoubleClick={ev => {
+                        ev.stopPropagation();
+                        if (g.type === 'text') setEditingGfxId(g.id);
+                      }}
+                      style={{
+                        position: 'absolute',
+                        left: `${gLeft}%`,
+                        top: `${gTop}%`,
+                        width: `calc(${g.width}px * var(--stage-scale, 1))`,
+                        height: `calc(${g.height}px * var(--stage-scale, 1))`,
+                        transform: `translate(-50%,-50%) scale(${gScale}) rotate(${gRot}deg)`,
+                        transformOrigin: 'center center',
+                        zIndex: Math.max(1, gZ) + 500,
+                        cursor: tool === 'select' ? 'move' : 'crosshair',
+                        background: 'transparent',
+                      }}
+                    />
+                  )}
+                </React.Fragment>
+              );
             })}
             {/* Audio Clips Hidden Sync */}
             <div style={{ display: 'none' }}>
               {clips.filter(c => c.type === 'audio' && time >= c.ts && time < c.ts + c.dur).map(c => (
                 <audio 
                   key={c.id} 
-                  src={c.url} 
-                  ref={el => { if (el) videoRefs.current[c.id] = el; else delete videoRefs.current[c.id]; }} 
+                  src={resolvePlaybackUrl(c)}
+                  ref={getMediaElementRef(c.id)}
                 />
               ))}
             </div>
@@ -5232,7 +5550,7 @@ export default function HMStudio() {
               const assetHPct = (assetH / comp.h) * 100;
               return <div style={{ position: 'absolute', left: `${clipLeft}%`, top: `${clipTop}%`, width: `${assetWPct}%`, height: `${assetHPct}%`, transform: `translate(-50%,-50%) scale(${clipScale}) rotate(${clipRot}deg)`, transformOrigin: 'center center', pointerEvents: 'none', zIndex: 90, boxSizing: 'border-box', outline: `1px solid ${ACCENT}` }} />;
             })()}
-            {selGfx && selGfx.visible !== false && !editingGfxId && <TransformHandles g={selGfx} time={time} stageRef={previewPopout ? popupStageRef : stageRef} onBeginInteract={beginInteract} />}
+            {selGfx && selGfx.visible !== false && !editingGfxId && <TransformHandles g={selGfx} time={time} stageRef={(previewPopout && popupStageRef.current) ? popupStageRef : stageRef} onBeginInteract={beginInteract} />}
           </>
         ) : <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#27272a' }}><div style={{ fontSize: 40, marginBottom: 8 }}>🎬</div><div style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.1em' }}>영상을 드래그하거나 추가하세요</div></div>}
 
@@ -5245,7 +5563,7 @@ export default function HMStudio() {
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12, padding: '8px 12px', background: popup ? 'rgba(8,8,8,0.92)' : '#080808', borderTop: popup ? `1px solid ${BORDER}` : 'none', borderBottom: popup ? 'none' : `1px solid ${BORDER}`, flexShrink: 0, backdropFilter: popup ? 'blur(6px)' : 'none', position: 'relative' }}>
       <button onClick={() => { setTime(0); setPlaying(false); }} style={{ background: 'none', border: 'none', color: '#71717a', fontSize: 16, cursor: 'pointer' }}>⏮</button>
       <button onClick={() => setTime(t => Math.max(0, t - 5))} style={{ background: 'none', border: 'none', color: '#71717a', fontSize: 14, cursor: 'pointer' }}>◁◁</button>
-      <button onClick={() => setPlaying(p => !p)} style={{ width: 40, height: 40, borderRadius: 10, background: ACCENT, border: 'none', color: '#000', fontSize: 18, cursor: 'pointer', fontWeight: 700 }}>
+      <button onClick={togglePlayback} style={{ width: 40, height: 40, borderRadius: 10, background: ACCENT, border: 'none', color: '#000', fontSize: 18, cursor: 'pointer', fontWeight: 700 }}>
         {playing ? '⏸' : '▶'}
       </button>
       <button onClick={() => setTime(t => Math.min(totalDur, t + 5))} style={{ background: 'none', border: 'none', color: '#71717a', fontSize: 14, cursor: 'pointer' }}>▷▷</button>
@@ -5488,6 +5806,25 @@ export default function HMStudio() {
       </div>
     </div>
   );
+
+  if (isPreviewWindow) {
+    return (
+      <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: '#000', display: 'flex', flexDirection: 'column', position: 'relative', color: '#e4e4e7', fontFamily: "'Inter', 'Noto Sans KR', sans-serif", userSelect: 'none' }}>
+        <div ref={previewScrollRef} style={{ flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'repeating-conic-gradient(#373a45 0 25%, #4b4f5d 0 50%) 0 0 / 24px 24px' }}>
+          <div style={{ transform: `translate(${previewPan.x}px, ${previewPan.y}px) scale(${previewZoom})`, transformOrigin: 'center center', flexShrink: 0 }}>
+            {isExportView ? (
+              <div style={{ width: comp.w, height: comp.h, background: '#000', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#71717a', gap: 12 }}>
+                <div style={{ fontSize: 14, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Preview</div>
+              </div>
+            ) : (
+              previewStageNode(true)
+            )}
+          </div>
+        </div>
+        {!isExportView && renderTransportControls(true)}
+      </div>
+    );
+  }
 
   if (!isLoggedIn && !isRenderMode) {
     if (showSystemModal) {
@@ -6954,24 +7291,17 @@ export default function HMStudio() {
                             <div key={`export-${clip.id}`} style={{ position: 'absolute', left: `${clipLeft}%`, top: `${clipTop}%`, width: `${assetWPct}%`, height: `${assetHPct}%`, transform: `translate(-50%,-50%) scale(${clipScale}) rotate(${clipRot}deg)`, transformOrigin: 'center center', zIndex: layerZMap.get(layerKey(layer)) || 1, display: clip.type === 'audio' ? 'none' : 'block' }}>
                               {clip.type === 'image' ? (
                                 <img 
-                                  src={clip.serverUrl || clip.url}
+                                  src={resolvePlaybackUrl(clip)}
                                   style={{ width: '100%', height: '100%', objectFit: 'fill', opacity: clipOpacity, pointerEvents: 'none', display: 'block' }} 
                                 />
                               ) : (
                                 <video 
-                                  src={clip.serverUrl || clip.url} 
+                                  src={resolvePlaybackUrl(clip)} 
                                   playsInline 
-                                  muted 
+                                  muted={false}
                                   preload='auto' 
                                   style={{ width: '100%', height: '100%', objectFit: 'fill', opacity: clipOpacity, pointerEvents: 'none', display: 'block' }} 
-                                  ref={el => {
-                                    if (el) {
-                                      videoRefs.current["export-" + clip.id] = el;
-                                      el.dataset.clipId = clip.id;
-                                    } else {
-                                      delete videoRefs.current["export-" + clip.id];
-                                    }
-                                  }}
+                                   ref={getMediaElementRef("export-" + clip.id)}
                                 />
                               )}
                             </div>
@@ -6985,15 +7315,9 @@ export default function HMStudio() {
                         {clips.filter(c => c.type === 'audio' && time >= c.ts && time < c.ts + c.dur).map(c => (
                           <audio 
                             key={`export-audio-${c.id}`} 
-                            src={c.serverUrl || c.url}
+                            src={resolvePlaybackUrl(c)}
                             playsInline
-                            ref={el => {
-                              if (el) {
-                                videoRefs.current["export-" + c.id] = el;
-                              } else {
-                                delete videoRefs.current["export-" + c.id];
-                              }
-                            }}
+                            ref={getMediaElementRef("export-" + c.id)}
                           />
                         ))}
                       </div>
@@ -7066,7 +7390,7 @@ export default function HMStudio() {
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 16 }}>
                     <button onClick={() => { setTime(renderIn || 0); setPlaying(false); }} style={{ background: "none", border: "none", color: "#71717a", fontSize: 16, cursor: "pointer" }}>⏮</button>
                     <button onClick={() => setTime(t => Math.max(renderIn || 0, t - 5))} style={{ background: "none", border: "none", color: "#71717a", fontSize: 14, cursor: "pointer" }}>◁◁</button>
-                    <button onClick={() => setPlaying(p => !p)} style={{ width: 40, height: 40, borderRadius: 10, background: "#f59e0b", border: "none", color: "#000", fontSize: 18, cursor: "pointer", fontWeight: 700 }}>
+                    <button onClick={togglePlayback} style={{ width: 40, height: 40, borderRadius: 10, background: "#f59e0b", border: "none", color: "#000", fontSize: 18, cursor: "pointer", fontWeight: 700 }}>
                       {playing ? '⏸' : '▶'}
                     </button>
                     <button onClick={() => setTime(t => Math.min(renderOut == null ? totalDur : renderOut, t + 5))} style={{ background: "none", border: "none", color: "#71717a", fontSize: 14, cursor: "pointer" }}>▷▷</button>

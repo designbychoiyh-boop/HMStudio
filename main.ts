@@ -6,6 +6,7 @@ import { spawn, spawnSync, execSync, exec, fork } from 'child_process';
 import os from 'os';
 import crypto from 'crypto';
 import ffmpegStaticPath from 'ffmpeg-static';
+import { pathToFileURL } from 'url';
 
 // Configure Chromium command line switches to disable background throttling and force hardware acceleration for hidden windows
 if (app) {
@@ -75,8 +76,25 @@ protocol.registerSchemesAsPrivileged([
   }
 ]);
 
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
 let mainWindow: BrowserWindow | null = null;
+let previewWindow: BrowserWindow | null = null;
 let serverProcess: any = null;
+
+function appBaseUrl() {
+  return app.isPackaged ? `http://127.0.0.1:${APP_PORT}` : `http://localhost:${APP_PORT}`;
+}
+
+function normalizePreviewBounds(bounds: any) {
+  const primary = screen.getPrimaryDisplay().workArea;
+  return {
+    x: Number.isFinite(Number(bounds?.x)) ? Number(bounds.x) : primary.x,
+    y: Number.isFinite(Number(bounds?.y)) ? Number(bounds.y) : primary.y,
+    width: Math.max(320, Number.isFinite(Number(bounds?.width)) ? Number(bounds.width) : primary.width),
+    height: Math.max(240, Number.isFinite(Number(bounds?.height)) ? Number(bounds.height) : primary.height),
+  };
+}
 
 function startBackendServer() {
   if (app.isPackaged) {
@@ -115,6 +133,10 @@ function startBackendServer() {
 
 // Clean up background server process upon application exit
 app.on('quit', () => {
+  if (previewWindow && !previewWindow.isDestroyed()) {
+    previewWindow.destroy();
+    previewWindow = null;
+  }
   if (serverProcess) {
     serverProcess.kill();
   }
@@ -1590,6 +1612,63 @@ ipcMain.handle('frame-captured', async (event, { jobId, frame, width, height, bu
   return { ok: true };
 });
 
+ipcMain.handle('open-preview-window', async (_event, options = {}) => {
+  const bounds = normalizePreviewBounds((options as any)?.bounds);
+  const fullscreen = (options as any)?.fullscreen !== false;
+
+  if (previewWindow && !previewWindow.isDestroyed()) {
+    previewWindow.setBounds(bounds);
+    previewWindow.setFullScreen(fullscreen);
+    previewWindow.show();
+    previewWindow.focus();
+    return { ok: true, reused: true };
+  }
+
+  previewWindow = new BrowserWindow({
+    ...bounds,
+    frame: false,
+    fullscreen,
+    show: false,
+    backgroundColor: '#000000',
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      webSecurity: false,
+      nodeIntegration: false,
+      contextIsolation: true,
+    },
+  });
+
+  previewWindow.on('closed', () => {
+    previewWindow = null;
+    mainWindow?.webContents.send('preview-window-closed');
+  });
+
+  previewWindow.once('ready-to-show', () => {
+    if (!previewWindow || previewWindow.isDestroyed()) return;
+    previewWindow.show();
+    previewWindow.focus();
+  });
+
+  await previewWindow.loadURL(`${appBaseUrl()}/?previewWindow=1`);
+  return { ok: true, reused: false };
+});
+
+ipcMain.handle('focus-preview-window', async () => {
+  if (!previewWindow || previewWindow.isDestroyed()) return { ok: false };
+  previewWindow.show();
+  previewWindow.focus();
+  return { ok: true };
+});
+
+ipcMain.handle('close-preview-window', async () => {
+  if (previewWindow && !previewWindow.isDestroyed()) {
+    previewWindow.close();
+  }
+  previewWindow = null;
+  return { ok: true };
+});
+
 // Register custom protocol handler for local files
 app.whenReady().then(() => {
   protocol.handle('local-file', (request) => {
@@ -1599,7 +1678,7 @@ app.whenReady().then(() => {
     } else if (process.platform === 'win32' && /^[a-zA-Z]\//.test(filePath)) {
       filePath = `${filePath[0].toUpperCase()}:/${filePath.slice(2)}`;
     }
-    return net.fetch('file:///' + filePath);
+    return net.fetch(pathToFileURL(filePath).toString());
   });
 
   startBackendServer();

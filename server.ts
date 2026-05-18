@@ -442,6 +442,8 @@ async function launchRenderSession(browserPath: string, width: number, height: n
     '--disable-setuid-sandbox',
     '--disable-extensions',
     '--disable-dev-shm-usage',
+    '--allow-file-access-from-files',
+    '--disable-web-security',
     `--user-data-dir=${path.join(TEMP_DIR, `chrome-profile-${debugPort}`)}`,
     '--enable-gpu',
     '--ignore-gpu-blocklist',
