@@ -126,6 +126,7 @@ type ActiveRenderSession = {
   renderWin: BrowserWindow;
   frameCount: number;
   currentFrame: number;
+  framesWritten: number;
   pendingFrameKey?: string;
   forceTransparentFirstGraphicsFrame?: boolean;
   frameCache: Map<string, Buffer>;
@@ -133,6 +134,10 @@ type ActiveRenderSession = {
   rejectPromise: (err: Error) => void;
 };
 const activeRenders = new Map<string, ActiveRenderSession>();
+
+function delay(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function writeRawFrame(session: ActiveRenderSession, buffer: Buffer) {
   return new Promise<void>((resolve, reject) => {
@@ -208,10 +213,10 @@ function refreshJobFromDisk(job: RenderJobRecord) {
   if (!isActiveStatus && fs.existsSync(mp4)) {
     job.status = 'completed';
     job.progress = 100;
-    job.downloadUrl = `local-file://${mp4.replace(/\\/g, '/')}`;
+    job.downloadUrl = `local-file:///${mp4.replace(/\\/g, '/').replace(/^\/+/, '')}`;
   }
   if (fs.existsSync(previewJpg)) {
-    job.previewUrl = `local-file://${previewJpg.replace(/\\/g, '/')}`;
+    job.previewUrl = `local-file:///${previewJpg.replace(/\\/g, '/').replace(/^\/+/, '')}`;
   }
   if (fs.existsSync(errorLog) && !fs.existsSync(mp4)) {
     job.status = 'failed';
@@ -397,23 +402,61 @@ function maxLottieChangingKeyframeFrame(value: any, seen = new WeakSet<object>()
 }
 
 async function moveFile(src: string, dest: string) {
-  try {
-    const destDir = path.dirname(dest);
-    if (!fs.existsSync(destDir)) {
-      fs.mkdirSync(destDir, { recursive: true });
-    }
-    if (fs.existsSync(dest)) {
-      await fsp.unlink(dest).catch(() => {});
-    }
-    await fsp.rename(src, dest);
-  } catch (err: any) {
-    if (err.code === 'EXDEV') {
-      await fsp.copyFile(src, dest);
-      await fsp.unlink(src).catch(() => {});
-    } else {
-      throw err;
+  const destDir = path.dirname(dest);
+  if (!fs.existsSync(destDir)) {
+    fs.mkdirSync(destDir, { recursive: true });
+  }
+
+  let lastErr: any = null;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      if (fs.existsSync(dest)) {
+        await fsp.unlink(dest);
+      }
+      await fsp.rename(src, dest);
+      return;
+    } catch (err: any) {
+      lastErr = err;
+      if (err?.code === 'EXDEV') {
+        await fsp.copyFile(src, dest);
+        await fsp.unlink(src).catch(() => {});
+        return;
+      }
+      if (!['EBUSY', 'EPERM', 'EACCES'].includes(err?.code)) {
+        throw err;
+      }
+      await delay(250 * (attempt + 1));
     }
   }
+  throw lastErr;
+}
+
+function assertUsableVideoFile(filePath: string, label: string) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`${label} file was not created: ${filePath}`);
+  }
+  const size = fs.statSync(filePath).size;
+  if (size < 1024) {
+    throw new Error(`${label} file is empty or invalid (${size} bytes): ${filePath}`);
+  }
+}
+
+function runFfmpegLogged(bin: string, args: string[], logStream?: fs.WriteStream) {
+  return new Promise<void>((resolve, reject) => {
+    const proc = spawn(bin, args);
+    let stderr = '';
+    proc.stdout.on('data', chunk => logStream?.write(chunk));
+    proc.stderr.on('data', chunk => {
+      const text = chunk.toString();
+      stderr += text;
+      logStream?.write(chunk);
+    });
+    proc.on('close', code => {
+      if (code === 0) resolve();
+      else reject(new Error(`FFmpeg final pass failed (code ${code}): ${stderr.slice(-800)}`));
+    });
+    proc.on('error', reject);
+  });
 }
 
 // Core Rendering Loop running on Electron Main process using Direct Pixel Stream
@@ -795,12 +838,14 @@ async function executeRenderJob(record: RenderJobRecord) {
       renderWin,
       frameCount,
       currentFrame: 0,
+      framesWritten: 0,
       forceTransparentFirstGraphicsFrame: canRunHybrid && hasGraphics,
       frameCache: new Map(),
       resolvePromise: async () => {
         try {
           renderWin.close();
           await ffmpegPromise;
+          assertUsableVideoFile(tempOutputPath, 'Rendered temp video');
           
           // Audio mixing and thumbnail generation
           record.progress = 96.00;
@@ -888,22 +933,30 @@ async function executeRenderJob(record: RenderJobRecord) {
               finalPassArgs.push(finalPassTemp);
 
               try {
-                const finalPass = spawnSync(bin, finalPassArgs, { encoding: 'utf8' });
-                if (finalPass.status !== 0) {
-                  throw new Error(`${finalPass.stderr || finalPass.stdout || 'FFmpeg audio pass failed'}`);
-                }
-                if (fs.existsSync(finalPassTemp)) {
-                  await moveFile(finalPassTemp, outputPath);
-                  await fsp.unlink(tempOutputPath).catch(() => {});
-                }
+                await runFfmpegLogged(bin, finalPassArgs, logStream);
+                assertUsableVideoFile(finalPassTemp, 'Final mixed video');
+                record.progress = 98.00;
+                record.statusText = '3단계. 결과 파일 저장 중...';
+                record.updatedAt = nowIso();
+                await saveJob(record);
+                await moveFile(finalPassTemp, outputPath);
+                await fsp.unlink(tempOutputPath).catch(() => {});
               } catch (err: any) {
                 console.error('Audio pass failed:', err);
                 throw err;
               }
             } else {
+              record.progress = 98.00;
+              record.statusText = '3단계. 결과 파일 저장 중...';
+              record.updatedAt = nowIso();
+              await saveJob(record);
               await moveFile(tempOutputPath, outputPath);
             }
           } else {
+            record.progress = 98.00;
+            record.statusText = '3단계. 결과 파일 저장 중...';
+            record.updatedAt = nowIso();
+            await saveJob(record);
             await moveFile(tempOutputPath, outputPath);
           }
 
@@ -916,13 +969,20 @@ async function executeRenderJob(record: RenderJobRecord) {
           record.statusText = `완료 (${frameCount}프레임, ${totalElapsed}초, ${outputSizeMB}MB)`;
           record.elapsedSeconds = Number(totalElapsed);
           record.outputSizeMB = Number(outputSizeMB);
-          record.downloadUrl = `local-file://${outputPath.replace(/\\/g, '/')}`;
-          if (fs.existsSync(previewPath)) record.previewUrl = `local-file://${previewPath.replace(/\\/g, '/')}`;
+          record.downloadUrl = `local-file:///${outputPath.replace(/\\/g, '/').replace(/^\/+/, '')}`;
+          if (fs.existsSync(previewPath)) record.previewUrl = `local-file:///${previewPath.replace(/\\/g, '/').replace(/^\/+/, '')}`;
           record.updatedAt = nowIso();
           await saveJob(record);
           activeRenders.delete(jobId);
           resolve();
         } catch (err: any) {
+          record.status = 'failed';
+          record.progress = -1;
+          record.statusText = '렌더링 실패';
+          record.error = String(err.message || err);
+          record.updatedAt = nowIso();
+          await fsp.writeFile(errorPath, record.error, 'utf8').catch(() => {});
+          await saveJob(record).catch(() => {});
           activeRenders.delete(jobId);
           reject(err);
         }
@@ -992,6 +1052,15 @@ async function executeRenderJob(record: RenderJobRecord) {
           fps,
           totalFrames: frameCount,
         });
+        let captureHookReady = false;
+        for (let waitMs = 0; waitMs < 5000; waitMs += 50) {
+          captureHookReady = await renderWin.webContents.executeJavaScript(`typeof window.__onElectronFrameReady === 'function'`);
+          if (captureHookReady) break;
+          await delay(50);
+        }
+        if (!captureHookReady) {
+          throw new Error('Electron render capture hook was not registered before frame capture started.');
+        }
       }
 
       // Start the FFmpeg capture loop
@@ -1007,12 +1076,26 @@ async function executeRenderJob(record: RenderJobRecord) {
         const cachedFrame = session?.frameCache.get(frameKey);
         if (session && cachedFrame && frameKey !== `dynamic:${i}`) {
           await writeRawFrame(session, cachedFrame);
+          session.framesWritten++;
         } else {
           if (session) session.pendingFrameKey = frameKey;
           try {
-            await renderWin.webContents.executeJavaScript(
+            const captured = await renderWin.webContents.executeJavaScript(
               `window.__HM_SET_RENDER_TIME(${ts})`
             );
+            if (!usePageCapture && captured === false) {
+              if (!session) {
+                throw new Error(`Frame ${i + 1}/${frameCount} was not captured by the Electron renderer.`);
+              }
+              console.warn(`[Render ${jobId}] Frame ${i + 1}/${frameCount} missed IPC capture; using direct window capture fallback.`);
+              await renderWin.webContents.executeJavaScript(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+              const capturedFrame = await captureWindowRgba(renderWin, width, height);
+              if (frameKey && !frameKey.startsWith('dynamic:') && !session.frameCache.has(frameKey)) {
+                session.frameCache.set(frameKey, Buffer.from(capturedFrame));
+              }
+              await writeRawFrame(session, capturedFrame);
+              session.framesWritten++;
+            }
             if (usePageCapture && session) {
               await renderWin.webContents.executeJavaScript(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
               const capturedFrame = await captureWindowRgba(renderWin, width, height);
@@ -1020,6 +1103,7 @@ async function executeRenderJob(record: RenderJobRecord) {
                 session.frameCache.set(frameKey, Buffer.from(capturedFrame));
               }
               await writeRawFrame(session, capturedFrame);
+              session.framesWritten++;
             }
           } catch (frameErr) {
             // executeJavaScript can throw if the window is destroyed mid-render
@@ -1042,6 +1126,10 @@ async function executeRenderJob(record: RenderJobRecord) {
       }
 
       // All frames written \u2014 close FFmpeg stdin and finalise.
+      const completedSession = activeRenders.get(jobId);
+      if (completedSession && completedSession.framesWritten < frameCount) {
+        throw new Error(`Only ${completedSession.framesWritten}/${frameCount} frames reached FFmpeg. Render aborted before creating an empty video.`);
+      }
       ffmpegProc.stdin.end();
       const session = activeRenders.get(jobId);
       if (session) {
@@ -1497,6 +1585,7 @@ ipcMain.handle('frame-captured', async (event, { jobId, frame, width, height, bu
     session.frameCache.set(frameKey, Buffer.from(nodeBuffer));
   }
   await writeRawFrame(session, nodeBuffer);
+  session.framesWritten++;
 
   return { ok: true };
 });
@@ -1505,8 +1594,10 @@ ipcMain.handle('frame-captured', async (event, { jobId, frame, width, height, bu
 app.whenReady().then(() => {
   protocol.handle('local-file', (request) => {
     let filePath = decodeURIComponent(request.url.replace('local-file://', ''));
-    if (process.platform === 'win32' && filePath.startsWith('/')) {
+    if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(filePath)) {
       filePath = filePath.slice(1);
+    } else if (process.platform === 'win32' && /^[a-zA-Z]\//.test(filePath)) {
+      filePath = `${filePath[0].toUpperCase()}:/${filePath.slice(2)}`;
     }
     return net.fetch('file:///' + filePath);
   });

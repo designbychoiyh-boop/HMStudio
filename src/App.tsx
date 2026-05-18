@@ -2507,30 +2507,58 @@ export default function HMStudio() {
 
           const isElectron = !!(window as any).electron;
           const isBlobUrl = url => typeof url === "string" && url.startsWith("blob:");
-          const pathToLocalFileUrl = filePath => `local-file://${String(filePath || "").replace(/\\/g, "/")}`;
+          const pathToLocalFileUrl = filePath => `local-file:///${String(filePath || "").replace(/\\/g, "/").replace(/^\/+/, "")}`;
           const isAbsoluteFilePath = filePath => /^[a-zA-Z]:[\\/]/.test(String(filePath || "")) || /^\\\\/.test(String(filePath || "")) || String(filePath || "").startsWith("/");
           const basenameFromPath = filePath => String(filePath || "").split(/[\\/]/).filter(Boolean).pop() || "";
           const localFileUrlToPath = url => {
             if (typeof url !== "string" || !url.startsWith("local-file://")) return "";
             const rawPath = url.replace("local-file://", "");
             try {
-              return decodeURIComponent(rawPath).replace(/\//g, "\\");
+              return decodeURIComponent(rawPath).replace(/^\/([a-zA-Z]:)/, "$1").replace(/\//g, "\\");
             } catch {
-              return rawPath.replace(/\//g, "\\");
+              return rawPath.replace(/^\/([a-zA-Z]:)/, "$1").replace(/\//g, "\\");
+            }
+          };
+          const fileExistsAtPath = async filePath => {
+            if (!isElectron || !isAbsoluteFilePath(filePath)) return null;
+            try {
+              const res = await fetch('/api/file-exists', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: filePath })
+              });
+              if (!res.ok) return null;
+              const data = await res.json();
+              return !!data.exists;
+            } catch {
+              return null;
             }
           };
 
-          const relinkMediaItem = c => {
+          const relinkMediaItem = async c => {
             let resolvedUrl = !isBlobUrl(c.serverUrl) ? c.serverUrl : "";
             if (!resolvedUrl && !isBlobUrl(c.url)) resolvedUrl = c.url;
             let resolvedPath = c.storedPath || "";
             let matchedAssetUrl = typeof resolvedUrl === "string" && resolvedUrl.startsWith("/assets/");
             const pathFromUrl = localFileUrlToPath(resolvedUrl);
             if (!resolvedPath && pathFromUrl) resolvedPath = pathFromUrl;
+            const hasSavedAbsolutePath = !!(resolvedPath && isAbsoluteFilePath(resolvedPath));
+            const savedPathExists = hasSavedAbsolutePath ? await fileExistsAtPath(resolvedPath) : false;
+            const savedPathMissing = hasSavedAbsolutePath && savedPathExists === false;
+            const savedPathUnchecked = hasSavedAbsolutePath && savedPathExists == null;
 
             const getSafeName = (name: string) => name.replace(/[^a-zA-Z0-9._-]+/g, '_');
 
-            if (assetFiles.length > 0) {
+            if (savedPathExists) {
+              resolvedUrl = pathToLocalFileUrl(resolvedPath);
+              matchedAssetUrl = false;
+            } else if (savedPathMissing) {
+              resolvedUrl = "";
+              matchedAssetUrl = false;
+            } else if (savedPathUnchecked) {
+              resolvedUrl = pathToLocalFileUrl(resolvedPath);
+              matchedAssetUrl = false;
+            } else if (assetFiles.length > 0) {
               const cleanName = getSafeName(c.name).replace(/\.[^/.]+$/, "");
               const cleanExt = (c.name.split('.').pop() || "").toLowerCase();
               
@@ -2568,7 +2596,7 @@ export default function HMStudio() {
               if (basename) resolvedUrl = `/assets/${basename}`;
             }
 
-            if (isElectron && resolvedPath && isAbsoluteFilePath(resolvedPath) && !matchedAssetUrl) {
+            if (isElectron && hasSavedAbsolutePath && !savedPathMissing && !matchedAssetUrl) {
               resolvedUrl = pathToLocalFileUrl(resolvedPath);
             }
 
@@ -2576,14 +2604,15 @@ export default function HMStudio() {
               ...c,
               url: resolvedUrl,
               serverUrl: resolvedUrl,
-              storedPath: resolvedPath
+              storedPath: resolvedPath,
+              needsRelink: !resolvedUrl || savedPathMissing
             };
           };
 
-          const processed = data.clips.map(relinkMediaItem);
+          const processed = await Promise.all(data.clips.map(relinkMediaItem));
           setClips(processed);
           const sourceAssets = Array.isArray(data.mediaAssets) ? data.mediaAssets : data.clips;
-          setMediaAssets(sourceAssets.map(relinkMediaItem));
+          setMediaAssets(await Promise.all(sourceAssets.map(relinkMediaItem)));
         }
         
         if (data.graphics) setGraphics(data.graphics);
@@ -2794,14 +2823,16 @@ export default function HMStudio() {
       return new Promise(resolve => {
         // @ts-ignore
         renderReadyResolverRef.current = resolve;
+        const isElectronIpcCapture = !!((window as any).electron && (window as any).__onElectronFrameReady);
         // Hard timeout: if onReady never fires (e.g. empty timeline), unblock after 3s.
         // In Electron IPC mode, onReady ALWAYS fires because WebGLRenderStage
         // skips nextPaint() and calls onReady synchronously after draw().
         const tid = setTimeout(() => {
           document.documentElement.setAttribute('data-render-ready', '1');
           document.body.setAttribute('data-render-ready', '1');
-          resolve(true);
-        }, 3000);
+          renderReadyResolverRef.current = null;
+          resolve(isElectronIpcCapture ? false : true);
+        }, isElectronIpcCapture ? 10000 : 3000);
         // @ts-ignore
         (renderReadyResolverRef as any)._tid = tid;
       });
@@ -3096,6 +3127,50 @@ export default function HMStudio() {
     setRenderOut(state.renderOut == null ? null : Number(state.renderOut));
     setTime(Number(state.time || 0));
   }, [cloneUndoValue]);
+  const newProject = useCallback(() => {
+    setPlaying(false);
+    Object.values(videoRefs.current || {}).forEach((el: any) => {
+      try {
+        el.pause();
+        el.removeAttribute("src");
+        el.removeAttribute("data-cid");
+        el.removeAttribute("data-src");
+        el.load();
+      } catch {}
+    });
+    videoRefs.current = {};
+    setClips([]);
+    setMediaAssets([]);
+    setGraphics([]);
+    setComp({ w: 3840, h: 2160, fps: 30, bg: "#000000" });
+    setTime(0);
+    setRenderIn(0);
+    setRenderOut(null);
+    setTotalDur(0);
+    setSelClipId(null);
+    setSelGfxId(null);
+    setSelectedMediaAssetId(null);
+    setSelectedTimelineItems(new Set());
+    setSelectedKeyframes(new Set());
+    setExpandedLayers(new Set());
+    setActiveKeyframePopup(null);
+    setCopiedItem(null);
+    setEditingGfxId(null);
+    setTool("select");
+    setHistory([]);
+    setRedo([]);
+    setRenderStatus("idle");
+    setRenderQueue([]);
+    savedJobsRef.current.clear();
+    setExportSettings(s => ({
+      ...s,
+      filename: "Untitled_Project",
+      width: 3840,
+      height: 2160,
+      bitrate: 45.0,
+      preset: "4K"
+    }));
+  }, []);
   const snap = useCallback(() => {
     const state = makeUndoState();
     const key = undoStateKey(state);
@@ -3161,7 +3236,7 @@ export default function HMStudio() {
       __type: 'graphic'
     })),
   ]).sort((a, b) => b.__sort - a.__sort), [clips, graphics]);
-  const preparePreviewPopout = useCallback(async (hasUserGesture = false) => {
+  const preparePreviewPopout = useCallback(async (hasUserGesture = false, skipScreenDetails = false) => {
     let win = previewWinRef.current;
     if (!win || win.closed) {
       // ── Multi-monitor positioning ─────────────────────────────────────
@@ -3181,7 +3256,7 @@ export default function HMStudio() {
       console.log('[Preview] screen.availLeft:', (window.screen as any).availLeft, 'screen.availTop:', (window.screen as any).availTop);
 
       // Strategy 1: Window Management API (only if we have user gesture)
-      if (hasUserGesture) {
+      if (hasUserGesture && !skipScreenDetails) {
         try {
           if ('getScreenDetails' in window) {
             const screenDetails = await (window as any).getScreenDetails();
@@ -3391,9 +3466,10 @@ export default function HMStudio() {
       el.playsInline = true;
       
       const targetSrc = clip.serverUrl || clip.url;
-      if (el.getAttribute("data-cid") !== refId) {
+      if (el.getAttribute("data-cid") !== refId || el.getAttribute("data-src") !== targetSrc) {
         el.src = targetSrc;
         el.setAttribute("data-cid", refId);
+        el.setAttribute("data-src", targetSrc || "");
         el.load();
         const applyTime = () => {
           try { el.currentTime = ct; } catch {}
@@ -3832,7 +3908,7 @@ export default function HMStudio() {
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const isElectron = !!(window as any).electron && typeof (file as any).path === 'string';
-      const url = isElectron ? `local-file://${(file as any).path.replace(/\\/g, '/')}` : URL.createObjectURL(file);
+      const url = isElectron ? `local-file:///${(file as any).path.replace(/\\/g, '/').replace(/^\/+/, '')}` : URL.createObjectURL(file);
       const isAudio = file.type.startsWith('audio/') || /\.(mp3|wav|m4a|aac|ogg)$/i.test(file.name);
       const isImage = file.type.startsWith('image/') || /\.(jpg|jpeg|png|webp|gif)$/i.test(file.name);
       
@@ -3975,6 +4051,149 @@ export default function HMStudio() {
     }
     fileRef.current?.click();
   }, [ingestFiles]);
+
+  const pickSingleMediaFile = useCallback(async () => {
+    const electronInvoke = (window as any).electron?.ipcRenderer?.invoke;
+    if (typeof electronInvoke === 'function') {
+      try {
+        const files = await electronInvoke('open-media-dialog');
+        if (Array.isArray(files) && files.length) return files[0];
+      } catch (err) {
+        console.warn("Could not open native relink dialog:", err);
+      }
+    }
+
+    const picker = (window as any).showOpenFilePicker;
+    if (typeof picker === 'function') {
+      try {
+        const [handle] = await picker.call(window, {
+          multiple: false,
+          excludeAcceptAllOption: false,
+          types: [
+            { description: 'Media Files', accept: { 'video/*': ['.mp4', '.mov', '.webm', '.avi', '.mkv'], 'audio/*': ['.mp3', '.wav', '.m4a', '.aac', '.ogg'], 'image/*': ['.png', '.jpg', '.jpeg', '.webp', '.gif'] } }
+          ]
+        });
+        return handle ? await handle.getFile() : null;
+      } catch (err) {
+        if (err?.name === 'AbortError') return null;
+      }
+    }
+
+    return await new Promise(resolve => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'video/*,audio/*,image/*';
+      input.onchange = () => resolve(input.files?.[0] || null);
+      input.click();
+    });
+  }, []);
+
+  const readMediaMeta = useCallback(async (file, url) => {
+    const name = String(file?.name || '');
+    const type = String(file?.type || '');
+    const isAudio = type.startsWith('audio/') || /\.(mp3|wav|m4a|aac|ogg)$/i.test(name);
+    const isImage = type.startsWith('image/') || /\.(jpg|jpeg|png|webp|gif)$/i.test(name);
+
+    if (isAudio) {
+      return await new Promise(res => {
+        const a = new Audio(); a.src = url;
+        a.onloadedmetadata = () => res({ type: 'audio', dur: a.duration || 5, w: 0, h: 0 });
+        a.onerror = () => res({ type: 'audio', dur: 5, w: 0, h: 0 });
+      });
+    }
+
+    if (isImage) {
+      return await new Promise(res => {
+        const img = new Image(); img.src = url;
+        img.onload = () => res({ type: 'image', dur: 5, w: img.width || 1920, h: img.height || 1080 });
+        img.onerror = () => res({ type: 'image', dur: 5, w: 1920, h: 1080 });
+      });
+    }
+
+    return await new Promise(res => {
+      const v = document.createElement('video'); v.src = url; v.preload = 'metadata';
+      const done = () => {
+        let d = v.duration;
+        if (!d || isNaN(d) || d === Infinity) d = 5;
+        res({ type: 'video', dur: d, w: v.videoWidth || 1920, h: v.videoHeight || 1080 });
+      };
+      v.onloadedmetadata = done;
+      v.onloadeddata = done;
+      v.onerror = () => res({ type: 'video', dur: 5, w: 1920, h: 1080 });
+    });
+  }, []);
+
+  const relinkMediaAsset = useCallback(async (asset) => {
+    if (!asset) return;
+    const file: any = await pickSingleMediaFile();
+    if (!file) return;
+
+    const isElectronFile = !!(window as any).electron && typeof file.path === 'string';
+    const localUrl = isElectronFile ? `local-file:///${file.path.replace(/\\/g, '/').replace(/^\/+/, '')}` : URL.createObjectURL(file);
+    let storedPath = isElectronFile ? file.path : null;
+    let serverUrl = isElectronFile ? localUrl : null;
+
+    if (!isElectronFile) {
+      try {
+        const fd = new FormData();
+        fd.append('file', file);
+        const res = await fetch('/api/uploads/video', { method: 'POST', body: fd });
+        if (res.ok) {
+          const uploaded = await res.json();
+          storedPath = uploaded.storedPath || null;
+          serverUrl = uploaded.url || localUrl;
+        }
+      } catch {}
+    }
+
+    const meta: any = await readMediaMeta(file, serverUrl || localUrl);
+    const assetKey = asset.assetId || asset.id;
+    const patch = {
+      file,
+      name: file.name || asset.name,
+      type: meta.type || asset.type,
+      url: serverUrl || localUrl,
+      serverUrl: serverUrl || localUrl,
+      storedPath,
+      sourceW: meta.w,
+      sourceH: meta.h,
+      dur: Math.max(0.1, Number(meta.dur || asset.dur || 5)),
+      needsRelink: false,
+    };
+
+    snap();
+    setMediaAssets(as => as.map(item => {
+      const itemKey = item.assetId || item.id;
+      return item.id === asset.id || itemKey === assetKey
+        ? { ...item, ...patch, id: item.id, assetId: item.assetId || item.id, ts: 0, startT: 0, endT: patch.dur }
+        : item;
+    }));
+    setClips(cs => cs.map(clip => {
+      const clipKey = clip.assetId || clip.id;
+      if (clipKey !== assetKey && clip.id !== asset.id) return clip;
+      const clipDur = Math.max(0.1, Number(clip.dur || patch.dur));
+      const startT = Math.max(0, Number(clip.startT || 0));
+      const endT = Math.min(Math.max(startT + 0.1, Number(clip.endT || startT + clipDur)), patch.dur);
+      return {
+        ...clip,
+        file: patch.file,
+        name: patch.name,
+        type: patch.type,
+        url: patch.url,
+        serverUrl: patch.serverUrl,
+        storedPath: patch.storedPath,
+        sourceW: patch.sourceW,
+        sourceH: patch.sourceH,
+        needsRelink: false,
+        id: clip.id,
+        assetId: clip.assetId || assetKey,
+        dur: clipDur,
+        startT,
+        endT
+      };
+    }));
+  }, [pickSingleMediaFile, readMediaMeta, snap]);
+
   const handleAEImport = async e => {
     const files = Array.from(e.target.files ?? []); if (!files.length) return;
     if (aeFileRef.current) aeFileRef.current.value = "";
@@ -4407,8 +4626,8 @@ export default function HMStudio() {
     }
   };
   const openPreviewPopout = useCallback(async (opts: any = {}) => {
-    const { activate = true, focusWindow = true, fullscreen = true, hasUserGesture = false } = opts;
-    const win = await preparePreviewPopout(hasUserGesture);
+    const { activate = true, focusWindow = true, fullscreen = true, hasUserGesture = false, skipScreenDetails = false } = opts;
+    const win = await preparePreviewPopout(hasUserGesture, skipScreenDetails);
     if (!win) return;
     if (activate) setPreviewPopout(true);
 
@@ -4464,18 +4683,6 @@ export default function HMStudio() {
     setPreviewPopout(false);
   };
   useEffect(() => () => { try { previewWinRef.current?.close(); } catch {} }, []);
-
-  // Auto-open preview window on page load
-  useEffect(() => {
-    if (isLoggedIn && !isRenderMode) {
-      const timer = setTimeout(() => {
-        if (!previewWinRef.current || previewWinRef.current.closed) {
-          openPreviewPopout({ fullscreen: true, focusWindow: true, hasUserGesture: false });
-        }
-      }, 500);
-      return () => clearTimeout(timer);
-    }
-  }, [isLoggedIn, isRenderMode, openPreviewPopout]);
 
   // Auto-fit preview zoom to the window dimensions when the popout is opened or composition size changes
   useEffect(() => {
@@ -4989,7 +5196,7 @@ export default function HMStudio() {
                       />
                     ) : (
                     <video 
-                      src={clip.url} 
+                      src={clip.serverUrl || clip.url}
                       ref={el => { if (el) { videoRefs.current[clip.id] = el; el.dataset.clipId = clip.id; } else delete videoRefs.current[clip.id]; }} 
                       playsInline 
                       muted={isRenderMode} 
@@ -5133,7 +5340,7 @@ export default function HMStudio() {
               document.documentElement.setAttribute('data-render-ready', '1');
               document.body.setAttribute('data-render-ready', '1');
 
-              if (isElectronIpcCapture) {
+              if (isElectronIpcCapture && renderReadyResolverRef.current) {
                 // In Electron IPC mode: invoke('frame-captured') inside __onElectronFrameReady
                 // writes RGBA bytes to FFmpeg stdin and awaits ipcMain.handle's return.
                 // We MUST await this before resolving renderReadyResolverRef so that
@@ -5460,6 +5667,7 @@ export default function HMStudio() {
 
         {/* RIGHT: PROJECT ACTIONS */}
         <div style={{ display: "flex", gap: 8, alignItems: "center", flex: 1, justifyContent: "flex-end" }}>
+          <button onClick={newProject} style={{ ...btn(false), fontSize: 13, padding: '6px 14px' }}>새 프로젝트</button>
           <button onClick={() => projectFileRef.current?.click()} style={{ ...btn(false), fontSize: 13, padding: '6px 14px' }}>📂 프로젝트 불러오기</button>
           <button onClick={saveProject} style={{ ...btn(false), fontSize: 13, padding: '6px 14px' }}>💾 프로젝트 저장</button>
           <input ref={projectFileRef} type="file" accept=".json" style={{ display: "none" }} onChange={loadProject} />
@@ -5486,6 +5694,7 @@ export default function HMStudio() {
                     const assetKey = c.assetId || c.id;
                     const isInTimeline = clips.some(clip => (clip.assetId || clip.id) === assetKey);
                     const isSelected = selectedMediaAssetId === c.id;
+                    const needsRelink = !!c.needsRelink;
                     return (
                     <div key={c.id}
                       onClick={() => {
@@ -5498,8 +5707,8 @@ export default function HMStudio() {
                       style={{ 
                         padding: 8, 
                         borderRadius: 8, 
-                        background: isSelected ? ACCENT + "22" : (isInTimeline ? ACCENT + "14" : "#141414"), 
-                        border: `1px solid ${isSelected ? ACCENT : (isInTimeline ? ACCENT + "88" : BORDER)}`, 
+                        background: needsRelink ? "#2a1111" : (isSelected ? ACCENT + "22" : (isInTimeline ? ACCENT + "14" : "#141414")),
+                        border: `1px solid ${needsRelink ? "#ef4444" : (isSelected ? ACCENT : (isInTimeline ? ACCENT + "88" : BORDER))}`,
                         color: isSelected ? "#fff" : "#a1a1aa", 
                         cursor: "pointer",
                         display: "flex", 
@@ -5515,10 +5724,15 @@ export default function HMStudio() {
                         🎬
                       </div>
                       <span style={{ fontSize: 11, fontWeight: "normal", width: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</span>
+                      {needsRelink && <span style={{ fontSize: 10, color: "#fca5a5", fontWeight: 800 }}>링크 끊김</span>}
                       <button onClick={(e) => { e.stopPropagation(); insertMediaAsset(c); }}
                         style={{ width: "100%", padding: "7px 8px", background: ACCENT, color: "#000", border: "none", borderRadius: 6, fontSize: 11, fontWeight: 800, cursor: "pointer" }}>
                         삽입
                       </button>
+                      {needsRelink && <button onClick={(e) => { e.stopPropagation(); relinkMediaAsset(c); }}
+                        style={{ width: "100%", padding: "7px 8px", background: needsRelink ? "#ef4444" : "transparent", color: needsRelink ? "#fff" : ACCENT, border: `1px solid ${needsRelink ? "#ef4444" : ACCENT + "88"}`, borderRadius: 6, fontSize: 11, fontWeight: 800, cursor: "pointer" }}>
+                        파일 연결
+                      </button>}
                     </div>
                     );
                   })}
